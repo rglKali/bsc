@@ -22,7 +22,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
@@ -49,9 +48,8 @@ const (
 	envRPC     = "E2E_RPC_URL"
 	envMaster  = "E2E_MASTER_SECRET"
 	envToken   = "E2E_TOKEN_ADDRESS"
-	envChainID = "E2E_CHAIN_ID" // default 97 (BSC testnet, Chapel)
-	envDeposit = "E2E_DEPOSIT"  // default 2 whole tokens
-	envTimeout = "E2E_TIMEOUT"  // default 15m for the whole lifecycle
+	envDeposit = "E2E_DEPOSIT" // default 2 whole tokens
+	envTimeout = "E2E_TIMEOUT" // default 15m for the whole lifecycle
 
 	envDestination = "E2E_DESTINATION"   // payout target; defaults to the funder
 	envCollector   = "E2E_FEE_COLLECTOR" // fee target; defaults to the master
@@ -109,42 +107,12 @@ func setup(t *testing.T, n needs) *harness {
 	}
 	masterSecret := need(envMaster)
 
-	chainID := uint64(chain.TestnetChainID)
-	if v := os.Getenv(envChainID); v != "" {
-		n, err := strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			t.Fatalf("%s: %v", envChainID, err)
-		}
-		chainID = n
-	}
-	// The token defaults to the well-known deployment for the chain; override it
-	// when running against your own ERC-20.
-	token := usdt.TestnetAddress
-	if chainID == chain.MainnetChainID {
-		token = usdt.MainnetAddress
-	}
-	if v := os.Getenv(envToken); v != "" {
-		if !common.IsHexAddress(v) {
-			t.Fatalf("%s=%q is not a hex address", envToken, v)
-		}
-		token = common.HexToAddress(v)
-	} else if chainID != chain.MainnetChainID && chainID != chain.TestnetChainID {
-		t.Skipf("%s must be set for chain %d — there is no default token for it", envToken, chainID)
-	}
-
-	if chainID == chain.MainnetChainID && os.Getenv("E2E_I_MEAN_MAINNET") != "yes" {
-		// Refusing by default is cheap insurance: this suite derives fresh
-		// wallets, moves funds and cannot undo any of it.
-		t.Fatalf("%s=56 is mainnet. Set E2E_I_MEAN_MAINNET=yes if that is really intended", envChainID)
-	}
-	// The endpoint follows the chain unless named, exactly as the service does.
+	// The endpoint is the only chain input, exactly as the service treats it.
+	// Everything else — which chain this is, the token, the router, and the
+	// mainnet guard below — follows what the endpoint reports once dialled.
 	rpcURL := os.Getenv(envRPC)
 	if rpcURL == "" {
-		url, ok := chain.DefaultRPC(chainID)
-		if !ok {
-			t.Skipf("%s must be set: no default endpoint for chain %d", envRPC, chainID)
-		}
-		rpcURL = url
+		rpcURL = chain.TestnetDefaultRPC
 	}
 
 	timeout := 15 * time.Minute
@@ -190,6 +158,37 @@ func setup(t *testing.T, n needs) *harness {
 		t.Fatalf("dial %s: %v", rpcURL, err)
 	}
 	t.Cleanup(rpc.Close)
+
+	chainID, err := rpc.ChainID(ctx)
+	if err != nil {
+		t.Fatalf("chain id: %v", err)
+	}
+	// Asking the endpoint rather than trusting a variable is what makes this
+	// guard real: the old one compared against a configured chain id, so
+	// pointing E2E_RPC_URL at mainnet while leaving the id at 97 sailed
+	// straight past it — on the one suite that derives wallets and moves funds
+	// it cannot get back.
+	if chainID == chain.MainnetChainID && os.Getenv("E2E_I_MEAN_MAINNET") != "yes" {
+		t.Fatalf("%s points at mainnet (chain %d). Set E2E_I_MEAN_MAINNET=yes if that is really intended",
+			envRPC, chainID)
+	}
+
+	// The token defaults to the well-known deployment for the chain; override it
+	// when running against your own ERC-20.
+	var token common.Address
+	switch v := os.Getenv(envToken); {
+	case v != "":
+		if !common.IsHexAddress(v) {
+			t.Fatalf("%s=%q is not a hex address", envToken, v)
+		}
+		token = common.HexToAddress(v)
+	case chainID == chain.MainnetChainID:
+		token = usdt.MainnetAddress
+	case chainID == chain.TestnetChainID:
+		token = usdt.TestnetAddress
+	default:
+		t.Skipf("%s must be set for chain %d — there is no default token for it", envToken, chainID)
+	}
 
 	st, err := store.Open(filepath.Join(t.TempDir(), "bsc.db"))
 	if err != nil {
@@ -241,7 +240,7 @@ func setup(t *testing.T, n needs) *harness {
 		t.Fatalf("scale: %v", err)
 	}
 	if err := st.Update(func(tx *store.Tx) error {
-		return tx.SetMeta(store.Meta{Token: token, Decimals: decimals})
+		return tx.SetMeta(store.Meta{ChainID: chainID, Token: token, Decimals: decimals})
 	}); err != nil {
 		t.Fatalf("meta: %v", err)
 	}

@@ -60,6 +60,17 @@ func Run(ctx context.Context, cfg config.Config) error {
 	}
 	defer rpc.Close()
 
+	// The endpoint says which chain this is, and everything chain-shaped follows
+	// from that: the token, the swap router, and the id every signature is bound
+	// to. Asking removes the one setting that could disagree with reality (§26).
+	chainID, err := rpc.ChainID(ctx)
+	if err != nil {
+		return err
+	}
+	if err := cfg.ResolveChain(chainID); err != nil {
+		return err
+	}
+
 	// The unit the ledger counts in follows from the token itself. Asking it
 	// rather than configuring it means the scale cannot be set inconsistently
 	// with the contract every amount is denominated in (§23).
@@ -71,11 +82,12 @@ func Run(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("token %s: %w", cfg.Token.Hex(), err)
 	}
-	// Recorded once and checked on every later start: every amount in this
-	// database is denominated by this token, so pointing it at another one is a
-	// migration rather than a configuration change.
+	// Recorded once and checked on every later start. Every amount in this
+	// database is denominated by this token on this chain, and every wallet in
+	// it was derived for it, so pointing the service at another is a migration
+	// rather than a configuration change — and now it cannot be done by accident.
 	if err := st.Update(func(tx *store.Tx) error {
-		return tx.SetMeta(store.Meta{Token: cfg.Token, Decimals: decimals})
+		return tx.SetMeta(store.Meta{ChainID: chainID, Token: cfg.Token, Decimals: decimals})
 	}); err != nil {
 		return err
 	}
@@ -152,7 +164,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 
 	log.Info("bsc starting",
 		"db", cfg.DBPath, "addr", cfg.HTTPAddr, "rpc", cfg.RPCURL,
-		"master", master.Address.Hex(), "collector", collector.Hex(),
+		"chain", chainID, "master", master.Address.Hex(), "collector", collector.Hex(),
 		"token", cfg.Token.Hex(), "decimals", decimals, "cent_wei", scale.CentWei(),
 		"rate_limit", cfg.RPCRateLimit)
 

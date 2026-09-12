@@ -18,6 +18,13 @@ access control.
 
 ## Day to day
 
+The startup line names the chain it detected, the token and the cent scale — the
+first thing to check if it is talking to the wrong network:
+
+```sh
+journalctl -u bsc | grep "bsc starting"
+```
+
 ```sh
 systemctl status bsc
 journalctl -u bsc -f              # structured JSON; LOG_LEVEL=debug for more

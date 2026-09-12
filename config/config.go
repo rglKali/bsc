@@ -27,10 +27,14 @@ type Config struct {
 	HTTPAddr string // HTTP_ADDR — the only listener
 
 	MasterSecret string // MASTER_SECRET (32-byte hex; required)
-	ChainID      uint64 // CHAIN_ID
-	RPCURL       string // RPC_URL
+	RPCURL       string // RPC_URL — the one chain input; everything else follows it
 	RPCRateLimit int    // RPC_RATE_LIMIT — one budget shared by everything
-	Token        common.Address
+
+	// ChainID and Token are *resolved*, not configured: ResolveChain fills them
+	// in once the endpoint has said which chain it is. Token may be overridden
+	// with TOKEN_ADDRESS, which is the only reason it is read here at all.
+	ChainID uint64
+	Token   common.Address
 
 	StartBlock    uint64        // START_BLOCK — only on a fresh database; 0 = the finalized head
 	PollInterval  time.Duration // POLL_INTERVAL
@@ -84,12 +88,11 @@ func New() *viper.Viper {
 	v := viper.New()
 	v.SetDefault("db_path", "bsc.db")
 	v.SetDefault("http_addr", "127.0.0.1:8800")
-	v.SetDefault("chain_id", chain.MainnetChainID)
-	v.SetDefault("rpc_url", "") // resolved from the chain id below
+	v.SetDefault("rpc_url", "") // resolved from the chain the endpoint reports
 	// At ~0.45s blocks the watcher alone needs ~2.2 req/s sustained, and it has
 	// to outrun the chain to ever catch up after an outage — see docs/REWRITE.md §10.
 	v.SetDefault("rpc_rate_limit", 20)
-	v.SetDefault("token_address", "") // resolved from the chain id below
+	v.SetDefault("token_address", "") // resolved from the chain the endpoint reports
 	v.SetDefault("start_block", 0)
 	v.SetDefault("poll_interval", 500*time.Millisecond)
 	v.SetDefault("backfill_batch", 100)
@@ -103,7 +106,7 @@ func New() *viper.Viper {
 	v.SetDefault("rebroadcast_after", 2*time.Minute)
 	v.SetDefault("master_poll", 30*time.Second)
 	v.SetDefault("swap_enabled", true)
-	v.SetDefault("swap_router", "") // resolved from the chain id below
+	v.SetDefault("swap_router", "") // resolved from the chain the endpoint reports
 	v.SetDefault("swap_wrapped_native", "")
 	v.SetDefault("swap_amount_wei", new(big.Int).Mul(oneUSDT, big.NewInt(10)).String())
 	// A transfer costs well under a thousandth of a BNB, so this floor is a few
@@ -128,7 +131,6 @@ func Parse(v *viper.Viper) (Config, error) {
 		DBPath:            v.GetString("db_path"),
 		HTTPAddr:          v.GetString("http_addr"),
 		MasterSecret:      v.GetString("master_secret"),
-		ChainID:           v.GetUint64("chain_id"),
 		RPCURL:            v.GetString("rpc_url"),
 		RPCRateLimit:      v.GetInt("rpc_rate_limit"),
 		StartBlock:        v.GetUint64("start_block"),
@@ -154,33 +156,21 @@ func Parse(v *viper.Viper) (Config, error) {
 		return Config{}, errors.New("MASTER_SECRET is required")
 	}
 
-	// An endpoint the operator did not name comes from the chain. Only a chain
-	// we have no default for is an error, and then only because there is
-	// nothing to dial — every other case just works.
+	// The endpoint is the one chain input, so it is the one with a literal
+	// default. Everything that used to follow a configured CHAIN_ID now follows
+	// the chain the endpoint actually reports — see ResolveChain.
 	if cfg.RPCURL == "" {
-		url, ok := chain.DefaultRPC(cfg.ChainID)
-		if !ok {
-			return Config{}, fmt.Errorf("RPC_URL must be set: there is no default endpoint for chain %d", cfg.ChainID)
-		}
-		cfg.RPCURL = url
+		cfg.RPCURL = chain.MainnetDefaultRPC
 	}
 
-	// The token resolves from the chain for the same reason the endpoint does.
-	// Defaulting to the mainnet address everywhere would be quietly wrong on any
-	// other chain: the contract simply would not exist there, and the watcher
-	// would see no transfers at all rather than complaining.
-	switch token := v.GetString("token_address"); {
-	case token != "":
+	// Validated here, resolved in ResolveChain: a bad address should be refused
+	// before anything dials, but a *missing* one cannot be filled in until the
+	// chain has identified itself.
+	if token := v.GetString("token_address"); token != "" {
 		if !common.IsHexAddress(token) {
 			return Config{}, fmt.Errorf("TOKEN_ADDRESS %q is not a hex address", token)
 		}
 		cfg.Token = common.HexToAddress(token)
-	case cfg.ChainID == chain.MainnetChainID:
-		cfg.Token = usdt.MainnetAddress
-	case cfg.ChainID == chain.TestnetChainID:
-		cfg.Token = usdt.TestnetAddress
-	default:
-		return Config{}, fmt.Errorf("TOKEN_ADDRESS must be set: there is no default token for chain %d", cfg.ChainID)
 	}
 
 	if cfg.FeeCollector != "" && !common.IsHexAddress(cfg.FeeCollector) {
@@ -198,23 +188,9 @@ func Parse(v *viper.Viper) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.SwapEnabled {
-		// A router the operator did not name is resolved from the chain, using
-		// addresses verified against the explorer. An unknown chain is a hard
-		// error rather than a silent no-op: quietly not swapping would only be
-		// discovered when the master ran dry.
-		if cfg.SwapRouter == "" {
-			switch cfg.ChainID {
-			case chain.MainnetChainID:
-				cfg.SwapRouter = swap.PancakeV2Mainnet.Hex()
-			case chain.TestnetChainID:
-				cfg.SwapRouter = swap.PancakeV2Testnet.Hex()
-			default:
-				return Config{}, fmt.Errorf(
-					"no default swap router for chain %d: set SWAP_ROUTER, or SWAP_ENABLED=false to run without gas top-ups",
-					cfg.ChainID)
-			}
-		}
-		if !common.IsHexAddress(cfg.SwapRouter) {
+		// A router the operator did not name is resolved from the chain in
+		// ResolveChain; only an explicit one can be checked this early.
+		if cfg.SwapRouter != "" && !common.IsHexAddress(cfg.SwapRouter) {
 			return Config{}, fmt.Errorf("SWAP_ROUTER %q is not a hex address", cfg.SwapRouter)
 		}
 		// Normally unset: the router reports its own wrapped token, which cannot
@@ -266,4 +242,58 @@ func wei(v *viper.Viper, key string) (*big.Int, error) {
 		return nil, fmt.Errorf("%s must be a non-negative integer in wei (got %q)", key, raw)
 	}
 	return n, nil
+}
+
+// ResolveChain fills in everything that depends on which chain we are actually
+// talking to, using the id the endpoint reported after connecting.
+//
+// This is a separate step from Load because Load does no I/O — it must be
+// testable and it must fail on a bad value before anything dials — while the
+// chain id is, by design, something only the chain can tell us. The alternative
+// was a CHAIN_ID setting, and a setting that can disagree with the endpoint is
+// one that eventually will: the signer binds every transaction to it, so a
+// mismatch leaves a service that reads blocks perfectly and cannot send
+// anything, with nothing in the logs to explain it.
+//
+// An explicit TOKEN_ADDRESS or SWAP_ROUTER still wins; this only supplies what
+// the operator left out.
+func (c *Config) ResolveChain(chainID uint64) error {
+	if chainID == 0 {
+		return errors.New("config: cannot resolve settings without a chain id")
+	}
+	c.ChainID = chainID
+
+	// Defaulting the token to the mainnet address everywhere would be quietly
+	// wrong on any other chain: the contract would not exist there, and the
+	// watcher would report no transfers rather than complaining.
+	if c.Token == (common.Address{}) {
+		switch chainID {
+		case chain.MainnetChainID:
+			c.Token = usdt.MainnetAddress
+		case chain.TestnetChainID:
+			c.Token = usdt.TestnetAddress
+		default:
+			return fmt.Errorf(
+				"TOKEN_ADDRESS must be set: %s is chain %d, which has no default token",
+				c.RPCURL, chainID)
+		}
+	}
+
+	if !c.SwapEnabled || c.SwapRouter != "" {
+		return nil
+	}
+	// Addresses verified against the explorer. An unknown chain is a hard error
+	// rather than a silent no-op: quietly not swapping would only be discovered
+	// when the master ran dry.
+	switch chainID {
+	case chain.MainnetChainID:
+		c.SwapRouter = swap.PancakeV2Mainnet.Hex()
+	case chain.TestnetChainID:
+		c.SwapRouter = swap.PancakeV2Testnet.Hex()
+	default:
+		return fmt.Errorf(
+			"no default swap router for chain %d: set SWAP_ROUTER, or SWAP_ENABLED=false to run without gas top-ups",
+			chainID)
+	}
+	return nil
 }

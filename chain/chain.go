@@ -13,6 +13,7 @@ package chain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"time"
@@ -89,6 +90,24 @@ func (c *Client) call(ctx context.Context, result any, method string, args ...an
 // Finalized returns the highest finalized block number. Everything bsc does is
 // finalized-only, which is what makes reorgs a non-issue rather than a design
 // problem.
+// ChainID asks the endpoint which chain it is.
+//
+// bsc reads this rather than being told, because a configured chain id that
+// disagreed with the endpoint would be undetectable and total: the signer binds
+// every transaction to it (EIP-155), so the node rejects all of them, while the
+// watcher happily keeps reading blocks. Deposits would be detected and never
+// drained, with nothing in the logs to say why.
+func (c *Client) ChainID(ctx context.Context) (uint64, error) {
+	var raw hexutil.Uint64
+	if err := c.call(ctx, &raw, "eth_chainId"); err != nil {
+		return 0, fmt.Errorf("chain: read eth_chainId: %w", err)
+	}
+	if raw == 0 {
+		return 0, errors.New("chain: endpoint reported chain id 0")
+	}
+	return uint64(raw), nil
+}
+
 func (c *Client) Finalized(ctx context.Context) (uint64, error) {
 	var head types.Header
 	if err := c.call(ctx, &head, "eth_getFinalizedHeader", finalizedVerifiedValidators); err != nil {

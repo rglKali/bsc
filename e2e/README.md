@@ -58,10 +58,9 @@ You need one funded wallet. Everything else defaults from the chain id.
 
 | Variable | Required | What |
 | --- | --- | --- |
-| `E2E_RPC_URL` | no | Defaults to the public endpoint for the chain (`chain.TestnetDefaultRPC` on 97). |
+| `E2E_RPC_URL` | no | **The one chain input**, defaulting to the public Chapel endpoint. Which chain this is, the token and the router all follow what it reports — as does the mainnet refusal below. |
 | `E2E_MASTER_SECRET` | yes | 32-byte hex. A **throwaway** key holding the run's funds. Everything else is derived or generated. |
-| `E2E_TOKEN_ADDRESS` | no | Defaults to `usdt.TestnetAddress` on chain 97 and `usdt.MainnetAddress` on 56. Set it only to use your own ERC-20. |
-| `E2E_CHAIN_ID` | no | Default `97` (Chapel). |
+| `E2E_TOKEN_ADDRESS` | no | Defaults to the USDT deployment for the chain the endpoint reports. Set it only to use your own ERC-20. |
 | `E2E_DEPOSIT` | no | Deposit size in wei. Default 2 whole tokens. |
 | `E2E_SWAP_ROUTER` | no | Defaults to the verified PancakeSwap V2 router for the chain. |
 | `E2E_SWAP_AMOUNT` | no | Tokens per gas top-up, in wei. Default 1 whole token. |
@@ -145,8 +144,8 @@ export E2E_MASTER_SECRET=…   # throwaway, holds the tBNB and test USDT
 task e2e
 ```
 
-Everything else has a default: the endpoint, the token and the swap router all
-follow `E2E_CHAIN_ID`, which is Chapel unless you say otherwise.
+Everything else has a default: the endpoint is Chapel unless you say otherwise,
+and the token and swap router follow whichever chain it turns out to be.
 
 Expect it to take several minutes: each stage waits for real finality, and the
 full lifecycle is roughly eight confirmations deep — stocking the funder is two,
@@ -158,9 +157,11 @@ transaction rather than just failing.
 
 ## Safety
 
-- It **refuses to run against mainnet** (`E2E_CHAIN_ID=56`) unless you also set
-  `E2E_I_MEAN_MAINNET=yes`. The suite derives fresh wallets and moves funds, and
-  none of that is reversible.
+- It **refuses to run against mainnet** unless you also set
+  `E2E_I_MEAN_MAINNET=yes`. The chain is read from the endpoint after connecting,
+  so pointing `E2E_RPC_URL` at a mainnet node trips the guard — which the old
+  check against a configured chain id would have sailed straight past. The suite
+  derives fresh wallets and moves funds, and none of that is reversible.
 - It uses a fresh temporary database per run, never your real one.
 - The funder is generated per run and emptied back into the master afterwards,
   tokens stranded in derived wallets are pulled back under the master's

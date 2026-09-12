@@ -184,6 +184,11 @@ NATS and SSE were all considered and rejected; see `docs/ARCHITECTURE.md`.
 - `RPC_RATE_LIMIT` must clear the block rate by a wide margin. At ~0.45s blocks
   the watcher needs ~2.2 req/s just to keep up, and a limit that cannot outrun
   the chain leaves it permanently unable to catch up. Config refuses below 5.
+- **There is no `CHAIN_ID`.** `RPC_URL` is the one chain input; `eth_chainId`
+  after connecting decides the token, the router and the signer, and the answer
+  is recorded in `data/` so a database cannot be opened against another chain
+  (§26). `config.Load` stays I/O-free — `Config.ResolveChain` is the step that
+  needs the dial.
 - `START_BLOCK=0` means "the current finalized head", not genesis.
 - The watcher must never be starved: it is what observes finality, so anything
   that blocks it stops every in-flight transfer too. Shutdown is decided by

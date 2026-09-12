@@ -5,6 +5,8 @@ import (
 	"bsc/swap"
 	"bsc/usdt"
 
+	"github.com/ethereum/go-ethereum/common"
+
 	"math/big"
 	"strings"
 	"testing"
@@ -49,11 +51,14 @@ func TestDefaults(t *testing.T) {
 	if cfg.DefaultFee != 100 || cfg.HouseSweepMin != 100 {
 		t.Fatalf("default fee %d / house sweep min %d", cfg.DefaultFee, cfg.HouseSweepMin)
 	}
-	if cfg.Token != usdt.MainnetAddress {
-		t.Fatalf("token = %s, want mainnet USDT", cfg.Token.Hex())
-	}
+	// The endpoint is the one chain input, so it is the only one with a
+	// literal default; the token follows the chain the endpoint reports.
 	if cfg.RPCURL != chain.MainnetDefaultRPC {
 		t.Fatalf("rpc = %q, want the mainnet default", cfg.RPCURL)
+	}
+	if cfg.Token != (common.Address{}) || cfg.ChainID != 0 {
+		t.Fatalf("Load resolved chain-dependent settings: chain %d token %s",
+			cfg.ChainID, cfg.Token.Hex())
 	}
 	if cfg.FeeCollector != "" {
 		t.Fatalf("collector = %q, want empty so it resolves to the master", cfg.FeeCollector)
@@ -155,41 +160,30 @@ func TestSwappingDefaultsToTheChainsRouter(t *testing.T) {
 	if !cfg.SwapEnabled {
 		t.Fatal("swapping is off by default")
 	}
+
+	// Nothing chain-shaped is decided until the endpoint says which chain it is.
+	if cfg.SwapRouter != "" {
+		t.Fatalf("router = %q before resolution; it cannot be known yet", cfg.SwapRouter)
+	}
+	if err := cfg.ResolveChain(chain.MainnetChainID); err != nil {
+		t.Fatalf("ResolveChain: %v", err)
+	}
 	if cfg.SwapRouter != swap.PancakeV2Mainnet.Hex() {
 		t.Fatalf("router = %q, want the mainnet default", cfg.SwapRouter)
 	}
 
-	withEnv(t, "CHAIN_ID", "97")
-	cfg, err = Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+	cfg, _ = Load()
+	if err := cfg.ResolveChain(chain.TestnetChainID); err != nil {
+		t.Fatalf("ResolveChain: %v", err)
 	}
 	if cfg.SwapRouter != swap.PancakeV2Testnet.Hex() {
 		t.Fatalf("testnet router = %q", cfg.SwapRouter)
 	}
 }
 
-func TestChainSelectsItsOwnEndpointAndToken(t *testing.T) {
-	// Chain id, endpoint and token have to agree. Defaulting the token to
-	// mainnet on every chain would be quietly wrong: the contract would not
-	// exist, and the watcher would report no transfers rather than an error.
-	withEnv(t, "CHAIN_ID", "97")
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.RPCURL != chain.TestnetDefaultRPC {
-		t.Fatalf("rpc = %q, want the testnet default", cfg.RPCURL)
-	}
-	if cfg.Token != usdt.TestnetAddress {
-		t.Fatalf("token = %s, want testnet USDT", cfg.Token.Hex())
-	}
-}
-
 func TestEnvironmentAlwaysBeatsTheChainDefaults(t *testing.T) {
 	// These are defaults, not policy.
 	withEnv(t,
-		"CHAIN_ID", "97",
 		"RPC_URL", "wss://my-own-node.example",
 		"TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955",
 	)
@@ -200,70 +194,13 @@ func TestEnvironmentAlwaysBeatsTheChainDefaults(t *testing.T) {
 	if cfg.RPCURL != "wss://my-own-node.example" {
 		t.Fatalf("rpc = %q, want the environment's", cfg.RPCURL)
 	}
+	// Resolution must not overwrite what the operator named, even when the
+	// chain has a perfectly good default of its own.
+	if err := cfg.ResolveChain(chain.TestnetChainID); err != nil {
+		t.Fatalf("ResolveChain: %v", err)
+	}
 	if cfg.Token != usdt.MainnetAddress {
 		t.Fatalf("token = %s, want the environment's", cfg.Token.Hex())
-	}
-}
-
-func TestUnknownChainNeedsItsEndpointAndTokenNamed(t *testing.T) {
-	// Not loud for its own sake: there is genuinely nothing to dial, and
-	// guessing would point a signer at one chain while it signs for another.
-	withEnv(t, "CHAIN_ID", "1337", "SWAP_ENABLED", "false")
-	_, err := Load()
-	if err == nil || !strings.Contains(err.Error(), "RPC_URL") {
-		t.Fatalf("err = %v, want it to name RPC_URL", err)
-	}
-
-	withEnv(t, "CHAIN_ID", "1337", "SWAP_ENABLED", "false", "RPC_URL", "wss://somewhere.example")
-	_, err = Load()
-	if err == nil || !strings.Contains(err.Error(), "TOKEN_ADDRESS") {
-		t.Fatalf("err = %v, want it to name TOKEN_ADDRESS", err)
-	}
-
-	withEnv(t, "CHAIN_ID", "1337", "SWAP_ENABLED", "false",
-		"RPC_URL", "wss://somewhere.example",
-		"TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955")
-	if _, err := Load(); err != nil {
-		t.Fatalf("a fully named unknown chain was rejected: %v", err)
-	}
-}
-
-func TestUnknownChainMustNameItsRouter(t *testing.T) {
-	// Silently not swapping would only be discovered when the master ran dry,
-	// so an unresolvable router is a startup failure.
-	named := []string{
-		"CHAIN_ID", "1337",
-		"RPC_URL", "wss://somewhere.example",
-		"TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955",
-	}
-	withEnv(t, named...)
-	_, err := Load()
-	if err == nil {
-		t.Fatal("accepted an unknown chain with swapping on")
-	}
-	if !strings.Contains(err.Error(), "SWAP_ENABLED=false") {
-		t.Fatalf("error = %v; it should say how to proceed", err)
-	}
-
-	// Either naming a router or turning it off is a way forward.
-	withEnv(t, append(named, "SWAP_ROUTER", "0x10ED43C718714eb63d5aA57B78B54704E256024E")...)
-	if _, err := Load(); err != nil {
-		t.Fatalf("explicit router rejected: %v", err)
-	}
-	withEnv(t, append(named, "SWAP_ENABLED", "false")...)
-	if _, err := Load(); err != nil {
-		t.Fatalf("disabling rejected: %v", err)
-	}
-}
-
-func TestSwappingCanBeTurnedOff(t *testing.T) {
-	withEnv(t, "SWAP_ENABLED", "false")
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.SwapEnabled {
-		t.Fatal("SWAP_ENABLED=false did not take")
 	}
 }
 
@@ -306,5 +243,90 @@ func TestEnablingSwapsDemandsCompleteConfiguration(t *testing.T) {
 	})
 	if cfg.SwapSlippage != 100 {
 		t.Fatalf("slippage = %d bps, want a 1%% default", cfg.SwapSlippage)
+	}
+}
+
+// TestNothingChainShapedIsKnownBeforeResolution: Load does no I/O, so it cannot
+// know which chain the endpoint speaks for. Leaving those fields empty is what
+// makes the mismatch impossible — there is no configured value to disagree.
+func TestNothingChainShapedIsKnownBeforeResolution(t *testing.T) {
+	withEnv(t, "RPC_URL", "wss://somewhere.example")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ChainID != 0 || cfg.Token != (common.Address{}) || cfg.SwapRouter != "" {
+		t.Fatalf("Load guessed at the chain: id %d token %s router %q",
+			cfg.ChainID, cfg.Token.Hex(), cfg.SwapRouter)
+	}
+}
+
+func TestResolveChainFollowsTheEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		chainID uint64
+		token   common.Address
+		router  string
+	}{
+		{chain.MainnetChainID, usdt.MainnetAddress, swap.PancakeV2Mainnet.Hex()},
+		{chain.TestnetChainID, usdt.TestnetAddress, swap.PancakeV2Testnet.Hex()},
+	} {
+		withEnv(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if err := cfg.ResolveChain(tc.chainID); err != nil {
+			t.Fatalf("chain %d: ResolveChain: %v", tc.chainID, err)
+		}
+		if cfg.ChainID != tc.chainID || cfg.Token != tc.token || cfg.SwapRouter != tc.router {
+			t.Fatalf("chain %d resolved to token %s router %q",
+				tc.chainID, cfg.Token.Hex(), cfg.SwapRouter)
+		}
+	}
+}
+
+// TestUnknownChainMustBeNamedInFull: an endpoint we have no defaults for is a
+// startup failure naming exactly what is missing. Guessing would point a signer
+// at one chain's token while the endpoint served another.
+func TestUnknownChainMustBeNamedInFull(t *testing.T) {
+	withEnv(t, "RPC_URL", "wss://somewhere.example", "SWAP_ENABLED", "false")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.ResolveChain(1337); err == nil || !strings.Contains(err.Error(), "TOKEN_ADDRESS") {
+		t.Fatalf("err = %v, want it to name TOKEN_ADDRESS", err)
+	}
+
+	// Swapping on, with no router we can resolve: it must say how to proceed
+	// rather than quietly never swapping, which would surface only as a dry
+	// master weeks later.
+	// SWAP_ENABLED is set back explicitly: t.Setenv unwinds at the end of the
+	// test, not between withEnv calls inside one.
+	withEnv(t, "RPC_URL", "wss://somewhere.example", "SWAP_ENABLED", "true",
+		"TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955")
+	cfg, _ = Load()
+	err = cfg.ResolveChain(1337)
+	if err == nil || !strings.Contains(err.Error(), "SWAP_ENABLED=false") {
+		t.Fatalf("err = %v; it should say how to proceed", err)
+	}
+
+	// Naming both is a way forward.
+	withEnv(t, "RPC_URL", "wss://somewhere.example", "SWAP_ENABLED", "true",
+		"TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955",
+		"SWAP_ROUTER", "0x10ED43C718714eb63d5aA57B78B54704E256024E")
+	cfg, _ = Load()
+	if err := cfg.ResolveChain(1337); err != nil {
+		t.Fatalf("a fully named unknown chain was rejected: %v", err)
+	}
+}
+
+func TestResolveChainRefusesAChainIdOfZero(t *testing.T) {
+	// Only reachable if an endpoint answers eth_chainId with 0, which the chain
+	// client already rejects — belt and braces around the signer.
+	withEnv(t)
+	cfg, _ := Load()
+	if err := cfg.ResolveChain(0); err == nil {
+		t.Fatal("resolved against chain id 0")
 	}
 }

@@ -321,6 +321,28 @@ Add an entry rather than silently changing a documented decision.
     design depends on the answer, because the excess is derived rather than
     stored and can be redirected without a migration.
 
+26. **The endpoint says which chain this is; `CHAIN_ID` is gone.** It used to be
+    the setting everything else followed — the endpoint, the token and the swap
+    router all defaulted from it. Nothing checked it against the endpoint, and
+    the default was mainnet, so pointing `RPC_URL` at testnet and forgetting it
+    produced a service that synced blocks, recorded deposits correctly, and had
+    every single transaction rejected: the signer binds each one to the
+    configured id (EIP-155), so the node refuses them all. Reads work, writes
+    fail, and nothing in the logs says why.
+
+    Now `RPC_URL` is the one chain input. `eth_chainId` after connecting decides
+    the token, the router and the signer, so there is no second value left to
+    disagree. `Config.Load` still does no I/O and still refuses a malformed
+    address before anything dials; `Config.ResolveChain` fills in what only the
+    chain can answer. An explicit `TOKEN_ADDRESS` or `SWAP_ROUTER` still wins,
+    and an endpoint we have no defaults for is a startup error naming exactly
+    what is missing.
+
+    The chain id joins the token and its decimals in `data/`, checked on every
+    later start. A database built against one chain cannot be opened against
+    another — the wallets in it were derived for that chain and the amounts are
+    denominated in its token, so moving it is a migration, not a config edit.
+
 ## Verification
 
 Every test runs offline — no chain, no network, no database server. The store is

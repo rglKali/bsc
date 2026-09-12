@@ -48,10 +48,9 @@ Everything comes from the environment. A handful of settings also have flags
 | `MASTER_SECRET` | — | **Required.** 32-byte hex. Signs everything; holds an unlimited allowance on every derived wallet. Secrets manager only. |
 | `DB_PATH` | `bsc.db` | The only datastore. Put it under `/var/lib/bsc`. |
 | `HTTP_ADDR` | `127.0.0.1:8800` | The only listener. There is no authentication — keep it on loopback. |
-| `RPC_URL` | per chain | Defaults to the public endpoint for `CHAIN_ID`. An unknown chain must name one — there is nothing sensible to guess, and pointing a signer at the wrong chain's node is worse than failing. |
+| `RPC_URL` | mainnet public node | **The one chain setting.** Everything else chain-shaped follows what this endpoint reports for `eth_chainId`: the token, the swap router, and the id every signature is bound to. Point it at a testnet node and the whole service follows. |
 | `RPC_RATE_LIMIT` | `20` | Requests per second, shared by everything. **Must clear the block rate with room to spare** — see below. Refused below 5. |
-| `CHAIN_ID` | `56` | |
-| `TOKEN_ADDRESS` | per chain | Defaults to USDT for `CHAIN_ID`. Defaulting to the mainnet address everywhere would be quietly wrong elsewhere: the contract would not exist and the watcher would simply see nothing. |
+| `TOKEN_ADDRESS` | per chain | Defaults to USDT for the chain the endpoint reports. Defaulting to the mainnet address everywhere would be quietly wrong elsewhere: the contract would not exist and the watcher would simply see nothing. An endpoint on a chain with no default must name this. |
 | `START_BLOCK` | `0` | Only used on a fresh database. `0` means *the current finalized head*, never genesis. |
 | `POLL_INTERVAL` | `500ms` | Head poll once caught up; no sleep at all while behind. |
 | `BACKFILL_BATCH` | `100` | Blocks per write transaction while catching up. |
@@ -65,7 +64,7 @@ Everything comes from the environment. A handful of settings also have flags
 | `REBROADCAST_AFTER` | `2m` | How long before an unconfirmed transaction is re-sent (the same signed bytes). |
 | `MASTER_POLL` | `30s` | How often the master BNB gauge refreshes. |
 | `SWAP_ENABLED` | `true` | Trade collected fees back into gas when the master runs low. |
-| `SWAP_ROUTER` | per chain | A Uniswap-V2-interface router. Defaults to the verified PancakeSwap V2 deployment for `CHAIN_ID`; an unknown chain must name one or set `SWAP_ENABLED=false`. |
+| `SWAP_ROUTER` | per chain | A Uniswap-V2-interface router. Defaults to the verified PancakeSwap V2 deployment for the chain the endpoint reports; an unknown chain must name one or set `SWAP_ENABLED=false`. |
 | `SWAP_WRAPPED_NATIVE` | asked of the router | Override only, for a fork that names the accessor something other than `WETH()`. |
 | `SWAP_AMOUNT_WEI` | `10e18` | Tokens traded per top-up. |
 | `GAS_FLOOR_WEI` | `0.05` BNB | Native balance below which a top-up is due. Well above the cost of the swap itself — below that, the master could not afford to rescue itself. |

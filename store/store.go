@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -270,6 +271,7 @@ func prefixEnd(prefix []byte) []byte {
 // or at a token whose decimals differ, would silently reinterpret every amount
 // it holds.
 type Meta struct {
+	ChainID  uint64
 	Token    common.Address
 	Decimals uint8
 }
@@ -289,7 +291,15 @@ func (t *Tx) Meta() (Meta, bool, error) {
 	if len(dec) != 1 {
 		return Meta{}, false, fmt.Errorf("store: decimals meta is %d bytes", len(dec))
 	}
-	return Meta{Token: common.BytesToAddress(raw), Decimals: dec[0]}, true, nil
+	id := b.Get(keyChainID)
+	if len(id) != 8 {
+		return Meta{}, false, fmt.Errorf("store: chain id meta is %d bytes", len(id))
+	}
+	return Meta{
+		ChainID:  binary.BigEndian.Uint64(id),
+		Token:    common.BytesToAddress(raw),
+		Decimals: dec[0],
+	}, true, nil
 }
 
 // SetMeta records the token identity, refusing to change one already stored.
@@ -303,8 +313,9 @@ func (t *Tx) SetMeta(m Meta) error {
 	if ok {
 		if existing != m {
 			return fmt.Errorf(
-				"store: this database is for token %s with %d decimals, not %s with %d",
-				existing.Token.Hex(), existing.Decimals, m.Token.Hex(), m.Decimals)
+				"store: this database belongs to chain %d, token %s with %d decimals — not chain %d, token %s with %d",
+				existing.ChainID, existing.Token.Hex(), existing.Decimals,
+				m.ChainID, m.Token.Hex(), m.Decimals)
 		}
 		return nil
 	}
@@ -314,6 +325,9 @@ func (t *Tx) SetMeta(m Meta) error {
 	}
 	if err := b.Put(keyDecimals, []byte{m.Decimals}); err != nil {
 		return fmt.Errorf("store: write decimals meta: %w", err)
+	}
+	if err := b.Put(keyChainID, binary.BigEndian.AppendUint64(nil, m.ChainID)); err != nil {
+		return fmt.Errorf("store: write chain id meta: %w", err)
 	}
 	return nil
 }

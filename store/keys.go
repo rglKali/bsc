@@ -53,6 +53,7 @@ var (
 	keyCursor   = []byte("cursor")
 	keyToken    = []byte("token")    // the token this database is about
 	keyDecimals = []byte("decimals") // its decimals(), read from the chain once
+	keyChainID  = []byte("chain_id") // the chain it lives on, reported by the endpoint
 )
 
 // ErrBadSlug is returned for an app slug that cannot be used in a key.

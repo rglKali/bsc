@@ -250,3 +250,49 @@ func TestOpenReadOnlyReadsASnapshot(t *testing.T) {
 		t.Fatal("a read-only store accepted a write")
 	}
 }
+
+// TestMetaRefusesADifferentChain: every wallet in a database was derived for
+// one chain and every amount is denominated by one token. Moving the file
+// between them is a migration, and the guard is what stops it happening by
+// accident — a mistake that would otherwise show up as a service that reads
+// blocks perfectly and can sign nothing.
+func TestMetaRefusesADifferentChain(t *testing.T) {
+	s := open(t)
+	mainnet := Meta{ChainID: 56, Token: addr(0x55), Decimals: 18}
+	update(t, s, func(tx *Tx) error { return tx.SetMeta(mainnet) })
+
+	// Re-recording the same identity is how every normal restart goes.
+	update(t, s, func(tx *Tx) error { return tx.SetMeta(mainnet) })
+
+	for name, m := range map[string]Meta{
+		"another chain":    {ChainID: 97, Token: addr(0x55), Decimals: 18},
+		"another token":    {ChainID: 56, Token: addr(0x99), Decimals: 18},
+		"another decimals": {ChainID: 56, Token: addr(0x55), Decimals: 6},
+	} {
+		err := s.Update(func(tx *Tx) error { return tx.SetMeta(m) })
+		if err == nil {
+			t.Fatalf("%s: accepted", name)
+		}
+	}
+
+	got, ok, err := readMeta(t, s)
+	if err != nil || !ok || got != mainnet {
+		t.Fatalf("meta = %+v (ok=%v err=%v), want it unchanged", got, ok, err)
+	}
+}
+
+func readMeta(t *testing.T, s *Store) (Meta, bool, error) {
+	t.Helper()
+	var (
+		m   Meta
+		ok  bool
+		err error
+	)
+	if verr := s.View(func(tx *Tx) error {
+		m, ok, err = tx.Meta()
+		return nil
+	}); verr != nil {
+		t.Fatalf("View: %v", verr)
+	}
+	return m, ok, err
+}
