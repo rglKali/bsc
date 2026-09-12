@@ -1,0 +1,15 @@
+# Standalone Prometheus config for running the Grafana dashboard against a local
+# bsc. For the monorepo deployment use ../prometheus.yml, which is a fragment
+# included by the repo-root config.
+#
+global:
+  scrape_interval: 15s
+
+#
+# One process, one target. bsc has no public route — it listens on loopback and
+# is called by other services on the same box — so this is scraped over loopback
+# too. Series are all under a single bsc_* namespace.
+scrape_configs:
+  - job_name: bsc
+    static_configs:
+      - targets: ["127.0.0.1:8800"]

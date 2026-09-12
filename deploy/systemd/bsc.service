@@ -1,0 +1,41 @@
+[Unit]
+Description=bsc — USDT chain gateway
+Documentation=https://github.com/rglKali/bsc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bsc
+Group=bsc
+EnvironmentFile=/etc/bsc/bsc.env
+ExecStart=/opt/bsc/bin/bsc
+Restart=on-failure
+RestartSec=3
+
+# State is one bbolt file plus the snapshots beside it. Everything is journalled
+# before it is broadcast, so a restart re-sends the same signed bytes rather than
+# signing again — stopping and starting is safe at any moment.
+WorkingDirectory=/var/lib/bsc
+ReadWritePaths=/var/lib/bsc
+
+# Give the watcher time to finish the block it is applying.
+TimeoutStopSec=30
+
+# Hardening. This process holds the master secret, so it gets no more of the
+# system than it needs.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

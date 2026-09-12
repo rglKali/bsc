@@ -1,0 +1,65 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: '3'
+
+tasks:
+  list:
+    desc: Print this message
+    silent: true
+    aliases:
+      - default
+    cmds:
+      - task --list
+
+  abi:
+    desc: Generate ABI bindings
+    cmds:
+      - mkdir -p usdt
+      - curl -s https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/refs/heads/master/contracts/token/ERC20/IERC20.sol | solc --combined-json abi - | jq '.contracts."<stdin>:IERC20".abi' | abigen --out usdt/abi.go --pkg usdt --v2 --abi -
+
+  build:
+    desc: Compile all packages
+    cmds:
+      - go build ./...
+
+  binary:
+    desc: Build the bsc binary into ./bin (static, stripped; see deploy/)
+    vars:
+      VERSION:
+        sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+    env:
+      CGO_ENABLED: '0'
+    cmds:
+      - mkdir -p bin
+      - go build -trimpath -ldflags="-s -w -X main.version={{.VERSION}}" -o bin/bsc .
+
+  test:
+    desc: Run the tests (no chain, no network, no database server)
+    cmds:
+      - go test ./...
+
+  cover:
+    desc: Report test coverage across the service packages
+    cmds:
+      - go test ./... -coverpkg=./... -coverprofile=/tmp/bsc-cover.out
+      - go tool cover -func=/tmp/bsc-cover.out | tail -1
+
+  e2e:
+    desc: 'End-to-end against a real chain. Spends testnet funds; skips unless configured (see e2e/README.md)'
+    cmds:
+      - go test -tags e2e -count=1 -v -timeout 30m ./e2e/ {{.CLI_ARGS}}
+
+  vet:
+    desc: Vet all packages
+    cmds:
+      - go vet ./...
+
+  run:
+    desc: Run the service (needs MASTER_SECRET; see deploy/README.md)
+    cmds:
+      - go run . {{.CLI_ARGS}}
+
+  inspect:
+    desc: 'Audit a database file: task inspect -- /var/backups/bsc/bsc-….db'
+    cmds:
+      - go run . inspect {{.CLI_ARGS}}

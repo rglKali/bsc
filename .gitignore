@@ -1,0 +1,14 @@
+# bbolt database + lock
+*.db
+*.db.lock
+
+# local env files (commit deploy/*.env.example instead)
+*.env
+
+# built binaries
+/bin/
+/bsc
+/dist/
+
+# editor/OS
+.DS_Store
