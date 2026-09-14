@@ -31,7 +31,7 @@ func (f *fixture) deposit(slug, ref string, block uint64, logIndex uint32, amoun
 		_, err = tx.PutDeposit(store.Deposit{
 			Wallet: w.ID, App: slug, Block: block, LogIndex: logIndex, TxHash: txHash,
 			From: common.HexToAddress("0xf0"), AmountWei: big.NewInt(amount), Cents: money.Cents(amount),
-			Status: store.DepositConfirmed, CreatedAt: time.Now().UTC(),
+			Status: store.DepositPending, CreatedAt: time.Now().UTC(),
 		})
 		return err
 	}); err != nil {
@@ -42,27 +42,32 @@ func (f *fixture) deposit(slug, ref string, block uint64, logIndex uint32, amoun
 func TestDepositFeedIsCursored(t *testing.T) {
 	f := newFixture(t)
 	f.register("df")
-	f.json(f.do("POST", "/v1/apps/df/wallets", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
+	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
 	f.deposit("df", "cust-1", 100, 3, 500)
 	f.deposit("df", "cust-1", 101, 0, 600)
 
 	var page depositsPage
 	f.json(f.do("GET", "/v1/apps/df/deposits?limit=1", nil), http.StatusOK, &page)
-	if len(page.Deposits) != 1 || page.Deposits[0].Block != 100 {
+	if len(page.Deposits) != 1 || page.Deposits[0].AmountCents != "500" {
 		t.Fatalf("first page = %+v", page.Deposits)
 	}
-	// The cursor is the chain's own ordering, and the app sees its own ref
-	// rather than an address it never chose.
-	if page.Deposits[0].Cursor != "100-3" || page.Deposits[0].Ref != "cust-1" {
+	// The app sees its own ref rather than an address it never chose, and the
+	// deposit's id doubles as the cursor.
+	first := page.Deposits[0].ID
+	if first == "" || page.Deposits[0].Ref != "cust-1" {
 		t.Fatalf("deposit view = %+v", page.Deposits[0])
 	}
-	if page.Cursor != "100-3" {
-		t.Fatalf("cursor = %q", page.Cursor)
+	if page.Cursor != first {
+		t.Fatalf("cursor = %q, want the last deposit's id %q", page.Cursor, first)
 	}
 
 	f.json(f.do("GET", "/v1/apps/df/deposits?since="+page.Cursor, nil), http.StatusOK, &page)
-	if len(page.Deposits) != 1 || page.Deposits[0].Block != 101 {
+	if len(page.Deposits) != 1 || page.Deposits[0].AmountCents != "600" {
 		t.Fatalf("second page = %+v", page.Deposits)
+	}
+	// Opaque, but ordered: an app may compare two ids without parsing either.
+	if page.Deposits[0].ID <= first {
+		t.Fatalf("ids did not increase: %q then %q", first, page.Deposits[0].ID)
 	}
 
 	// Passing the cursor back when nothing is new must not lose the place.
@@ -77,14 +82,14 @@ func TestDepositFeedIsScopedPerApp(t *testing.T) {
 	f := newFixture(t)
 	f.register("df")
 	f.register("other")
-	f.json(f.do("POST", "/v1/apps/df/wallets", depositAddressBody{Ref: "a"}), http.StatusCreated, nil)
-	f.json(f.do("POST", "/v1/apps/other/wallets", depositAddressBody{Ref: "a"}), http.StatusCreated, nil)
+	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "a"}), http.StatusCreated, nil)
+	f.json(f.do("POST", "/v1/apps/other/addresses", depositAddressBody{Ref: "a"}), http.StatusCreated, nil)
 	f.deposit("df", "a", 100, 0, 1)
 	f.deposit("other", "a", 101, 0, 2)
 
 	var page depositsPage
 	f.json(f.do("GET", "/v1/apps/df/deposits", nil), http.StatusOK, &page)
-	if len(page.Deposits) != 1 || page.Deposits[0].Block != 100 {
+	if len(page.Deposits) != 1 || page.Deposits[0].AmountCents != "1" {
 		t.Fatalf("df feed = %+v", page.Deposits)
 	}
 }
@@ -94,12 +99,12 @@ func TestUncreditedDepositsAreListable(t *testing.T) {
 	// several deposits at once.
 	f := newFixture(t)
 	f.register("df")
-	f.json(f.do("POST", "/v1/apps/df/wallets", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
+	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
 	f.deposit("df", "cust-1", 100, 0, 300)
 	f.deposit("df", "cust-1", 100, 1, 400)
 
 	var page depositsPage
-	f.json(f.do("GET", "/v1/apps/df/deposits?status=confirmed", nil), http.StatusOK, &page)
+	f.json(f.do("GET", "/v1/apps/df/deposits?status=pending", nil), http.StatusOK, &page)
 	if len(page.Deposits) != 2 {
 		t.Fatalf("awaiting drain = %d, want 2", len(page.Deposits))
 	}
@@ -122,14 +127,14 @@ func TestUncreditedDepositsAreListable(t *testing.T) {
 		t.Fatalf("credit: %v", err)
 	}
 
-	f.json(f.do("GET", "/v1/apps/df/deposits?status=confirmed", nil), http.StatusOK, &page)
+	f.json(f.do("GET", "/v1/apps/df/deposits?status=pending", nil), http.StatusOK, &page)
 	if len(page.Deposits) != 0 {
 		t.Fatalf("still awaiting drain: %+v", page.Deposits)
 	}
 	f.json(f.do("GET", "/v1/apps/df/deposits", nil), http.StatusOK, &page)
 	for _, d := range page.Deposits {
-		if d.Status != "credited" || d.DrainTx == "" {
-			t.Fatalf("deposit = %+v, want credited and stamped", d)
+		if d.Status != "credited" {
+			t.Fatalf("deposit = %+v, want credited", d)
 		}
 	}
 }
@@ -149,7 +154,7 @@ func TestPendingBalanceCountsUndrainedDeposits(t *testing.T) {
 	// spendable until it reaches the wallet payouts are drawn from.
 	f := newFixture(t)
 	f.register("df")
-	f.json(f.do("POST", "/v1/apps/df/wallets", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
+	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
 	f.deposit("df", "cust-1", 10, 0, 750)
 
 	var app appView
@@ -168,7 +173,7 @@ func TestPendingBalanceCountsUndrainedDeposits(t *testing.T) {
 func TestPendingExcludesUncreditedDust(t *testing.T) {
 	f := newFixture(t)
 	f.register("df")
-	f.json(f.do("POST", "/v1/apps/df/wallets", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
+	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
 	f.deposit("df", "cust-1", 10, 0, 750)
 	// Custody rises by more than was ever recorded, as flooring guarantees.
 	if err := f.st.Update(func(tx *store.Tx) error {
@@ -198,6 +203,9 @@ func TestBalanceEndpoint(t *testing.T) {
 	f.json(f.do("GET", "/v1/apps/df/balance", nil), http.StatusOK, &b)
 	if b.AvailableCents != "500" || b.ReservedCents != "0" || b.PendingCents != "0" {
 		t.Fatalf("balance = %+v", b)
+	}
+	if b.TotalCents != "500" {
+		t.Fatalf("total = %s, want the three parts summed", b.TotalCents)
 	}
 }
 

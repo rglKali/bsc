@@ -90,7 +90,9 @@ func Advance(tx *store.Tx, f store.Flow, ok bool, now time.Time) (store.Flow, er
 // worth keeping must be copied onto a durable record here, because the flow
 // itself is about to be deleted. `from` is the state the flow was in when the
 // transaction it was waiting on resolved, which is what distinguishes a payout
-// that failed from a withdrawal that never got as far as paying.
+// that reverted from a withdrawal that never got as far as paying. Neither is
+// terminal for the request — both retry (§28) — but only the first has a payout
+// transaction worth recording.
 func settle(tx *store.Tx, f store.Flow, from store.FlowState, confirmed common.Hash, ok bool, now time.Time) error {
 	switch f.Kind {
 	case store.FlowDrain:
@@ -141,7 +143,7 @@ func settleDrain(tx *store.Tx, f store.Flow, confirmed common.Hash, ok bool, now
 
 func settleWithdrawal(tx *store.Tx, f store.Flow, from store.FlowState, confirmed common.Hash, ok bool, now time.Time) error {
 	// A withdrawal that never reached its payout has not been decided: the
-	// funding or the approval failed, and the request stays queued for the
+	// funding or the approval failed, and the request stays `pending` for the
 	// rules to retry. Backing the wallet off is what keeps that retry from
 	// becoming a loop that burns gas as fast as blocks arrive.
 	if from != store.StatePaying {
@@ -159,31 +161,44 @@ func settleWithdrawal(tx *store.Tx, f store.Flow, from store.FlowState, confirme
 		return fmt.Errorf("engine: withdrawal %s vanished", f.Withdrawal)
 	}
 
+	// A payout that reverted is not the app's problem to compensate for: the
+	// money stays reserved, the record stays `pending`, and the wallet backs off
+	// so ShouldPay picks it up again later (§28). Releasing the reservation here
+	// would hand the app back money it has already committed, and marking the
+	// record terminal would make it look settled when nothing moved.
+	if !ok {
+		_, err := tx.MutateWithdrawal(wd.ID, func(w *store.Withdrawal) error {
+			// Kept for the operator, not as a verdict: the request is still
+			// live and the next attempt overwrites this.
+			w.Error = f.Error
+			w.Attempts++
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		return backOff(tx, f.Wallet, now)
+	}
+
 	// Release exactly what this record reserved, rather than recomputing it: a
 	// policy change between request and settlement must not move the figure.
 	if _, err := tx.ReleaseLedger(f.App, wd.Debit); err != nil {
 		return fmt.Errorf("engine: release reserve: %w", err)
 	}
-	if ok {
-		// Payout and fee leave the ledger together. Only the payout moved
-		// on-chain; the fee stays in the wallet, uncredited, which is precisely
-		// how it is collected (§24).
-		if _, err := tx.DebitLedger(f.App, wd.Debit); err != nil {
-			return fmt.Errorf("engine: debit ledger: %w", err)
-		}
-		if _, err := tx.ClearBackoff(f.Wallet); err != nil {
-			return fmt.Errorf("engine: clear backoff: %w", err)
-		}
+	// Payout and fee leave the ledger together. Only the payout moved on-chain;
+	// the fee stays in the wallet, uncredited, which is precisely how it is
+	// collected (§24).
+	if _, err := tx.DebitLedger(f.App, wd.Debit); err != nil {
+		return fmt.Errorf("engine: debit ledger: %w", err)
+	}
+	if _, err := tx.ClearBackoff(f.Wallet); err != nil {
+		return fmt.Errorf("engine: clear backoff: %w", err)
 	}
 
 	_, err = tx.MutateWithdrawal(wd.ID, func(w *store.Withdrawal) error {
-		if ok {
-			w.Status = store.WithdrawalDone
-		} else {
-			w.Status = store.WithdrawalFailed
-			w.Error = f.Error
-		}
+		w.Status = store.WithdrawalDebited
 		w.TxHash = confirmed
+		w.Error = ""
 		return nil
 	})
 	return err
@@ -234,7 +249,7 @@ func EvaluateWallet(tx *store.Tx, w store.Wallet, cfg Config, now time.Time) (bo
 	})
 }
 
-// EvaluateApp starts a queued withdrawal if one is owed and the app's top-level
+// EvaluateApp starts a pending withdrawal if one is owed and the app's top-level
 // wallet is free, and otherwise considers sweeping the house's excess.
 //
 // The two are ordered, not raced: one wallet runs one flow at a time, and the
@@ -252,15 +267,15 @@ func EvaluateApp(tx *store.Tx, a store.App, cfg Config, now time.Time) (bool, er
 		return false, nil
 	}
 
-	queued, err := oldestQueued(tx, a.Slug)
+	pending, err := oldestPending(tx, a.Slug)
 	if err != nil {
 		return false, err
 	}
-	if flow.ShouldPay(a, top, queued != nil) {
+	if flow.ShouldPay(a, top, pending != nil, now) {
 		return true, begin(tx, flow.Params{
 			Kind: store.FlowWithdrawal, Wallet: top.ID, App: a.Slug,
-			To: queued.Destination, Amount: cfg.Scale.Wei(queued.Payout),
-			Withdrawal: queued.ID, Active: top.Active, Now: now,
+			To: pending.Destination, Amount: cfg.Scale.Wei(pending.Payout),
+			Withdrawal: pending.ID, Active: top.Active, Now: now,
 		})
 	}
 
@@ -269,7 +284,7 @@ func EvaluateApp(tx *store.Tx, a store.App, cfg Config, now time.Time) (bool, er
 	// and anything a stranger sent to the address. After the ledger they are
 	// one quantity and one rule collects them all (§25).
 	excess := cfg.Scale.Excess(top.Balance, a.Ledger)
-	if flow.ShouldSweepHouse(top, excess, cfg.HouseSweepMin, queued != nil, now) {
+	if flow.ShouldSweepHouse(top, excess, cfg.HouseSweepMin, pending != nil, now) {
 		return true, begin(tx, flow.Params{
 			Kind: store.FlowHouseSweep, Wallet: top.ID, App: a.Slug,
 			To: cfg.FeeCollector, Active: top.Active, Now: now,
@@ -335,23 +350,28 @@ func EvaluateAll(tx *store.Tx, cfg Config, now time.Time) (int, error) {
 	return started, nil
 }
 
-// oldestQueued returns the app's longest-waiting queued withdrawal, or nil.
-func oldestQueued(tx *store.Tx, slug string) (*store.Withdrawal, error) {
+// oldestPending returns the app's longest-waiting pending withdrawal, or nil.
+//
+// Oldest-first is what stops a withdrawal that keeps reverting from starving the
+// ones behind it forever: it is retried rather than failed (§28), so without an
+// ordering it could hold the wallet on every evaluation. Its wallet backoff lets
+// the queue behind it move in the meantime.
+func oldestPending(tx *store.Tx, slug string) (*store.Withdrawal, error) {
 	open, err := tx.OpenWithdrawals(slug)
 	if err != nil {
 		return nil, err
 	}
-	var queued []store.Withdrawal
+	var pending []store.Withdrawal
 	for _, wd := range open {
-		if wd.Status == store.WithdrawalQueued {
-			queued = append(queued, wd)
+		if wd.Status == store.WithdrawalPending {
+			pending = append(pending, wd)
 		}
 	}
-	if len(queued) == 0 {
+	if len(pending) == 0 {
 		return nil, nil
 	}
-	sort.Slice(queued, func(i, j int) bool { return queued[i].CreatedAt.Before(queued[j].CreatedAt) })
-	return &queued[0], nil
+	sort.Slice(pending, func(i, j int) bool { return pending[i].CreatedAt.Before(pending[j].CreatedAt) })
+	return &pending[0], nil
 }
 
 // begin creates a flow and claims its wallet, the two halves of "this wallet is

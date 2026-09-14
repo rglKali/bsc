@@ -154,7 +154,7 @@ func (f *fixture) chargedWithdrawal(payout, fee money.Cents) store.Withdrawal {
 	wd := store.Withdrawal{
 		ID: uuid.New(), App: "df", Destination: addr(0xDD),
 		Amount: payout, Fee: fee, Payout: payout, Debit: payout + fee,
-		Status: store.WithdrawalQueued, CreatedAt: now,
+		Status: store.WithdrawalPending, CreatedAt: now,
 	}
 	f.update(func(tx *store.Tx) error {
 		if err := tx.PutWithdrawal(wd); err != nil {
@@ -221,7 +221,7 @@ func TestWithdrawalDebitsPayoutAndFeeTogether(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if got.Status != store.WithdrawalDone {
+		if got.Status != store.WithdrawalDebited {
 			t.Fatalf("withdrawal = %s, want done as soon as the payout confirmed", got.Status)
 		}
 		return nil
@@ -247,7 +247,11 @@ func TestWithdrawalDebitsPayoutAndFeeTogether(t *testing.T) {
 
 // TestFailedPayoutReleasesWithoutDebiting: a payout that reverted charges
 // nothing, fee included. The app gets its whole reservation back.
-func TestFailedPayoutReleasesWithoutDebiting(t *testing.T) {
+// A reverted payout is ours to retry, not the app's to compensate for (§28).
+// The money stays reserved and the record stays pending: releasing the
+// reservation would hand back money the app has already committed, and a
+// terminal status would make an unmoved payout look settled.
+func TestRevertedPayoutStaysPendingAndKeepsItsReservation(t *testing.T) {
 	f := newFixture(t)
 	f.fund(1000)
 	wd := f.chargedWithdrawal(50, 3)
@@ -259,16 +263,35 @@ func TestFailedPayoutReleasesWithoutDebiting(t *testing.T) {
 	})
 
 	a := f.appState()
-	if a.Ledger != 1000 || a.Reserved != 0 {
-		t.Fatalf("ledger %d reserved %d, want the whole reservation returned", a.Ledger, a.Reserved)
+	if a.Ledger != 1000 || a.Reserved != 53 {
+		t.Fatalf("ledger %d reserved %d, want 1000/53 — nothing debited, nothing released",
+			a.Ledger, a.Reserved)
 	}
 	if err := f.st.View(func(tx *store.Tx) error {
 		got, _, err := tx.Withdrawal(wd.ID)
 		if err != nil {
 			return err
 		}
-		if got.Status != store.WithdrawalFailed {
-			t.Fatalf("withdrawal = %s, want failed", got.Status)
+		if got.Status != store.WithdrawalPending {
+			t.Fatalf("withdrawal = %s, want it still pending for the retry", got.Status)
+		}
+		if got.Attempts != 1 {
+			t.Fatalf("attempts = %d, want the retry counted", got.Attempts)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+
+	// And the wallet is backed off, which is what stops ShouldPay re-signing it
+	// on the very next evaluation.
+	if err := f.st.View(func(tx *store.Tx) error {
+		w, _, err := tx.Wallet(f.top.ID)
+		if err != nil {
+			return err
+		}
+		if !w.RetryAfter.After(now) {
+			t.Fatalf("RetryAfter = %v, want a backoff past %v", w.RetryAfter, now)
 		}
 		return nil
 	}); err != nil {
@@ -295,7 +318,7 @@ func TestWithdrawalThatNeverPaidStaysQueued(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if got.Status != store.WithdrawalQueued {
+		if got.Status != store.WithdrawalPending {
 			t.Fatalf("withdrawal = %s, want it still queued for a retry", got.Status)
 		}
 		return nil
@@ -326,7 +349,7 @@ func TestDrainCreditsTheLedgerOnlyWhenItLands(t *testing.T) {
 		_, err := tx.PutDeposit(store.Deposit{
 			Wallet: f.dep.ID, App: "df", Block: 10, LogIndex: 0, TxHash: hash(0x51),
 			From: addr(0xF0), AmountWei: wei(500), Cents: 500,
-			Status: store.DepositConfirmed, CreatedAt: now,
+			Status: store.DepositPending, CreatedAt: now,
 		})
 		return err
 	})
@@ -426,7 +449,7 @@ func TestPayoutOutranksTheHouseSweep(t *testing.T) {
 	}
 }
 
-func TestOldestQueuedWithdrawalGoesFirst(t *testing.T) {
+func TestOldestPendingWithdrawalGoesFirst(t *testing.T) {
 	f := newFixture(t)
 	var first uuid.UUID
 	f.update(func(tx *store.Tx) error {
@@ -440,7 +463,7 @@ func TestOldestQueuedWithdrawalGoesFirst(t *testing.T) {
 			wd := store.Withdrawal{
 				ID: uuid.New(), App: "df", Destination: addr(byte(0xD0 + i)),
 				Amount: 10, Payout: 10, Debit: 10,
-				Status: store.WithdrawalQueued, CreatedAt: now.Add(age),
+				Status: store.WithdrawalPending, CreatedAt: now.Add(age),
 			}
 			if age == -time.Hour {
 				first = wd.ID
@@ -478,7 +501,7 @@ func TestEvaluateAppStartsNothingWhileTheWalletIsBusy(t *testing.T) {
 		wd := store.Withdrawal{
 			ID: uuid.New(), App: "df", Destination: addr(0xDD),
 			Amount: 10, Payout: 10, Debit: 10,
-			Status: store.WithdrawalQueued, CreatedAt: now,
+			Status: store.WithdrawalPending, CreatedAt: now,
 		}
 		if err := tx.PutWithdrawal(wd); err != nil {
 			return err
@@ -519,7 +542,7 @@ func TestEvaluateAllConvergesAtStartup(t *testing.T) {
 		wd := store.Withdrawal{
 			ID: uuid.New(), App: "df", Destination: addr(0xDD),
 			Amount: 10, Payout: 10, Debit: 10,
-			Status: store.WithdrawalQueued, CreatedAt: now,
+			Status: store.WithdrawalPending, CreatedAt: now,
 		}
 		if err := tx.PutWithdrawal(wd); err != nil {
 			return err

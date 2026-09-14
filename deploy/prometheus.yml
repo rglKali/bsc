@@ -1,4 +1,4 @@
-# bsc/ — Prometheus scrape fragment. Included by the repo-root prometheus.yml via
+# bsc — Prometheus scrape fragment. Included by the host's prometheus.yml via
 # `scrape_config_files`, so bsc owns its own scrape config. Holds ONLY
 # scrape_configs (no global block).
 #

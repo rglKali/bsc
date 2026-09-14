@@ -6,41 +6,43 @@ import (
 	"bsc/store"
 )
 
+// depositView is one arrival, as a payments provider would describe it: your
+// handle, an amount, whether you can spend it, and a hash to look up if you ever
+// need to prove it happened.
+//
+// What is deliberately absent: the block, the log index, the wei amount and the
+// hash of the drain that swept it. Those are how the money moved, not what
+// happened to the app's balance, and an app that never sees them cannot come to
+// depend on them (§27).
 type depositView struct {
-	Cursor      string `json:"cursor"`
-	Block       uint64 `json:"block"`
-	LogIndex    uint32 `json:"log_index"`
+	ID          string `json:"id"` // opaque, ordered; also the pagination cursor
 	TxHash      string `json:"tx_hash"`
 	Ref         string `json:"ref"`
 	From        string `json:"from"`
 	AmountCents string `json:"amount_cents"`
-	AmountWei   string `json:"amount_wei"`
 	Status      string `json:"status"`
-	DrainTx     string `json:"drain_tx"`
 	CreatedAt   string `json:"created_at"`
 }
 
 // listDeposits serves the one cursor in the system.
 //
 // Deposits are unsolicited — an app cannot know one is coming — so it needs
-// "what is new since I last looked". The cursor is the chain's own ordering,
-// (block, log_index): it sorts identically to the chain, is verifiable against a
-// block explorer, and every deposit has one by construction, being a Transfer
-// log. Apps should treat it as opaque and ordered: pass it back, compare it,
-// don't parse it.
+// "what is new since I last looked". Every deposit has a unique id by
+// construction, and that id doubles as the cursor: pass the last one back as
+// ?since. It is opaque and ordered — compare it, pass it back, don't parse it.
 //
-// ?status=confirmed instead returns what is still awaiting a drain.
+// ?status=pending instead returns what is not yet spendable.
 func (s *Server) listDeposits(w http.ResponseWriter, r *http.Request) error {
 	limit, err := limitParam(r, 100, 1000)
 	if err != nil {
 		return err
 	}
 	q := r.URL.Query()
-	if q.Get("status") == "confirmed" {
+	if q.Get("status") == "pending" {
 		return s.listOpenDeposits(w, r, limit)
 	}
 	if s := q.Get("status"); s != "" {
-		return fail(http.StatusBadRequest, "bad_status", "the only supported status filter is confirmed")
+		return fail(http.StatusBadRequest, "bad_status", "the only supported status filter is pending")
 	}
 
 	since, err := store.ParseCursor(q.Get("since"))
@@ -111,10 +113,9 @@ func viewDeposits(tx *store.Tx, list []store.Deposit) ([]depositView, error) {
 			refs[d.Wallet.String()] = ref
 		}
 		out = append(out, depositView{
-			Cursor: d.Cursor().String(), Block: d.Block, LogIndex: d.LogIndex,
-			TxHash: hashStr(d.TxHash), Ref: ref, From: d.From.Hex(),
-			AmountCents: d.Cents.String(), AmountWei: str(d.AmountWei), Status: d.Status.String(),
-			DrainTx: hashStr(d.DrainTx), CreatedAt: stamp(d.CreatedAt),
+			ID: d.Cursor().String(), TxHash: hashStr(d.TxHash), Ref: ref,
+			From: d.From.Hex(), AmountCents: d.Cents.String(),
+			Status: d.Status.String(), CreatedAt: stamp(d.CreatedAt),
 		})
 	}
 	return out, nil

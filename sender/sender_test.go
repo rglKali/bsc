@@ -471,7 +471,7 @@ func TestPayRefusesWhenTheChainHoldsLessThanOurRecords(t *testing.T) {
 	wd := store.Withdrawal{
 		ID: uuid.New(), App: "df", Destination: addr(0xDD),
 		Amount: 250, Payout: 250, Debit: 250,
-		Status: store.WithdrawalQueued, CreatedAt: time.Now(),
+		Status: store.WithdrawalPending, CreatedAt: time.Now(),
 	}
 	f.update(func(tx *store.Tx) error {
 		if _, err := tx.Credit(f.top.ID, wei(1000)); err != nil { // our record is wrong
@@ -503,8 +503,11 @@ func TestPayRefusesWhenTheChainHoldsLessThanOurRecords(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if got.Status != store.WithdrawalFailed {
-			t.Fatalf("withdrawal status = %s, want failed", got.Status)
+		// Refusing to broadcast is not the same as failing the request: the
+		// shortfall is ours, so the withdrawal stays pending and is retried
+		// once custody agrees with the chain again (§28).
+		if got.Status != store.WithdrawalPending {
+			t.Fatalf("withdrawal status = %s, want it still pending", got.Status)
 		}
 		if !strings.Contains(got.Error, "below") {
 			t.Fatalf("withdrawal error = %q, want the shortfall explained", got.Error)
@@ -518,8 +521,11 @@ func TestPayRefusesWhenTheChainHoldsLessThanOurRecords(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if a.Reserved != 0 || a.Ledger != 1000 {
-			t.Fatalf("ledger %d reserved %d, want the reservation released untouched", a.Ledger, a.Reserved)
+		// The reservation stands: the payout has not been decided, only
+		// deferred, and the app's commitment is still live (§28).
+		if a.Reserved != 250 || a.Ledger != 1000 {
+			t.Fatalf("ledger %d reserved %d, want 1000/250 — nothing charged, nothing released",
+				a.Ledger, a.Reserved)
 		}
 		return nil
 	}); err != nil {

@@ -37,13 +37,11 @@ type addressView struct {
 
 type depositsPage struct {
 	Deposits []struct {
-		Cursor      string `json:"cursor"`
+		ID          string `json:"id"`
 		Ref         string `json:"ref"`
 		AmountCents string `json:"amount_cents"`
-		AmountWei   string `json:"amount_wei"`
 		Status      string `json:"status"`
 		TxHash      string `json:"tx_hash"`
-		DrainTx     string `json:"drain_tx"`
 	} `json:"deposits"`
 	Cursor string `json:"cursor"`
 }
@@ -54,7 +52,8 @@ type withdrawalView struct {
 	FeeCents    string `json:"fee_cents"`
 	PayoutCents string `json:"payout_cents"`
 	TxHash      string `json:"tx_hash"`
-	Error       string `json:"error"`
+	Attempts    int    `json:"attempts"`
+	LastError   string `json:"last_error"`
 }
 
 // TestLifecycle walks real money through the whole service on a real chain:
@@ -91,7 +90,7 @@ func TestLifecycle(t *testing.T) {
 	})
 
 	t.Run("deposit address", func(t *testing.T) {
-		h.call("POST", "/v1/apps/"+slug+"/wallets",
+		h.call("POST", "/v1/apps/"+slug+"/addresses",
 			map[string]any{"ref": "cust-1"}, http.StatusCreated, &depositAdr)
 		if !common.IsHexAddress(depositAdr.Address) {
 			t.Fatalf("bad address %q", depositAdr.Address)
@@ -111,13 +110,13 @@ func TestLifecycle(t *testing.T) {
 		})
 		got := page.Deposits[0]
 		depositCents, _ := h.scale.ToCents(h.deposit)
-		if got.Ref != "cust-1" || got.AmountCents != depositCents.String() ||
-			got.AmountWei != h.deposit.String() {
-			t.Fatalf("deposit = %+v, want %s cents (%s wei) to cust-1",
-				got, depositCents, h.deposit)
+		if got.Ref != "cust-1" || got.AmountCents != depositCents.String() {
+			t.Fatalf("deposit = %+v, want %s cents to cust-1", got, depositCents)
 		}
-		if got.Cursor == "" {
-			t.Fatal("deposit carries no cursor")
+		// The app is shown cents and a hash it can look up, and nothing about
+		// how the money moved — no wei, no block, no log index (§27).
+		if got.ID == "" || got.TxHash == "" {
+			t.Fatalf("deposit = %+v, want an id and a transaction hash", got)
 		}
 
 		// The drain is nobody's request: the rules noticed the balance and
@@ -143,9 +142,6 @@ func TestLifecycle(t *testing.T) {
 			h.call("GET", "/v1/apps/"+slug+"/deposits", nil, http.StatusOK, &page)
 			return len(page.Deposits) > 0 && page.Deposits[0].Status == "credited"
 		})
-		if page.Deposits[0].DrainTx == "" {
-			t.Fatal("credited deposit is not stamped with its sweep")
-		}
 		if got := h.tokenBalance(hot); got.Cmp(h.deposit) < 0 {
 			t.Fatalf("hot wallet holds %s on-chain, want the whole deposit %s",
 				fmtToken(got), fmtToken(h.deposit))
@@ -178,7 +174,7 @@ func TestLifecycle(t *testing.T) {
 			"destination": dest.Hex(), "amount_cents": "100",
 			"idempotency_key": "e2e-1",
 		}, http.StatusCreated, &withdrawal)
-		if withdrawal.Status != "queued" {
+		if withdrawal.Status != "pending" {
 			t.Fatalf("status = %s", withdrawal.Status)
 		}
 
@@ -198,10 +194,13 @@ func TestLifecycle(t *testing.T) {
 			var got withdrawalView
 			h.call("GET", "/v1/apps/"+slug+"/withdrawals/"+withdrawal.ID, nil, http.StatusOK, &got)
 			withdrawal = got
-			return got.Status == "done" || got.Status == "failed"
+			// There is no failure state to wait for: a payout that reverts is
+			// retried, so the only terminal status is `debited` (§28).
+			return got.Status == "debited"
 		})
-		if withdrawal.Status != "done" {
-			t.Fatalf("withdrawal %s: %s", withdrawal.Status, withdrawal.Error)
+		if withdrawal.Status != "debited" {
+			t.Fatalf("withdrawal %s after %d attempts: %s",
+				withdrawal.Status, withdrawal.Attempts, withdrawal.LastError)
 		}
 		if withdrawal.TxHash == "" {
 			t.Fatal("settled withdrawal has no transaction hash")

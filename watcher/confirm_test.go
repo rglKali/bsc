@@ -115,7 +115,7 @@ func TestDrainCompletionCreditsEveryWaitingDeposit(t *testing.T) {
 			if _, err := tx.PutDeposit(store.Deposit{
 				Wallet: h.deposit.ID, App: "df", Block: 1, LogIndex: uint32(i),
 				TxHash: hash(byte(0x40 + i)), AmountWei: wei(amount), Cents: money.Cents(amount),
-				Status: store.DepositConfirmed, CreatedAt: time.Now(),
+				Status: store.DepositPending, CreatedAt: time.Now(),
 			}); err != nil {
 				return err
 			}
@@ -188,7 +188,7 @@ func TestWithdrawalSettlementReleasesItsReserve(t *testing.T) {
 	wd := store.Withdrawal{
 		ID: uuid.New(), App: "df", Destination: addr(0xDD),
 		Amount: 50, Fee: 1, Payout: 50, Debit: 51,
-		Status: store.WithdrawalQueued, CreatedAt: time.Now(),
+		Status: store.WithdrawalPending, CreatedAt: time.Now(),
 	}
 	h.update(func(tx *store.Tx) error {
 		if _, err := tx.Credit(h.top.ID, wei(1000)); err != nil {
@@ -218,7 +218,7 @@ func TestWithdrawalSettlementReleasesItsReserve(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("withdrawal: ok=%v err=%v", ok, err)
 		}
-		if got.Status != store.WithdrawalDone || got.TxHash != txh {
+		if got.Status != store.WithdrawalDebited || got.TxHash != txh {
 			t.Fatalf("withdrawal = %+v", got)
 		}
 		return nil
@@ -233,15 +233,16 @@ func TestWithdrawalSettlementReleasesItsReserve(t *testing.T) {
 	}
 }
 
-func TestFailedWithdrawalVoidsItsFee(t *testing.T) {
-	// A payout that never happened is not charged.
+func TestRevertedWithdrawalChargesNothingAndStaysPending(t *testing.T) {
+	// A payout that never happened is not charged — and it is not failed
+	// either: it keeps its reservation and waits for the retry (§28).
 	h := newHarness(t, 1)
 	h.addrs.Add(h.top.Address, h.top.ID)
 
 	wd := store.Withdrawal{
 		ID: uuid.New(), App: "df", Destination: addr(0xDD),
 		Amount: 50, Fee: 1, Payout: 50, Debit: 51,
-		Status: store.WithdrawalQueued, CreatedAt: time.Now(),
+		Status: store.WithdrawalPending, CreatedAt: time.Now(),
 	}
 	h.update(func(tx *store.Tx) error {
 		if _, err := tx.Credit(h.top.ID, wei(1000)); err != nil {
@@ -270,14 +271,16 @@ func TestFailedWithdrawalVoidsItsFee(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if got.Status != store.WithdrawalFailed || got.Error == "" {
-			t.Fatalf("withdrawal = %+v, want failed with a reason", got)
+		if got.Status != store.WithdrawalPending || got.Error == "" {
+			t.Fatalf("withdrawal = %+v, want it still pending with a recorded reason", got)
 		}
 		return nil
 	})
-	// Nothing was charged: the whole reservation, fee included, comes back.
-	if a := h.app2(); a.Reserved != 0 || a.Ledger != 1000 {
-		t.Fatalf("ledger %d reserved %d, want the reservation returned in full", a.Ledger, a.Reserved)
+	// Nothing was charged: the ledger is untouched and the reservation still
+	// stands, because the payout is going to be attempted again.
+	if a := h.app2(); a.Reserved != 51 || a.Ledger != 1000 {
+		t.Fatalf("ledger %d reserved %d, want 1000/51 — charged nothing, released nothing",
+			a.Ledger, a.Reserved)
 	}
 }
 
@@ -355,7 +358,7 @@ func TestQueuedWithdrawalsWaitUntilCaughtUp(t *testing.T) {
 		wd := store.Withdrawal{
 			ID: uuid.New(), App: "df", Destination: addr(0xDD),
 			Amount: 50, Payout: 50, Debit: 50,
-			Status: store.WithdrawalQueued, CreatedAt: time.Now(),
+			Status: store.WithdrawalPending, CreatedAt: time.Now(),
 		}
 		if err := tx.PutWithdrawal(wd); err != nil {
 			return err

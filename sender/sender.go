@@ -519,9 +519,12 @@ func (s *Sender) wrappedNative(ctx context.Context) (common.Address, error) {
 // so it is deliberately conservative — a stale reading must leave money behind
 // rather than take money that was owed (§25).
 //
-// Anything that lands after this reading is simply swept next time: custody and
-// the ledger rise together when a drain settles, so the excess is unchanged by
-// whatever arrives while this transaction is in flight.
+// Anything that lands after this reading is simply swept next time, and the
+// direction is what makes that safe: while this transaction is in flight the
+// excess can only *rise*, never fall. A landing drain lifts custody by the full
+// wei but the ledger by only the floored cents, so it adds its dust to the
+// excess; a settling payout lifts it by the fee. Both leave this sweep taking
+// less than it could rather than more than it should.
 func (s *Sender) sweepHouse(ctx context.Context, key keys.Key, to common.Address, app string) (outcome, *types.Transaction, string, error) {
 	if !s.opts.Scale.Valid() {
 		return outcomeFail, nil, "no token scale configured", nil

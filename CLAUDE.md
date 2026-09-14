@@ -2,18 +2,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`bsc/` is a **standalone Go module** (`module bsc`) living inside the dfclub
-monorepo. It has **no dependency on `svc/`** and must keep it that way — it is a
-reusable USDT chain gateway that happens to be vendored here. Consumers talk to
+This is a **standalone Go module** (`module bsc`) in its own repository. It is a
+reusable USDT chain gateway with no dependency on any consumer, and must keep it
+that way — the internal tools and infrastructure components that use it talk to
 it over HTTP; nothing imports it.
 
-## Commands (run from `bsc/`)
+## Commands (run from the repository root)
 
 ```sh
 task                 # list tasks
 task build           # go build ./...
 task vet             # go vet ./...
-task test            # go test ./...     — no chain, no network, no database server
+task unit            # go test ./...     — no chain, no network, no database server
 task cover           # coverage across the service packages
 task binary          # -> bin/bsc  (CGO off, -trimpath, version stamped)
 GOOS=linux GOARCH=amd64 task binary   # cross-compile for the VPS
@@ -153,13 +153,26 @@ would buy nothing but ceremony — and with slug addressing the app API already
 
 **Every amount on the wire is a whole number of cents**, as a decimal string, in
 a field named `*_cents`. Never wei, never a decimal point, never a JSON number.
-Deposits additionally carry `amount_wei` so an operator can reconcile a record
-against a block explorer (§23).
 
-Apps **poll**; nothing is pushed. Deposits are unsolicited so they have a cursor —
-the chain's own `(block, log_index)`, which every deposit has by construction.
-Withdrawals are app-initiated, so the app polls its own open set by id. Webhooks,
-NATS and SSE were all considered and rejected; see `docs/ARCHITECTURE.md`.
+**Nothing chain-shaped reaches an app** (§27). No wei, no block height, no log
+index, no drain hash, no allowance or nonce or gas, and no internal flow state.
+An app gets cents, a `tx_hash` to paste into an explorer, and a status.
+`api/contract_test.go` enforces this by walking the real surface and failing on
+the vocabulary — keep it passing rather than adding an exception.
+
+**Two statuses each, named for the ledger, not the chain**: deposits are
+`pending` → `credited`, withdrawals are `pending` → `debited`. A withdrawal has
+**no failure state** (§28): what cannot be honoured is refused synchronously at
+creation and never becomes a record, and what breaks afterwards is ours to retry
+— the reservation stays held and `attempts`/`last_error` are diagnostics. This
+is why `ShouldPay` must keep its `RetryAfter` gate.
+
+Apps **poll**; nothing is pushed. Deposits are unsolicited so they have a cursor:
+still the chain's `(block, log_index)` internally, but rendered as hex so it is
+opaque-yet-ordered — an app may compare two ids, never parse one. A deposit's
+`id` *is* its cursor. Withdrawals are app-initiated, so the app polls its own
+outstanding set by id. Webhooks, NATS and SSE were all considered and rejected;
+see `docs/ARCHITECTURE.md`.
 
 ## Docs (keep in sync when behavior changes)
 
@@ -172,10 +185,10 @@ NATS and SSE were all considered and rejected; see `docs/ARCHITECTURE.md`.
 
 ## Gotchas
 
-- **Never edit `deploy/env/*.env.example` or any `.env`** (monorepo-wide rule),
-  and never write `MASTER_SECRET` anywhere but a secrets manager. It signs
-  everything and holds a `MaxUint256` allowance on every managed wallet, so
-  whoever has it can move every app's funds.
+- **Never edit `deploy/*.env.example` or any `.env`**, and never write
+  `MASTER_SECRET` anywhere but a secrets manager. It signs everything and holds a
+  `MaxUint256` allowance on every managed wallet, so whoever has it can move
+  every app's funds.
 - `usdt/abi.go` is generated (`task abi`) — regenerate, don't hand-edit.
 - **`MIN_DEPOSIT_WEI` is gone.** `DRAIN_THRESHOLD_WEI` replaced it and means
   something narrower: don't spend gas on a small move. It must never decide

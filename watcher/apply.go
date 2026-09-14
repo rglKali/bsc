@@ -19,12 +19,17 @@ import (
 // apply folds one finalized block into the store, inside the caller's write
 // transaction. Ordering matters and is the reason this reads as a list:
 //
-//  1. confirmations first, so a flow that just finished has released its wallet
-//     before anything evaluates whether that wallet needs new work;
-//  2. credits, applied to every observed transfer, so custody tracks the chain
-//     exactly — this is the wallet's balance, not the app's ledger;
-//  3. debits, so a sweep is already subtracted before step 4 looks at balances;
-//  4. the drain rule, which therefore sees post-block balances on idle wallets.
+//  1. per receipt, its confirmation first and then its transfer logs, so a flow
+//     that just finished has released its wallet, and so the credits and debits
+//     of a transaction are applied after the flow waiting on it resolved;
+//  2. within a log, the credit before the debit — they touch different wallets,
+//     so this only matters for reading it;
+//  3. the work rules last, once, over every wallet the whole block touched, so
+//     they see post-block balances on wallets no longer mid-flow.
+//
+// Note that (1) means a drain's ledger credit runs *before* that same receipt's
+// custody credit. Nothing outside can observe the gap: the whole block is one
+// write transaction, which is the point (§3).
 //
 // Nothing here credits an app's ledger. Custody is what the chain says a wallet
 // holds; the ledger is what an app is owed, and a deposit joins it only when its
@@ -168,7 +173,7 @@ func (w *Watcher) credit(tx *store.Tx, id uuid.UUID, ev *usdt.UsdtTransfer, rc *
 	created, err := tx.PutDeposit(store.Deposit{
 		Wallet: id, App: wallet.App, Block: block, LogIndex: uint32(lg.Index),
 		TxHash: rc.TxHash, From: ev.From, AmountWei: ev.Value, Cents: cents,
-		Status: store.DepositConfirmed, CreatedAt: now.UTC(),
+		Status: store.DepositPending, CreatedAt: now.UTC(),
 	})
 	if err != nil {
 		return err
@@ -206,7 +211,7 @@ func (w *Watcher) evaluateTouched(tx *store.Tx, touched map[uuid.UUID]struct{}, 
 	return nil
 }
 
-// evaluateApps runs the app-level rules — queued withdrawals and due house
+// evaluateApps runs the app-level rules — pending withdrawals and due house
 // sweeps. Unlike the drain rule this is not driven by block contents, so it
 // runs once per commit rather than per block.
 func (w *Watcher) evaluateApps(tx *store.Tx, now time.Time) error {

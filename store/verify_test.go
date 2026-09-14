@@ -84,7 +84,7 @@ func TestVerifyTracksTheLedgerLifecycle(t *testing.T) {
 	// exactly what the record says, so a fee-policy change cannot move it.
 	update(t, s, func(tx *Tx) error {
 		if _, err := tx.MutateWithdrawal(wd.ID, func(w *Withdrawal) error {
-			w.Status = WithdrawalDone
+			w.Status = WithdrawalDebited
 			w.TxHash = hash(1)
 			return nil
 		}); err != nil {
@@ -322,7 +322,7 @@ func TestVerifyCatchesOpenSetMismatch(t *testing.T) {
 	s := open(t)
 	seedApp(t, s, "df", 1000)
 	wd := newWithdrawal("df", 10, 1, "k-1")
-	wd.Status = WithdrawalDone
+	wd.Status = WithdrawalDebited
 	update(t, s, func(tx *Tx) error {
 		if err := put(tx, bWithdrawal, wd.ID[:], wd.encode); err != nil {
 			return err
@@ -343,7 +343,7 @@ func TestVerifyCatchesDepositMissingFromTheCursorIndex(t *testing.T) {
 	w := depositWallet(t, s, "df", "cust-1", 0x75, 0)
 	d := Deposit{
 		Wallet: w.ID, App: "df", Block: 100, LogIndex: 0, TxHash: hash(0x91),
-		AmountWei: wei(5), Cents: 5, Status: DepositConfirmed, CreatedAt: time.Now().UTC(),
+		AmountWei: wei(5), Cents: 5, Status: DepositPending, CreatedAt: time.Now().UTC(),
 	}
 	// Record with no index entries at all.
 	update(t, s, func(tx *Tx) error {

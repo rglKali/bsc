@@ -58,7 +58,7 @@ func TestCreateWithdrawalReservesPayoutAndFeeSeparately(t *testing.T) {
 		Destination: dest, AmountCents: "100",
 	}), http.StatusCreated, &wd)
 
-	if wd.Status != "queued" || wd.PayoutCents != "100" || wd.FeeCents != "1" {
+	if wd.Status != "pending" || wd.PayoutCents != "100" || wd.FeeCents != "1" {
 		t.Fatalf("withdrawal = %+v", wd)
 	}
 
@@ -245,7 +245,7 @@ func TestListWithdrawalsByStatus(t *testing.T) {
 	// Settle one, as the watcher would.
 	if err := f.st.Update(func(tx *store.Tx) error {
 		_, err := tx.MutateWithdrawal(uuid.MustParse(settled.ID), func(w *store.Withdrawal) error {
-			w.Status = store.WithdrawalDone
+			w.Status = store.WithdrawalDebited
 			return nil
 		})
 		return err
@@ -258,12 +258,12 @@ func TestListWithdrawalsByStatus(t *testing.T) {
 	}
 	f.json(f.do("GET", "/v1/apps/df/withdrawals", nil), http.StatusOK, &list)
 	if len(list.Withdrawals) != 1 || list.Withdrawals[0].ID != open.ID {
-		t.Fatalf("open set = %+v, want just the queued one", list.Withdrawals)
+		t.Fatalf("outstanding set = %+v, want just the pending one", list.Withdrawals)
 	}
 
-	f.json(f.do("GET", "/v1/apps/df/withdrawals?status=done", nil), http.StatusOK, &list)
+	f.json(f.do("GET", "/v1/apps/df/withdrawals?status=debited", nil), http.StatusOK, &list)
 	if len(list.Withdrawals) != 1 || list.Withdrawals[0].ID != settled.ID {
-		t.Fatalf("done = %+v", list.Withdrawals)
+		t.Fatalf("debited = %+v", list.Withdrawals)
 	}
 
 	f.json(f.do("GET", "/v1/apps/df/withdrawals?status=all", nil), http.StatusOK, &list)

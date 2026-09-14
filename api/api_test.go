@@ -211,7 +211,7 @@ func TestUnknownAppIsNotFound(t *testing.T) {
 	f := newFixture(t)
 	for _, path := range []string{
 		"/v1/apps/nope", "/v1/apps/nope/balance", "/v1/apps/nope/deposits",
-		"/v1/apps/nope/withdrawals", "/v1/apps/nope/wallets",
+		"/v1/apps/nope/withdrawals", "/v1/apps/nope/addresses",
 	} {
 		if w := f.do("GET", path, nil); w.Code != http.StatusNotFound {
 			t.Fatalf("%s: status %d, want 404", path, w.Code)
@@ -223,7 +223,7 @@ func TestMalformedBodiesAreRejected(t *testing.T) {
 	f := newFixture(t)
 	f.register("df")
 
-	r := httptest.NewRequest("POST", "/v1/apps/df/wallets", strings.NewReader("{not json"))
+	r := httptest.NewRequest("POST", "/v1/apps/df/addresses", strings.NewReader("{not json"))
 	w := httptest.NewRecorder()
 	f.mux.ServeHTTP(w, r)
 	if w.Code != http.StatusBadRequest {
@@ -232,7 +232,7 @@ func TestMalformedBodiesAreRejected(t *testing.T) {
 
 	// A misspelled field must not be silently ignored — it usually means the
 	// caller thinks it configured something it did not.
-	r = httptest.NewRequest("POST", "/v1/apps/df/wallets", strings.NewReader(`{"reff":"x"}`))
+	r = httptest.NewRequest("POST", "/v1/apps/df/addresses", strings.NewReader(`{"reff":"x"}`))
 	w = httptest.NewRecorder()
 	f.mux.ServeHTTP(w, r)
 	if w.Code != http.StatusBadRequest {
@@ -245,7 +245,7 @@ func TestDepositAddressIsIdempotentOnRef(t *testing.T) {
 	f.register("df")
 
 	var first depositAddressView
-	f.json(f.do("POST", "/v1/apps/df/wallets", depositAddressBody{Ref: "cust-1"}),
+	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}),
 		http.StatusCreated, &first)
 	if first.Address == "" {
 		t.Fatal("no address returned")
@@ -255,18 +255,18 @@ func TestDepositAddressIsIdempotentOnRef(t *testing.T) {
 	}
 
 	var again depositAddressView
-	f.json(f.do("POST", "/v1/apps/df/wallets", depositAddressBody{Ref: "cust-1"}),
+	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}),
 		http.StatusOK, &again)
 	if again.Address != first.Address {
 		t.Fatalf("ref remapped: %s -> %s", first.Address, again.Address)
 	}
 
 	var fetched depositAddressView
-	f.json(f.do("GET", "/v1/apps/df/wallets/cust-1", nil), http.StatusOK, &fetched)
+	f.json(f.do("GET", "/v1/apps/df/addresses/cust-1", nil), http.StatusOK, &fetched)
 	if fetched.Address != first.Address {
 		t.Fatalf("lookup = %s, want %s", fetched.Address, first.Address)
 	}
-	if w := f.do("GET", "/v1/apps/df/wallets/nobody", nil); w.Code != http.StatusNotFound {
+	if w := f.do("GET", "/v1/apps/df/addresses/nobody", nil); w.Code != http.StatusNotFound {
 		t.Fatalf("unknown ref: status %d", w.Code)
 	}
 }
@@ -277,16 +277,16 @@ func TestDepositAddressesAreScopedPerApp(t *testing.T) {
 	f.register("lkr:acme")
 
 	var a, b depositAddressView
-	f.json(f.do("POST", "/v1/apps/df/wallets", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, &a)
-	f.json(f.do("POST", "/v1/apps/lkr:acme/wallets", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, &b)
+	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, &a)
+	f.json(f.do("POST", "/v1/apps/lkr:acme/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, &b)
 	if a.Address == b.Address {
 		t.Fatal("the same ref under two apps produced one address")
 	}
 
 	var list struct {
-		Addresses []depositAddressView `json:"deposit_addresses"`
+		Addresses []depositAddressView `json:"addresses"`
 	}
-	f.json(f.do("GET", "/v1/apps/df/wallets", nil), http.StatusOK, &list)
+	f.json(f.do("GET", "/v1/apps/df/addresses", nil), http.StatusOK, &list)
 	if len(list.Addresses) != 1 || list.Addresses[0].Address != a.Address {
 		t.Fatalf("listing leaked across apps: %+v", list.Addresses)
 	}
@@ -296,17 +296,17 @@ func TestDepositAddressListPaginates(t *testing.T) {
 	f := newFixture(t)
 	f.register("df")
 	for _, ref := range []string{"a", "b", "c"} {
-		f.json(f.do("POST", "/v1/apps/df/wallets", depositAddressBody{Ref: ref}), http.StatusCreated, nil)
+		f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: ref}), http.StatusCreated, nil)
 	}
 	var page struct {
-		Addresses []depositAddressView `json:"deposit_addresses"`
+		Addresses []depositAddressView `json:"addresses"`
 		After     string               `json:"after"`
 	}
-	f.json(f.do("GET", "/v1/apps/df/wallets?limit=2", nil), http.StatusOK, &page)
+	f.json(f.do("GET", "/v1/apps/df/addresses?limit=2", nil), http.StatusOK, &page)
 	if len(page.Addresses) != 2 || page.After != "b" {
 		t.Fatalf("first page = %+v", page)
 	}
-	f.json(f.do("GET", "/v1/apps/df/wallets?limit=2&after="+page.After, nil), http.StatusOK, &page)
+	f.json(f.do("GET", "/v1/apps/df/addresses?limit=2&after="+page.After, nil), http.StatusOK, &page)
 	if len(page.Addresses) != 1 || page.Addresses[0].Ref != "c" {
 		t.Fatalf("second page = %+v", page.Addresses)
 	}

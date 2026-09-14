@@ -32,7 +32,7 @@ func (t *Tx) PutDeposit(d Deposit) (created bool, err error) {
 	if err := t.tx.Bucket(iDep).Put(scoped(d.App, d.Cursor().Key()), key); err != nil {
 		return false, fmt.Errorf("store: put dep index: %w", err)
 	}
-	if d.Status == DepositConfirmed {
+	if d.Status == DepositPending {
 		if err := t.tx.Bucket(iDepOpen).Put(scoped(d.App, d.Wallet[:], key), key); err != nil {
 			return false, fmt.Errorf("store: put dep_open index: %w", err)
 		}
@@ -78,7 +78,8 @@ func (t *Tx) DepositsSince(slug string, after Cursor, limit int) ([]Deposit, Cur
 }
 
 // OpenDeposits lists an app's deposits that have been detected but not yet
-// swept into its top-level wallet — the `?status=confirmed` view.
+// swept into its top-level wallet — the `?status=pending` view, and the sum an
+// app sees as `pending_cents`.
 func (t *Tx) OpenDeposits(slug string, limit int) ([]Deposit, error) {
 	var out []Deposit
 	err := scanPrefix(t, iDepOpen, scopePrefix(slug), func(_, v []byte) error {

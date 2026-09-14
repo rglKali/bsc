@@ -190,7 +190,7 @@ func (t *Tx) Verify() (Report, error) {
 			rep.flag("index", "deposit/"+d.TxHash.Hex(), "missing from the cursor index")
 		}
 		inOpen := t.tx.Bucket(iDepOpen).Get(scoped(d.App, d.Wallet[:], key)) != nil
-		if want := d.Status == DepositConfirmed; inOpen != want {
+		if want := d.Status == DepositPending; inOpen != want {
 			rep.flag("index", "deposit/"+d.TxHash.Hex(),
 				fmt.Sprintf("status %s but open-set membership is %v", d.Status, inOpen))
 		}
@@ -207,9 +207,9 @@ func (t *Tx) Verify() (Report, error) {
 		}
 		rep.Withdrawals++
 		switch wd.Status {
-		case WithdrawalDone:
+		case WithdrawalDebited:
 			want(wd.App).debited += wd.Debit
-		case WithdrawalQueued, WithdrawalPending:
+		case WithdrawalPending:
 			want(wd.App).reserved += wd.Debit
 		}
 		inOpen := t.tx.Bucket(iWdOpen).Get(scoped(wd.App, wd.ID[:])) != nil

@@ -16,7 +16,7 @@ func newWithdrawal(slug string, payout, fee int64, key string) Withdrawal {
 		ID: uuid.New(), App: slug, Destination: addr(0xD0),
 		Amount: money.Cents(payout), Fee: money.Cents(fee),
 		Payout: money.Cents(payout), Debit: money.Cents(payout + fee),
-		Status: WithdrawalQueued, IdempotencyKey: key,
+		Status: WithdrawalPending, IdempotencyKey: key,
 		FeeSnapshot: FeePolicy{Flat: money.Cents(fee)},
 		CreatedAt:   time.Now().UTC(),
 	}
@@ -111,7 +111,7 @@ func TestOpenSetTracksTerminalStatus(t *testing.T) {
 
 	update(t, s, func(tx *Tx) error {
 		_, err := tx.MutateWithdrawal(a.ID, func(wd *Withdrawal) error {
-			wd.Status = WithdrawalDone
+			wd.Status = WithdrawalDebited
 			return nil
 		})
 		return err
@@ -120,8 +120,7 @@ func TestOpenSetTracksTerminalStatus(t *testing.T) {
 
 	update(t, s, func(tx *Tx) error {
 		_, err := tx.MutateWithdrawal(b.ID, func(wd *Withdrawal) error {
-			wd.Status = WithdrawalFailed
-			wd.Error = "reverted"
+			wd.Status = WithdrawalDebited
 			return nil
 		})
 		return err
@@ -135,8 +134,8 @@ func TestOpenSetTracksTerminalStatus(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("terminal withdrawal unreadable: ok=%v err=%v", ok, err)
 		}
-		if got.Error != "reverted" {
-			t.Fatalf("error = %q, want the failure reason preserved", got.Error)
+		if got.Debit != b.Debit {
+			t.Fatalf("debit = %d, want %d preserved on the terminal record", got.Debit, b.Debit)
 		}
 		return nil
 	}); err != nil {
@@ -216,5 +215,30 @@ func TestMutateMissingWithdrawal(t *testing.T) {
 	})
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
+// `log/` is kept forever, so a database written before §28 can still hold a
+// withdrawal in the retired `failed` state. This binary must read it as what it
+// was — terminal, and out of the outstanding set — rather than as an unknown
+// value that would reappear as outstanding and make Verify report the
+// withdrawal-open index as broken.
+func TestRetiredFailedStatusStillDecodesAsTerminal(t *testing.T) {
+	legacy := WithdrawalStatus(4)
+	if got := legacy.String(); got != "failed" {
+		t.Fatalf("legacy status 4 = %q, want %q", got, "failed")
+	}
+	if !legacy.IsTerminal() {
+		t.Fatal("legacy failed status read as still outstanding")
+	}
+	// The two values that carried over must keep their meaning: a pre-§28
+	// `queued` was 1 and is now `pending`, and `done` was 3 and is now
+	// `debited`. Re-using either number for something else would silently
+	// rewrite history.
+	if got := WithdrawalStatus(1).String(); got != "pending" {
+		t.Fatalf("legacy status 1 = %q, want pending", got)
+	}
+	if got := WithdrawalStatus(3).String(); got != "debited" || !WithdrawalStatus(3).IsTerminal() {
+		t.Fatalf("legacy status 3 = %q terminal=%v, want debited/true", got, WithdrawalStatus(3).IsTerminal())
 	}
 }

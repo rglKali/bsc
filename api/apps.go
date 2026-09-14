@@ -34,16 +34,23 @@ type feeView struct {
 	MaxFeeCents string `json:"max_fee_cents"`
 }
 
-// balanceView is the app's ledger, in cents.
+// balanceView is the app's ledger in cents, split by what the app can do with
+// each part right now. Every deposit and every withdrawal sits in exactly one of
+// the three, so they answer "where is my money" without remainder:
 //
-// Available is what the app may spend right now; pending is money we have seen
-// arrive but not yet moved into the hot wallet, which is real but cannot be paid
-// out yet. Neither is a chain balance: the wallet also holds our fees and the
-// sub-cent dust, and none of that is the app's (§22).
+//	available  spendable this second
+//	reserved   committed to payouts that have not settled
+//	pending    arrived, not yet moved into the wallet payouts are drawn from
+//	total      the three added up — everything that is or will be the app's
+//
+// None of it is a chain balance. The hot wallet also holds our fees and the
+// sub-cent remainders, and none of that is the app's (§22) — which is the whole
+// reason the ledger is reported instead of a `balanceOf`.
 type balanceView struct {
 	AvailableCents string `json:"available_cents"`
 	ReservedCents  string `json:"reserved_cents"`
 	PendingCents   string `json:"pending_cents"`
+	TotalCents     string `json:"total_cents"`
 }
 
 type appView struct {
@@ -227,6 +234,7 @@ func (s *Server) appView(slug string) (appView, error) {
 				AvailableCents: a.Spendable().String(),
 				ReservedCents:  a.Reserved.String(),
 				PendingCents:   pending.String(),
+				TotalCents:     (a.Spendable() + a.Reserved + pending).String(),
 			},
 			CreatedAt: stamp(a.CreatedAt),
 		}
@@ -371,7 +379,7 @@ func (s *Server) listDepositAddresses(w http.ResponseWriter, r *http.Request) er
 	}); err != nil {
 		return err
 	}
-	body := map[string]any{"deposit_addresses": out}
+	body := map[string]any{"addresses": out}
 	if len(out) == limit {
 		body["after"] = out[len(out)-1].Ref // pass back to continue
 	}

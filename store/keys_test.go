@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -50,10 +51,35 @@ func TestCursorWireFormRoundTrips(t *testing.T) {
 	if got, err := ParseCursor(""); err != nil || got != (Cursor{}) {
 		t.Fatalf(`ParseCursor("") = (%v, %v), want (zero, nil)`, got, err)
 	}
-	for _, bad := range []string{"nope", "1", "1-", "-1", "1-x", "x-1"} {
+	// The old "<block>-<logindex>" form is no longer a cursor: it leaked the
+	// chain's position to apps that have no use for it (§27).
+	for _, bad := range []string{"nope", "1", "1-", "-1", "1-x", "x-1", "48210577-9", "00", ""[:0] + "0000000000000064000000"} {
 		if _, err := ParseCursor(bad); err == nil {
 			t.Fatalf("ParseCursor(%q) accepted", bad)
 		}
+	}
+}
+
+// The cursor is opaque to apps but still ordered, which is the one property an
+// app is allowed to rely on: it may compare two ids to know which came first
+// without being able to read a block height out of either (§27).
+func TestCursorStringsSortLikeTheChain(t *testing.T) {
+	ordered := []Cursor{
+		{Block: 100, LogIndex: 3},
+		{Block: 100, LogIndex: 4},
+		{Block: 101, LogIndex: 0},
+		{Block: 48210577, LogIndex: 9},
+	}
+	for i := 1; i < len(ordered); i++ {
+		prev, next := ordered[i-1].String(), ordered[i].String()
+		if prev >= next {
+			t.Fatalf("cursor strings out of order: %q then %q", prev, next)
+		}
+	}
+	// And nothing human-readable survives: no separator, no decimal block.
+	if s := (Cursor{Block: 48210577, LogIndex: 9}).String(); strings.Contains(s, "-") ||
+		strings.Contains(s, "48210577") {
+		t.Fatalf("cursor %q still reads as a block position", s)
 	}
 }
 

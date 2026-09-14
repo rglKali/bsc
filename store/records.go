@@ -19,7 +19,7 @@ const (
 	vTxRef      = 1
 	vSend       = 1
 	vDeposit    = 1
-	vWithdrawal = 1
+	vWithdrawal = 2 // +Attempts
 )
 
 // WalletKind separates an app's single hot wallet from the deposit addresses
@@ -135,50 +135,76 @@ func (s FlowState) String() string {
 	return "unknown"
 }
 
-// DepositStatus tracks whether a detected deposit has been swept into its app's
-// top-level wallet yet. Crediting is a status rather than a feed entry because
-// one sweep can credit several deposits at once (§9).
+// DepositStatus is the app-visible lifecycle of money arriving, and it has
+// exactly two states because the app only ever needs one distinction: can I
+// spend this yet. `pending` is money we have seen and owe you; `credited` is
+// money sitting in the wallet payouts are drawn from.
+//
+// Crediting is a status rather than a feed entry because one drain can credit
+// several deposits at once (§9). The on-chain machinery that gets it there —
+// funding, approving, draining — is not a state an app is shown (§27).
+//
+// The stored values are frozen: they are a packed field in every deposit record.
 type DepositStatus uint8
 
 const (
-	DepositConfirmed DepositStatus = 1 // seen in a finalized block, not yet swept
-	DepositCredited  DepositStatus = 2 // its drain landed; the funds are withdrawable
+	DepositPending  DepositStatus = 1 // recorded from a finalized block, not yet drained
+	DepositCredited DepositStatus = 2 // its drain landed; the funds are withdrawable
 )
 
 func (s DepositStatus) String() string {
 	switch s {
-	case DepositConfirmed:
-		return "confirmed"
+	case DepositPending:
+		return "pending"
 	case DepositCredited:
 		return "credited"
 	}
 	return "unknown"
 }
 
-// WithdrawalStatus is the app-visible lifecycle. There is no `partial`: fees
-// accrue off-chain and sweep in batch, so a withdrawal is exactly one transfer
-// and cannot half-succeed (§7).
+// WithdrawalStatus is the app-visible lifecycle of money leaving, and it mirrors
+// DepositStatus: one non-terminal state and one terminal one, named for what
+// happened to the ledger rather than for what happened on the chain.
+//
+// **There is no failure state.** A request that cannot be honoured is refused
+// synchronously at creation — bad address, below the minimum, not enough
+// balance — so it never becomes a record at all. Anything that goes wrong after
+// that is ours, not the app's: a reverted payout backs the wallet off and the
+// withdrawal stays `pending` for the rules to retry (§28). The app is therefore
+// never handed a terminal state it has to compensate for.
+//
+// There is no `partial` either: fees accrue off-chain and sweep in batch, so a
+// withdrawal is exactly one transfer and cannot half-succeed (§7).
+//
+// The stored values are frozen: they are a packed field in every withdrawal
+// record. 2 and 4 were `pending` (never written) and `failed` (retired in §28).
 type WithdrawalStatus uint8
 
 const (
-	WithdrawalQueued  WithdrawalStatus = 1 // accepted and reserved, not yet signed
-	WithdrawalPending WithdrawalStatus = 2 // broadcast, awaiting finality
-	WithdrawalDone    WithdrawalStatus = 3
-	WithdrawalFailed  WithdrawalStatus = 4
+	WithdrawalPending WithdrawalStatus = 1 // accepted and reserved, not yet settled
+	WithdrawalDebited WithdrawalStatus = 3 // the payout landed and the ledger is charged
+
+	// withdrawalFailed is retired and never written. It is kept because `log/`
+	// is kept forever: a database written before §28 can still hold one, and a
+	// value this binary did not recognise would read as "unknown", fall out of
+	// IsTerminal, and so be counted in the outstanding set the old binary had
+	// already removed it from — which `Verify` would then report as a broken
+	// index. Decoding it honestly costs one case and keeps old records true.
+	withdrawalFailed WithdrawalStatus = 4
 )
 
-func (s WithdrawalStatus) IsTerminal() bool { return s >= WithdrawalDone }
+func (s WithdrawalStatus) IsTerminal() bool {
+	return s == WithdrawalDebited || s == withdrawalFailed
+}
 
 func (s WithdrawalStatus) String() string {
 	switch s {
-	case WithdrawalQueued:
-		return "queued"
 	case WithdrawalPending:
 		return "pending"
-	case WithdrawalDone:
-		return "done"
-	case WithdrawalFailed:
-		return "failed"
+	case WithdrawalDebited:
+		return "debited"
+	case withdrawalFailed:
+		return "failed" // legacy only; nothing reaches this state any more
 	}
 	return "unknown"
 }
@@ -547,17 +573,20 @@ func decodeDeposit(b []byte) (Deposit, error) {
 // policy, and storing the reserved figure rather than recomputing it makes the
 // release exact across a policy change.
 type Withdrawal struct {
-	ID             uuid.UUID
-	App            string
-	Destination    common.Address
-	Amount         money.Cents // what the app asked for
-	Fee            money.Cents // charged, per the policy at request time
-	Payout         money.Cents // what the destination receives, on-chain
-	Debit          money.Cents // payout + fee: what this record reserves and then spends
-	DeductFee      bool
-	Status         WithdrawalStatus
-	TxHash         common.Hash
+	ID          uuid.UUID
+	App         string
+	Destination common.Address
+	Amount      money.Cents // what the app asked for
+	Fee         money.Cents // charged, per the policy at request time
+	Payout      money.Cents // what the destination receives, on-chain
+	Debit       money.Cents // payout + fee: what this record reserves and then spends
+	DeductFee   bool
+	Status      WithdrawalStatus
+	TxHash      common.Hash
+	// Error and Attempts are diagnostics, never a verdict: a withdrawal has no
+	// failure state, so these describe a request still being retried (§28).
 	Error          string
+	Attempts       uint32
 	IdempotencyKey string
 	FeeSnapshot    FeePolicy
 	CreatedAt      time.Time
@@ -582,12 +611,13 @@ func (wd *Withdrawal) encode() ([]byte, error) {
 	wd.FeeSnapshot.encode(e)
 	e.stamp(wd.CreatedAt)
 	e.stamp(wd.UpdatedAt)
+	e.u32(wd.Attempts) // v2
 	return e.b, e.err
 }
 
 func decodeWithdrawal(b []byte) (Withdrawal, error) {
 	d := newDec(b)
-	_ = d.u8()
+	v := d.u8()
 	var wd Withdrawal
 	wd.ID = d.id()
 	wd.App = d.str()
@@ -604,6 +634,9 @@ func decodeWithdrawal(b []byte) (Withdrawal, error) {
 	wd.FeeSnapshot.decode(d)
 	wd.CreatedAt = d.stamp()
 	wd.UpdatedAt = d.stamp()
+	if v >= 2 {
+		wd.Attempts = d.u32()
+	}
 	return wd, d.done()
 }
 

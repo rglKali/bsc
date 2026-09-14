@@ -14,6 +14,18 @@ Roughly ordered by value, none committed.
   than on `bsc_transactions_in_flight`, which is 0 or 1 by design.
 - [ ] Tracing across the deposit → drain → settlement path.
 
+## Withdrawals
+
+- [ ] **Cancelling a withdrawal.** A withdrawal has no failure state (§28): a
+  payout that reverts is retried forever, so one to a destination that can never
+  receive holds its reservation indefinitely and only an operator editing the
+  record frees it. A cancel is the obvious remedy and is unbuilt on purpose —
+  releasing a reservation for a payout that might still land is the one way this
+  design could pay twice. It needs a signed-and-broadcast check that is certain,
+  not merely probable, which in practice means "no journal entry and no in-flight
+  tx for this withdrawal" evaluated inside the same write transaction that
+  releases.
+
 ## Throughput
 
 - [ ] **Beyond one transaction at a time.** Signing is sequential, capping

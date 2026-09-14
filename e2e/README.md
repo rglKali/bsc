@@ -1,6 +1,6 @@
 # End-to-end tests against a real chain
 
-Everything in `task test` runs offline against a chain simulator. The simulator
+Everything in `task unit` runs offline against a chain simulator. The simulator
 is faithful — it enforces allowances and balances exactly as the token does — but
 it is still our own model, and a model agreeing with itself proves nothing about
 gas estimation, finality timing, receipt shapes, or whether the token behaves the

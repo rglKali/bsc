@@ -37,7 +37,7 @@ caller can read any app:
 
 ```sh
 curl -s localhost:8800/v1/apps/df | jq
-curl -s localhost:8800/v1/apps/df/withdrawals?status=open | jq
+curl -s localhost:8800/v1/apps/df/withdrawals | jq   # still pending
 ```
 
 ## What to watch
@@ -104,7 +104,7 @@ bsc inspect <snapshot.db>                         # `owed` totals every app's le
 
 A `house_sweep` flow starts once an app's wallet holds at least
 `HOUSE_SWEEP_MIN_CENTS` more than its ledger, and sends the difference to
-`FEE_COLLECTOR`. It waits for any queued payout first, and its amount is computed
+`FEE_COLLECTOR`. It waits for any pending payout first, and its amount is computed
 from `balanceOf` at signing time rather than fixed in advance — so a sweep never
 takes money an app is owed, even if a drain lands while it is in flight.
 
@@ -173,9 +173,28 @@ timer and will not abandon or re-sign it — doing so could double-spend if the
 original later mines. If it stays stuck, it usually means its nonce was consumed
 by a transaction you signed by hand; that needs your judgment, not a restart.
 
-**A withdrawal failed.** It is terminal and the whole reservation — payout and
-fee — is released; a payout that never happened is not charged. The app simply
-requests again. There is nothing to retry on this side.
+**A withdrawal is stuck.** There is no failure state: a payout that reverts
+keeps its reservation, stays `pending`, and is retried behind a growing backoff
+(§28). Nothing is charged until it lands, so the books are never wrong — but the
+app's money stays reserved while this goes on, and nothing resolves it by itself.
+
+`attempts` on the withdrawal is the signal. A handful is a transient problem
+sorting itself out, which is the usual case: the token moves balances without
+consulting the destination, so a payout fails on *our* side — a hot wallet
+momentarily short, an allowance not yet in place, a node that refused the
+broadcast — and the next attempt succeeds.
+
+Double digits means something retrying will not fix. Look at `last_error` first;
+if it is a revert with no obvious cause, check whether the configured token has a
+transfer blacklist covering that destination (the BSC default does not; mainnet
+Tether does). The remedy is editing the record, and there is deliberately no
+cancel — releasing a reservation for a payout that might still land is the one
+way this design could pay twice.
+
+```sh
+curl -s localhost:8800/v1/apps/df/withdrawals | jq '.withdrawals[]
+  | select(.attempts > 5) | {id, attempts, last_error}'
+```
 
 **A solvency finding, or `bsc_solvency_shortfalls_total` above zero.** A wallet
 holds less than the app it belongs to is owed. The house sweep refuses to run

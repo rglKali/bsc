@@ -17,7 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"net/http"
 	"time"
 
@@ -93,9 +92,12 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/apps/{slug}", s.handle(s.getApp))
 	mux.HandleFunc("GET /v1/apps/{slug}/balance", s.handle(s.getBalance))
 
-	mux.HandleFunc("POST /v1/apps/{slug}/wallets", s.handle(s.createDepositAddress))
-	mux.HandleFunc("GET /v1/apps/{slug}/wallets", s.handle(s.listDepositAddresses))
-	mux.HandleFunc("GET /v1/apps/{slug}/wallets/{ref}", s.handle(s.getDepositAddress))
+	// "addresses", not "wallets": a wallet is an internal record with a kind, a
+	// live flow and a wei balance. What an app asks for is an address for one of
+	// its own handles, and that is all it is given (§27).
+	mux.HandleFunc("POST /v1/apps/{slug}/addresses", s.handle(s.createDepositAddress))
+	mux.HandleFunc("GET /v1/apps/{slug}/addresses", s.handle(s.listDepositAddresses))
+	mux.HandleFunc("GET /v1/apps/{slug}/addresses/{ref}", s.handle(s.getDepositAddress))
 
 	mux.HandleFunc("POST /v1/apps/{slug}/withdrawals/quote", s.handle(s.quoteWithdrawal))
 	mux.HandleFunc("POST /v1/apps/{slug}/withdrawals", s.handle(s.createWithdrawal))
@@ -196,13 +198,6 @@ func cents(field, s string) (money.Cents, error) {
 			"%s must be a whole number of cents, as a decimal string (got %q)", field, s)
 	}
 	return v, nil
-}
-
-func str(v *big.Int) string {
-	if v == nil {
-		return "0"
-	}
-	return v.String()
 }
 
 func stamp(t time.Time) string {

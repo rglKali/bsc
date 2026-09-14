@@ -198,7 +198,7 @@ func TestFullMoneyLifecycle(t *testing.T) {
 	var da struct {
 		Address string `json:"address"`
 	}
-	s.call("POST", "/v1/apps/df/wallets", map[string]any{"ref": "cust-1"}, http.StatusCreated, &da)
+	s.call("POST", "/v1/apps/df/addresses", map[string]any{"ref": "cust-1"}, http.StatusCreated, &da)
 	deposit := common.HexToAddress(da.Address)
 
 	// 3. The user sends 50 USDT to it.
@@ -209,19 +209,19 @@ func TestFullMoneyLifecycle(t *testing.T) {
 	var feed struct {
 		Deposits []struct {
 			AmountCents string `json:"amount_cents"`
-			AmountWei   string `json:"amount_wei"`
 			Status      string `json:"status"`
 			Ref         string `json:"ref"`
+			TxHash      string `json:"tx_hash"`
 		} `json:"deposits"`
 	}
 	s.call("GET", "/v1/apps/df/deposits", nil, http.StatusOK, &feed)
 	if len(feed.Deposits) != 1 {
 		t.Fatalf("deposits = %+v", feed.Deposits)
 	}
-	// Both units on the record: 50 USDT is 5000 cents, and the wei figure is
-	// what a block explorer would show.
+	// Cents and a hash, and nothing about how the money moved: 50 USDT is 5000
+	// cents, and the hash is the app's one handle on the chain (§27).
 	if d := feed.Deposits[0]; d.Status != "credited" || d.Ref != "cust-1" ||
-		d.AmountCents != "5000" || d.AmountWei != ether(50).String() {
+		d.AmountCents != "5000" || d.TxHash == "" {
 		t.Fatalf("deposit = %+v", d)
 	}
 	if got := s.sim.usdtOf(top); got.Cmp(ether(50)) != 0 {
@@ -252,7 +252,7 @@ func TestFullMoneyLifecycle(t *testing.T) {
 	s.call("POST", "/v1/apps/df/withdrawals", map[string]any{
 		"destination": dest.Hex(), "amount_cents": "2000",
 	}, http.StatusCreated, &wd)
-	if wd.Status != "queued" || wd.PayoutCents != "2000" || wd.FeeCents != "100" {
+	if wd.Status != "pending" || wd.PayoutCents != "2000" || wd.FeeCents != "100" {
 		t.Fatalf("withdrawal = %+v", wd)
 	}
 	s.settle()
@@ -266,7 +266,7 @@ func TestFullMoneyLifecycle(t *testing.T) {
 		TxHash string `json:"tx_hash"`
 	}
 	s.call("GET", "/v1/apps/df/withdrawals/"+wd.ID, nil, http.StatusOK, &settled)
-	if settled.Status != "done" || settled.TxHash == "" {
+	if settled.Status != "debited" || settled.TxHash == "" {
 		t.Fatalf("withdrawal = %+v", settled)
 	}
 
@@ -314,7 +314,7 @@ func TestFeesAccumulateAsExcessAndSweep(t *testing.T) {
 	var da struct {
 		Address string `json:"address"`
 	}
-	s.call("POST", "/v1/apps/df/wallets", map[string]any{"ref": "cust-1"}, http.StatusCreated, &da)
+	s.call("POST", "/v1/apps/df/addresses", map[string]any{"ref": "cust-1"}, http.StatusCreated, &da)
 	s.sim.deposit(common.HexToAddress(da.Address), ether(500))
 	s.settle()
 
@@ -360,7 +360,7 @@ func TestSecondDepositOnAnActiveWalletSkipsActivation(t *testing.T) {
 	var da struct {
 		Address string `json:"address"`
 	}
-	s.call("POST", "/v1/apps/df/wallets", map[string]any{"ref": "cust-1"}, http.StatusCreated, &da)
+	s.call("POST", "/v1/apps/df/addresses", map[string]any{"ref": "cust-1"}, http.StatusCreated, &da)
 	deposit := common.HexToAddress(da.Address)
 
 	s.sim.deposit(deposit, ether(10))

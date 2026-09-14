@@ -50,12 +50,12 @@ manager, never in the database and never on disk.
 ```sh
 task binary                          # -> bin/bsc
 GOOS=linux GOARCH=amd64 task binary  # cross-compile for a VPS
-task test                            # offline: no chain, no network, no server
+task unit                            # offline: no chain, no network, no server
 task cover                           # coverage across the service packages
 task inspect -- snapshot.db          # audit a database file
 ```
 
-Every test in `task test` runs offline — the store is a temp file, the chain is a
+Every test in `task unit` runs offline — the store is a temp file, the chain is a
 simulator, HTTP is `httptest` — so there is nothing to start first and nothing to
 skip. The one suite that does spend real funds is `task e2e`, which is
 build-tagged and skips unless configured; see

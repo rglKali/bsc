@@ -80,16 +80,16 @@ func ShouldDrain(w store.Wallet, threshold *big.Int, now time.Time) bool {
 // sent to a managed address. One rule collects all of it, because after the
 // ledger they are the same thing (§25).
 //
-// It defers to a queued withdrawal. The app's own payout is the more urgent use
+// It defers to a pending withdrawal. The app's own payout is the more urgent use
 // of a wallet that can only run one flow at a time, and the excess is not going
 // anywhere.
-func ShouldSweepHouse(top store.Wallet, excess, threshold *big.Int, hasQueued bool, now time.Time) bool {
+func ShouldSweepHouse(top store.Wallet, excess, threshold *big.Int, hasPending bool, now time.Time) bool {
 	switch {
 	case top.Kind != store.KindTopLevel:
 		return false
 	case !top.Idle():
 		return false
-	case hasQueued:
+	case hasPending:
 		return false
 	case now.Before(top.RetryAfter):
 		return false
@@ -99,14 +99,32 @@ func ShouldSweepHouse(top store.Wallet, excess, threshold *big.Int, hasQueued bo
 	return cmp(excess, threshold) >= 0
 }
 
-// ShouldPay reports whether an app's top-level wallet should start a queued
+// ShouldPay reports whether an app's top-level wallet should start a pending
 // withdrawal. Withdrawals for one app therefore serialize, which is also what
 // keeps the reserve arithmetic obvious.
 //
 // Pausing an app blocks payouts. Drains carry on regardless — those are us
 // collecting our own money, not the app spending its users'.
-func ShouldPay(app store.App, top store.Wallet, hasQueued bool) bool {
-	return hasQueued && !app.Paused && top.Idle() && top.Kind == store.KindTopLevel
+//
+// The RetryAfter gate is load-bearing rather than symmetry with the other two
+// rules. A withdrawal has no failure state: a reverted payout stays `pending`
+// for this rule to pick up again (§28), so without the gate a payout that
+// reverts every time would be re-signed on every evaluation and burn the
+// master's gas as fast as blocks arrive.
+func ShouldPay(app store.App, top store.Wallet, hasPending bool, now time.Time) bool {
+	switch {
+	case !hasPending:
+		return false
+	case app.Paused:
+		return false
+	case top.Kind != store.KindTopLevel:
+		return false
+	case !top.Idle():
+		return false
+	case now.Before(top.RetryAfter):
+		return false
+	}
+	return true
 }
 
 func sign(v *big.Int) int {

@@ -113,28 +113,45 @@ func TestShouldPay(t *testing.T) {
 	app := store.App{Slug: "df"}
 	top := topWallet(1_000)
 
-	if !ShouldPay(app, top, true) {
-		t.Fatal("an idle top-level with queued work was not selected")
+	if !ShouldPay(app, top, true, now) {
+		t.Fatal("an idle top-level with a pending withdrawal was not selected")
 	}
-	if ShouldPay(app, top, false) {
-		t.Fatal("selected with nothing queued")
+	if ShouldPay(app, top, false, now) {
+		t.Fatal("selected with nothing pending")
 	}
 
 	busy := top
 	busy.Flow = uuid.New()
-	if ShouldPay(app, busy, true) {
+	if ShouldPay(app, busy, true, now) {
 		t.Fatal("selected while another flow owns the wallet")
 	}
 
 	// Withdrawals for one app serialize, which is what keeps the reserve
 	// arithmetic obvious.
 	paused := store.App{Slug: "df", Paused: true}
-	if ShouldPay(paused, top, true) {
+	if ShouldPay(paused, top, true, now) {
 		t.Fatal("a paused app was allowed to pay out")
 	}
 
-	if ShouldPay(app, depositWallet(1_000), true) {
+	if ShouldPay(app, depositWallet(1_000), true, now) {
 		t.Fatal("a deposit wallet was selected to pay out")
+	}
+}
+
+// A withdrawal has no failure state: a reverted payout stays pending for this
+// rule to pick up again (§28). Without the backoff gate that retry fires on
+// every evaluation, so a payout that always reverts would burn the master's gas
+// as fast as blocks arrive.
+func TestShouldPayWaitsOutTheBackoff(t *testing.T) {
+	app := store.App{Slug: "df"}
+	backedOff := topWallet(1_000)
+	backedOff.RetryAfter = now.Add(time.Minute)
+
+	if ShouldPay(app, backedOff, true, now) {
+		t.Fatal("re-signed a payout while the wallet was still backed off")
+	}
+	if !ShouldPay(app, backedOff, true, now.Add(2*time.Minute)) {
+		t.Fatal("the backoff never expired")
 	}
 }
 

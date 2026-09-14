@@ -3,10 +3,9 @@ package store
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -126,8 +125,11 @@ func sendKey(signer common.Address, nonce uint64) []byte {
 }
 
 // Cursor is a deposit-feed position: the chain's own ordering, (block,
-// log_index). It sorts identically to the chain, is verifiable against a block
-// explorer, and as a 12-byte key is directly seekable (§9).
+// log_index). Every deposit has one by construction, being a Transfer log, and
+// as a 12-byte key it is directly seekable (§9).
+//
+// It is internal. Apps see String(), which renders it as opaque hex — they are
+// told to compare and pass back, never to parse (§27).
 type Cursor struct {
 	Block    uint64
 	LogIndex uint32
@@ -145,11 +147,20 @@ func (c Cursor) Next() Cursor {
 	return Cursor{Block: c.Block, LogIndex: c.LogIndex + 1}
 }
 
-// String is the wire form handed to apps: "<block>-<logindex>". Apps are told
-// to treat it as opaque and ordered — pass it back, compare it, don't parse it.
-func (c Cursor) String() string {
-	return strconv.FormatUint(c.Block, 10) + "-" + strconv.FormatUint(uint64(c.LogIndex), 10)
-}
+// String is the wire form handed to apps: the 12-byte sortable key as hex.
+//
+// It used to be "<block>-<logindex>", which invited apps to read the chain's
+// position out of it and reason about blocks. They should not have to: a block
+// height and a log index are internal counters, and an app integrating a
+// payments provider has no use for either (§27). Hex is chosen over base64
+// because the byte order survives it — two cursors compare as strings in the
+// same order the chain produced them — so an app can still dedupe and compare
+// without being able to read anything out.
+//
+// The encoding is reversible, which is deliberate: `bsc inspect` and the logs
+// still need to locate a deposit on a block explorer. Opaque is a contract with
+// the app, not a secret.
+func (c Cursor) String() string { return hex.EncodeToString(c.Key()) }
 
 // ParseCursor reads the wire form. An empty string is the zero cursor, i.e.
 // "from the beginning".
@@ -157,19 +168,14 @@ func ParseCursor(s string) (Cursor, error) {
 	if s == "" {
 		return Cursor{}, nil
 	}
-	blk, idx, ok := strings.Cut(s, "-")
-	if !ok {
+	raw, err := hex.DecodeString(s)
+	if err != nil || len(raw) != 12 {
 		return Cursor{}, fmt.Errorf("store: bad cursor %q", s)
 	}
-	b, err := strconv.ParseUint(blk, 10, 64)
-	if err != nil {
-		return Cursor{}, fmt.Errorf("store: bad cursor block in %q: %w", s, err)
-	}
-	i, err := strconv.ParseUint(idx, 10, 32)
-	if err != nil {
-		return Cursor{}, fmt.Errorf("store: bad cursor index in %q: %w", s, err)
-	}
-	return Cursor{Block: b, LogIndex: uint32(i)}, nil
+	return Cursor{
+		Block:    binary.BigEndian.Uint64(raw[:8]),
+		LogIndex: binary.BigEndian.Uint32(raw[8:]),
+	}, nil
 }
 
 // cursorFromScoped recovers the cursor from an idx/dep key ("<slug>\0<block><logidx>").

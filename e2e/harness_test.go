@@ -9,7 +9,7 @@
 // shapes, or whether the token behaves as we assume. This package exists to
 // close that gap, and it is the only test that spends real money.
 //
-// It is build-tagged and skips unless configured, so `task test` stays offline.
+// It is build-tagged and skips unless configured, so `task unit` stays offline.
 package e2e
 
 import (

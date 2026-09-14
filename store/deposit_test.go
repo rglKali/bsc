@@ -12,7 +12,7 @@ func putDeposit(t *testing.T, s *Store, w Wallet, block uint64, logIndex uint32,
 	t.Helper()
 	d := Deposit{
 		Wallet: w.ID, App: w.App, Block: block, LogIndex: logIndex, TxHash: hash(txb),
-		From: addr(0xF0), AmountWei: wei(amount), Cents: money.Cents(amount), Status: DepositConfirmed, CreatedAt: time.Now().UTC(),
+		From: addr(0xF0), AmountWei: wei(amount), Cents: money.Cents(amount), Status: DepositPending, CreatedAt: time.Now().UTC(),
 	}
 	update(t, s, func(tx *Tx) error {
 		created, err := tx.PutDeposit(d)
@@ -234,7 +234,7 @@ func TestOneSweepCreditsEveryOpenDepositOnTheWallet(t *testing.T) {
 			if credited && (d.Status != DepositCredited || d.DrainTx != sweep) {
 				t.Fatalf("deposit %d-%d not credited: %s %s", d.Block, d.LogIndex, d.Status, d.DrainTx.Hex())
 			}
-			if !credited && d.Status != DepositConfirmed {
+			if !credited && d.Status != DepositPending {
 				t.Fatalf("other wallet's deposit was touched: %s", d.Status)
 			}
 		}

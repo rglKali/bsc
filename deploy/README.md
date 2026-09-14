@@ -3,6 +3,15 @@
 One binary, one systemd unit, one file on disk. No database server, no message
 broker, no Docker.
 
+Everything here is flat; each file is copied somewhere on the box:
+
+| File | Goes to |
+| --- | --- |
+| `bsc.service` | `/etc/systemd/system/` |
+| `bsc.env.example` | copy to `/etc/bsc/bsc.env` and fill in |
+| `prometheus.yml` | included by the host's Prometheus |
+| `dashboard.json` | imported into Grafana |
+
 ## 1. Build
 
 ```sh
@@ -17,12 +26,13 @@ sudo mkdir -p /opt/bsc/bin /etc/bsc /var/lib/bsc /var/backups/bsc
 sudo chown -R bsc:bsc /var/lib/bsc /var/backups/bsc
 
 sudo cp bin/bsc /opt/bsc/bin/
-sudo cp deploy/systemd/bsc.service /etc/systemd/system/
+sudo cp deploy/bsc.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
 
-Create `/etc/bsc/bsc.env` with at least `MASTER_SECRET` and `RPC_URL`, then lock
-it down — it holds the key to every managed wallet:
+Start from `deploy/bsc.env.example` — copy it to `/etc/bsc/bsc.env` and fill in
+at least `MASTER_SECRET` and `RPC_URL`. Then lock it down; it holds the key to
+every managed wallet:
 
 ```sh
 sudo chown root:bsc /etc/bsc/bsc.env && sudo chmod 640 /etc/bsc/bsc.env
@@ -118,11 +128,34 @@ bsc inspect --rpc /var/backups/bsc/bsc-20260911T120000Z.db   # also checks balan
 `/metrics` is Prometheus-formatted and served from the same loopback listener, so
 it is scraped over loopback like everything else here.
 
-| File | For |
-| --- | --- |
-| `prometheus.yml` | A scrape **fragment** — `scrape_configs` only, no `global` block. The repo-root Prometheus includes it via `scrape_config_files`, so bsc owns its own scrape config. |
-| `grafana/prometheus.yml` | A **standalone** config, for pointing a local Prometheus at a local bsc while working on the dashboard. |
-| `grafana/bsc-dashboard.json` | Import into Grafana. See [`grafana/README.md`](grafana/README.md) for what each panel means and which two are worth reading carefully rather than at a glance. |
+`prometheus.yml` is a scrape **fragment** — `scrape_configs` only, no `global`
+block. The host's Prometheus includes it via `scrape_config_files`, so bsc owns
+its own scrape config.
+
+`dashboard.json` is the Grafana dashboard: import it and pick your Prometheus
+datasource. All series are under one `bsc_*` namespace from that single endpoint.
+
+The top row is what an operator actually watches, and
+[`../docs/OPERATING.md`](../docs/OPERATING.md) explains why each one matters:
+
+- **Master wallet** — the one to alert on. A dry master stops every pipeline, and
+  gas top-ups defend it, but only while there are fees to sell — which is why
+  the same panel plots `bsc_master_usdt_wei` beside it. Native falling while
+  tokens sit at zero is the combination that needs a human.
+- **Blocks behind** — sustained growth means the RPC cannot keep up, and
+  withdrawals start being refused once it passes `MAX_LAG_BLOCKS`.
+- **In-flight age** — signing is sequential, so this growing means one
+  transaction is wedged and everything is queued behind it.
+
+Two panels are worth reading carefully rather than at a glance:
+
+- *Deposits* shows recorded and ignored side by side. Ignored transfers were
+  worth less than a whole cent, so there was no ledger entry to write: the two
+  series differing is correct, not a fault.
+- *Problems* should sit flat at zero. **A solvency shortfall is the serious one**
+  — a hot wallet holding less than its app is owed, which nothing self-corrects.
+  A balance underflow is a bug in our own accounting; insufficient-balance
+  refusals mean our record of custody drifted from the chain.
 
 What to alert on is in [`../docs/OPERATING.md`](../docs/OPERATING.md); the short
 version is a master that stays low on gas, a watcher that stays behind, and any

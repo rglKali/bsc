@@ -12,7 +12,7 @@ import (
 var ErrDuplicate = errors.New("store: duplicate idempotency key")
 
 // PutWithdrawal writes a withdrawal and its three indexes: the history listing,
-// the open set an app polls, and the idempotency key. Idempotency matters more
+// the outstanding set an app polls, and the idempotency key. Idempotency matters more
 // here than it did in v1, which got dedup free from the message broker — over
 // HTTP, a client retry after a timeout would otherwise double-pay (§6).
 func (t *Tx) PutWithdrawal(wd Withdrawal) error {
@@ -62,10 +62,11 @@ func (t *Tx) WithdrawalByKey(slug, key string) (Withdrawal, bool, error) {
 	return t.Withdrawal(u)
 }
 
-// OpenWithdrawals returns everything not yet terminal for an app. This is the
-// whole withdrawal notification mechanism: the app holds the ids, so it polls
-// its own open set and drops each entry as it settles (§9). The set is bounded
-// by how many the app has in flight.
+// OpenWithdrawals returns everything not yet terminal for an app — which, since
+// `debited` is the only terminal status (§28), means everything still `pending`.
+// This is the whole withdrawal notification mechanism: the app holds the ids, so
+// it polls its own outstanding set and drops each entry as it settles (§9). The
+// set is bounded by how many the app has in flight.
 func (t *Tx) OpenWithdrawals(slug string) ([]Withdrawal, error) {
 	var out []Withdrawal
 	err := scanPrefix(t, iWdOpen, scopePrefix(slug), func(k, _ []byte) error {

@@ -63,15 +63,24 @@ Every piece of chain work is a **flow**: a persisted state machine.
 | --- | --- |
 | `drain` | `funding` → `approving` → `sweeping` → `done` \| `failed` |
 | `withdrawal` | `funding` → `approving` → `paying` → `done` \| `failed` |
-| `fee_sweep` | `funding` → `approving` → `paying` → `done` \| `failed` |
+| `house_sweep` | `funding` → `approving` → `sweeping_house` → `done` \| `failed` |
+| `gas_topup` | `approving_router` → `swapping` → `done` \| `failed` |
 | `prewarm` | `funding` → `approving` → `done` |
 
+These are **internal** and no app ever sees one (§27). The overlap with the
+app-facing vocabulary is accidental and worth keeping straight: a flow's `failed`
+is one attempt giving up, which for a withdrawal means a backoff and a retry, not
+a verdict — a *withdrawal* has no failed status at all (§28).
+
 Activation is not a separate flow — funding and approving are simply the prefix
-of whatever needed an inactive wallet. A fee sweep **pays an exact amount** rather
-than sweeping, despite the name: it draws on an app's top-level wallet, which
-holds the app's money alongside the fees owed on it, so moving the balance would
-hand the app's funds to the treasury. `sweeping` is only ever correct on a
-deposit wallet.
+of whatever needed an inactive wallet.
+
+`sweeping` and `sweeping_house` are distinct states for the same reason the
+wallets are distinct. `sweeping` moves a deposit wallet's *whole* balance, which
+is only ever correct there: everything on a deposit address is owed to the app.
+`sweeping_house` draws on the top-level wallet, which holds the app's money
+alongside the house's, so it moves a computed difference — `balanceOf` less the
+ledger, resolved at signing time — and never the balance (§25).
 
 A flow's **state is the instruction**. `funding` means "the funding transfer still
 needs to go out", and the record carries everything that transfer needs, so
@@ -88,7 +97,7 @@ and converges on it. The rules are evaluated inside the block transaction, right
 after any flow terminates, and once at startup:
 
 > a **deposit** wallet with `balance ≥ DRAIN_THRESHOLD_WEI`, no live flow, and past its retry deadline is owed a **drain**
-> an app with a queued withdrawal and an idle top-level is owed a **withdrawal**
+> an app with a pending withdrawal, an idle top-level, and past its retry deadline is owed a **withdrawal**
 > an app whose wallet holds more than its ledger, by at least `HOUSE_SWEEP_MIN_CENTS`, is owed a **house sweep**
 
 Two deposits in one block are credited before the check runs, so the wallet is
@@ -120,10 +129,15 @@ single number. So the app-facing balance is a **ledger**, and the wallet balance
 means custody and nothing else (§22).
 
 - `available` = ledger − reserved — what the app may spend now
-- `reserved` — held by open withdrawals, payout and fee together
+- `reserved` — held by pending withdrawals, payout and fee together
 - `pending` — recorded deposits whose drain has not landed: real, not yet
   spendable, and counted from the deposit records rather than from what the
   deposit wallets hold, because those also carry dust nobody was credited for
+- `total` — the three added up, so an app never has to work out which pair to add
+
+The three parts partition the ledger, which is what lets a deposit's status name
+the bucket it is in: a `pending` deposit is what `pending` counts, a `credited`
+one is in `available` (§27).
 
 The ledger is **materialised for reads and recomputable from `log/`**, which is
 the property the old chain-materialised balance could not offer: `bsc inspect`
@@ -142,7 +156,7 @@ to fail, and there is no `partial` status.
 What is left over — fees, the sub-cent remainders flooring leaves behind, and
 anything a stranger sends to a managed address — is one quantity after the
 ledger, and one rule collects it: the **house sweep**, resolved at signing time
-from `balanceOf` less the ledger, deferring to any queued payout (§25).
+from `balanceOf` less the ledger, deferring to any pending payout (§25).
 
 ## Nothing escapes us, with one exception
 
@@ -224,7 +238,9 @@ Add an entry rather than silently changing a documented decision.
 16. **Polling two read models, not webhooks or a broker.** Deposits are
     unsolicited so they get a cursor — the chain's own `(block, log_index)`,
     which every deposit has by construction. Withdrawals are app-initiated, so
-    the app polls its own open set by id. Webhooks would mean owning per-delivery
+    the app polls its own outstanding set by id. *(The shape of both held; only
+    the spelling changed. §27 made the cursor opaque hex rather than
+    `<block>-<logindex>`, and the set an app polls is now `?status=pending`.)* Webhooks would mean owning per-delivery
     state, attempt counters, backoff timers and dead-lettering — and would still
     need a cursor behind them for recovery. A broker would put back the moving
     part this design removes. SSE remains a small addition on the same substrate
@@ -305,7 +321,17 @@ Add an entry rather than silently changing a documented decision.
     charged, the sub-cent remainders flooring left behind, and any tokens a
     stranger sent to a managed address are the same quantity: the excess of
     custody over the ledger. A single `house_sweep` flow moves it to the
-    collector once it is worth a transfer, and defers to any queued payout.
+    collector once it is worth a transfer, and defers to any pending payout.
+
+    "Everything" is the top-level wallet's excess, which is narrower than it
+    sounds: the sweep is scoped to `KindTopLevel` and the drain to `KindDeposit`
+    above `DRAIN_THRESHOLD_WEI`, so a deposit address that only ever receives
+    sub-threshold amounts holds them indefinitely — its dust never reaches a
+    wallet the sweep looks at. Later deposits push it over and carry the old dust
+    along, so this only strands anything on an address that is never used again.
+    It is the drain threshold working as intended (moving three cents costs more
+    than three cents), not a leak, but the quantity is not literally *all* of the
+    house's money.
 
     Its amount is resolved at signing time from a `balanceOf` and the ledger read
     together, never fixed when the flow starts — it is the one operation whose
@@ -342,6 +368,86 @@ Add an entry rather than silently changing a documented decision.
     later start. A database built against one chain cannot be opened against
     another — the wallets in it were derived for that chain and the amounts are
     denominated in its token, so moving it is a migration, not a config edit.
+
+27. **The app-facing API is a payments provider's, not a chain's.** An app asks
+    for an address, is told what arrived and what it may spend, and asks for a
+    payout. Everything about *how* that happens on-chain is now absent from the
+    wire: the wei amount beside every cents amount, the block height and log
+    index on every deposit, the hash of the drain that swept it, and the
+    `/wallets` noun for something an app only ever treats as an address.
+
+    The reasoning that put `amount_wei` there (§23) was that an operator should
+    be able to reconcile a record against a block explorer. That is a real need
+    and it was solved in the wrong place: `tx_hash` already opens the exact
+    transfer on bscscan, and `bsc inspect --rpc` reconciles the whole database
+    against the token. Neither needs the app to carry a second unit it must
+    never do arithmetic on — and a wei figure on the wire is an invitation to
+    try. Cents, a hash, a status: the app has no use for more.
+
+    The deposit cursor stays the chain's `(block, log_index)` internally,
+    because it is still the only ordering every deposit has by construction, but
+    it is rendered as hex rather than `<block>-<logindex>`. Hex keeps the one
+    property an app may rely on — two ids compare in the order the chain
+    produced them — while removing the one it must not, which is reading a block
+    height out of a cursor and reasoning about the chain's position. It is
+    reversible on purpose: opacity is a contract with the app, not a secret, and
+    support still needs to find a deposit.
+
+    `api/contract_test.go` walks the real surface and fails on the vocabulary
+    itself, because "no wei on the wire" is a property of every response rather
+    than of any one handler, and is exactly what a well-meaning addition puts
+    back without noticing.
+
+28. **A withdrawal has no failure state.** The lifecycle is `pending` →
+    `debited`, mirroring a deposit's `pending` → `credited`: two words each,
+    both terminal ones naming what happened to the app's balance rather than
+    what happened on the chain. `queued`, `pending`, `done` and `failed` are
+    gone, along with the internal `funding` / `approving` / `draining` states
+    that were never app-visible anyway.
+
+    The split is by *whose problem it is*. A request that cannot be honoured is
+    the app's problem and is refused synchronously, so it never becomes a record
+    at all — a bad address, an amount under the minimum, a fee that exceeds it,
+    a paused app, an overdraft, a watcher too far behind. Anything that goes
+    wrong after we have accepted it is ours: a reverted payout keeps its
+    reservation, stays `pending`, stamps `attempts` and `last_error` as
+    diagnostics, and backs the wallet off for the rules to retry. The app is
+    never handed a terminal state it has to compensate for, because the only
+    terminal state is the money having moved.
+
+    This makes `ShouldPay`'s `RetryAfter` gate load-bearing rather than
+    symmetry with `ShouldDrain` and `ShouldSweepHouse`. It was safe to omit only
+    while a reverted payout terminated; with the retry it is the one thing
+    standing between a payout that always reverts and re-signing it on every
+    evaluation, burning the master's gas as fast as blocks arrive.
+
+    **What makes retrying-forever safe is that almost nothing is permanently
+    unpayable.** A plain BEP-20 `transferFrom` does not call the recipient —
+    there is no hook, unlike ERC-777 or ERC-1363 — so the destination gets no
+    opportunity to reject it; the token updates two balance slots and that is
+    all. A contract, a cold wallet and an EOA are the same thing to it. Every
+    ordinary payout failure is therefore *ours* and transient: a hot wallet
+    momentarily short, an allowance not yet in place, a node that refused the
+    broadcast. Those are precisely what should retry rather than be handed back.
+
+    The one exception a valid address can be is the **zero address**, which
+    `common.IsHexAddress` accepts and the token reverts on. It is refused at
+    creation, where it costs no RPC call — the rule being that anything
+    permanently unpayable must be caught *before* it becomes a record holding a
+    reservation, because there is no terminal state left to settle it into
+    afterwards.
+
+    That leaves one residual, and it is a property of the token rather than of
+    this design: a token with a transfer blacklist can make one specific
+    destination permanently unpayable. The default BSC deployment (Binance-Peg
+    BSC-USD) has no such list; mainnet Ethereum Tether does. Since
+    `TOKEN_ADDRESS` is configurable, the posture is to retry and make it visible
+    rather than to guess — `attempts` climbing into double digits is an
+    operator's signal, not a retry's, and the remedy today is editing the
+    record. A cancel is the obvious follow-up and is deliberately unbuilt
+    (`docs/ROADMAP.md`): releasing a reservation for a payout that might still
+    land is the one way this design could pay twice.
+
 
 ## Verification
 

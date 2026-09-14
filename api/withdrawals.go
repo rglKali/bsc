@@ -30,6 +30,15 @@ type withdrawalBody struct {
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
+// withdrawalView is one payout. `status` is `pending` until the transfer is
+// final, then `debited`; there is no failure state, because a request that
+// cannot be honoured was refused at creation and anything that goes wrong
+// afterwards is retried rather than handed back (§28).
+//
+// LastError and Attempts are therefore diagnostics, not a verdict. They exist
+// because the app API is also the operator's read surface (§13): a payout that
+// keeps reverting must be visible to a human without inventing a terminal state
+// the app would have to compensate for.
 type withdrawalView struct {
 	ID          string `json:"id"`
 	Status      string `json:"status"`
@@ -39,7 +48,8 @@ type withdrawalView struct {
 	PayoutCents string `json:"payout_cents"`
 	DeductFee   bool   `json:"deduct_fee"`
 	TxHash      string `json:"tx_hash"`
-	Error       string `json:"error"`
+	Attempts    uint32 `json:"attempts"`
+	LastError   string `json:"last_error,omitempty"`
 	CreatedAt   string `json:"created_at"`
 	UpdatedAt   string `json:"updated_at"`
 }
@@ -89,6 +99,17 @@ func (s *Server) createWithdrawal(w http.ResponseWriter, r *http.Request) error 
 	}
 	if !common.IsHexAddress(body.Destination) {
 		return fail(http.StatusBadRequest, "bad_destination", "destination must be a hex address")
+	}
+	// The zero address passes IsHexAddress and is the one destination a valid
+	// address can be while still being unpayable: the token reverts on it, so
+	// the payout could never land however many times it was retried. A
+	// withdrawal has no failure state (§28), which means anything permanently
+	// unpayable has to be caught here — before it becomes a record holding a
+	// reservation forever — rather than settled into one afterwards. It costs
+	// no RPC call, so there is no reason not to.
+	if common.HexToAddress(body.Destination) == (common.Address{}) {
+		return fail(http.StatusBadRequest, "bad_destination",
+			"destination is the zero address, which cannot receive tokens")
 	}
 	value, err := cents("amount_cents", body.AmountCents)
 	if err != nil {
@@ -146,7 +167,7 @@ func (s *Server) createWithdrawal(w http.ResponseWriter, r *http.Request) error 
 		wd = store.Withdrawal{
 			ID: uuid.New(), App: a.Slug, Destination: destination,
 			Amount: q.Amount, Fee: q.Fee, Payout: q.Payout, Debit: q.Debit,
-			DeductFee: body.DeductFee, Status: store.WithdrawalQueued,
+			DeductFee: body.DeductFee, Status: store.WithdrawalPending,
 			IdempotencyKey: body.IdempotencyKey, FeeSnapshot: a.Fee,
 			CreatedAt: now, UpdatedAt: now,
 		}
@@ -160,7 +181,7 @@ func (s *Server) createWithdrawal(w http.ResponseWriter, r *http.Request) error 
 
 	if !replay {
 		s.opts.Notify()
-		s.log.Info("withdrawal queued",
+		s.log.Info("withdrawal accepted",
 			"app", wd.App, "id", wd.ID, "payout_cents", wd.Payout, "fee_cents", wd.Fee,
 			"to", wd.Destination.Hex())
 	}
@@ -201,13 +222,13 @@ func (s *Server) getWithdrawal(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// listWithdrawals serves the open set by default. Withdrawals need no cursor:
-// the app minted the ids and only wants to know which of its own are still
-// outstanding.
+// listWithdrawals serves the outstanding set by default. Withdrawals need no
+// cursor: the app minted the ids and only wants to know which of its own have
+// not settled yet.
 func (s *Server) listWithdrawals(w http.ResponseWriter, r *http.Request) error {
 	status := r.URL.Query().Get("status")
 	if status == "" {
-		status = "open"
+		status = "pending"
 	}
 	limit, err := limitParam(r, 100, 1000)
 	if err != nil {
@@ -222,22 +243,19 @@ func (s *Server) listWithdrawals(w http.ResponseWriter, r *http.Request) error {
 		}
 		var list []store.Withdrawal
 		switch status {
-		case "open":
+		case "pending":
 			list, err = tx.OpenWithdrawals(a.Slug)
-		case "done", "failed", "all":
+		case "debited", "all":
 			list, err = tx.Withdrawals(a.Slug, 0)
 		default:
-			return fail(http.StatusBadRequest, "bad_status", "status must be open, done, failed or all")
+			return fail(http.StatusBadRequest, "bad_status", "status must be pending, debited or all")
 		}
 		if err != nil {
 			return err
 		}
 		out = make([]withdrawalView, 0, len(list))
 		for _, wd := range list {
-			if status == "done" && wd.Status != store.WithdrawalDone {
-				continue
-			}
-			if status == "failed" && wd.Status != store.WithdrawalFailed {
+			if status == "debited" && wd.Status != store.WithdrawalDebited {
 				continue
 			}
 			out = append(out, viewWithdrawal(wd))
@@ -258,7 +276,7 @@ func viewWithdrawal(wd store.Withdrawal) withdrawalView {
 		ID: wd.ID.String(), Status: wd.Status.String(), Destination: wd.Destination.Hex(),
 		AmountCents: wd.Amount.String(), FeeCents: wd.Fee.String(),
 		PayoutCents: wd.Payout.String(), DeductFee: wd.DeductFee,
-		TxHash: hashStr(wd.TxHash), Error: wd.Error,
+		TxHash: hashStr(wd.TxHash), Attempts: wd.Attempts, LastError: wd.Error,
 		CreatedAt: stamp(wd.CreatedAt), UpdatedAt: stamp(wd.UpdatedAt),
 	}
 }

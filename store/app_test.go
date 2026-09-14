@@ -196,13 +196,13 @@ func TestEnumLabels(t *testing.T) {
 		{StateDone.String(), "done"},
 		{StateFailed.String(), "failed"},
 		{FlowState(99).String(), "unknown"},
-		{DepositConfirmed.String(), "confirmed"},
+		{DepositPending.String(), "pending"},
 		{DepositCredited.String(), "credited"},
 		{DepositStatus(99).String(), "unknown"},
-		{WithdrawalQueued.String(), "queued"},
+		// Two states each, named for what happened to the ledger. There is no
+		// withdrawal failure label because there is no failure state (§28).
 		{WithdrawalPending.String(), "pending"},
-		{WithdrawalDone.String(), "done"},
-		{WithdrawalFailed.String(), "failed"},
+		{WithdrawalDebited.String(), "debited"},
 		{WithdrawalStatus(99).String(), "unknown"},
 	}
 	for _, c := range cases {
