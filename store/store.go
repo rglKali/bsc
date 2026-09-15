@@ -128,7 +128,7 @@ func (s *Store) Snapshot(w io.Writer) (int64, error) {
 // --- chain cursor ---
 
 // Cursor returns the next block to process. ok is false on a fresh database,
-// which is the caller's signal to fall back to START_BLOCK — and that fallback
+// which is the caller's signal to fall back to chain.start_block — and that fallback
 // must resolve to the current finalized head, never 0, or the watcher would try
 // to scan from genesis (§11).
 func (t *Tx) Cursor() (next uint64, ok bool, err error) {

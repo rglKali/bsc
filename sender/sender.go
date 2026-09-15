@@ -501,7 +501,7 @@ func (s *Sender) wrappedNative(ctx context.Context) (common.Address, error) {
 		}
 		addr, err := swap.UnpackAddress(out)
 		if err != nil {
-			s.wrappedErr = fmt.Errorf("sender: %w — set SWAP_WRAPPED_NATIVE if this router names it differently", err)
+			s.wrappedErr = fmt.Errorf("sender: %w — set swap.wrapped_native if this router names it differently", err)
 			return
 		}
 		s.wrapped = addr

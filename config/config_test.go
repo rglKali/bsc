@@ -8,6 +8,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 
 	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,10 +17,10 @@ import (
 
 const secret = "1111111111111111111111111111111111111111111111111111111111111111"
 
-// withEnv sets MASTER_SECRET plus any extras, cleaned up by t.Setenv.
+// withEnv sets BSC_MASTER_SECRET plus any extras, cleaned up by t.Setenv.
 func withEnv(t *testing.T, kv ...string) {
 	t.Helper()
-	t.Setenv("MASTER_SECRET", secret)
+	t.Setenv("BSC_MASTER_SECRET", secret)
 	for i := 0; i < len(kv); i += 2 {
 		t.Setenv(kv[i], kv[i+1])
 	}
@@ -66,7 +68,7 @@ func TestDefaults(t *testing.T) {
 }
 
 func TestMasterSecretIsRequired(t *testing.T) {
-	t.Setenv("MASTER_SECRET", "")
+	t.Setenv("BSC_MASTER_SECRET", "")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load accepted a missing master secret")
 	}
@@ -76,7 +78,7 @@ func TestRateLimitMustOutrunTheChain(t *testing.T) {
 	// At ~2.2 blocks/s a limit that cannot clear the block rate leaves the
 	// watcher permanently unable to catch up. Refusing at boot beats finding
 	// out during an incident.
-	withEnv(t, "RPC_RATE_LIMIT", "3")
+	withEnv(t, "BSC_CHAIN_RPC_RATE_LIMIT", "3")
 	_, err := Load()
 	if err == nil {
 		t.Fatal("Load accepted a rate limit below the block rate")
@@ -85,7 +87,7 @@ func TestRateLimitMustOutrunTheChain(t *testing.T) {
 		t.Fatalf("error = %v; it should explain why", err)
 	}
 
-	withEnv(t, "RPC_RATE_LIMIT", "20")
+	withEnv(t, "BSC_CHAIN_RPC_RATE_LIMIT", "20")
 	if _, err := Load(); err != nil {
 		t.Fatalf("a workable limit was rejected: %v", err)
 	}
@@ -93,14 +95,14 @@ func TestRateLimitMustOutrunTheChain(t *testing.T) {
 
 func TestValidation(t *testing.T) {
 	tests := map[string][2]string{
-		"bad token":       {"TOKEN_ADDRESS", "not-an-address"},
-		"bad collector":   {"FEE_COLLECTOR", "nope"},
-		"bad min deposit": {"DRAIN_THRESHOLD_WEI", "abc"},
-		"negative fee":    {"DEFAULT_FEE_CENTS", "-1"},
-		"negative sweep":  {"HOUSE_SWEEP_MIN_CENTS", "-1"},
-		"zero batch":      {"BACKFILL_BATCH", "0"},
-		"low funding mul": {"FUNDING_MULTIPLIER", "0.9"},
-		"low gas mul":     {"GAS_PRICE_MULTIPLIER", "0.5"},
+		"bad token":       {"BSC_CHAIN_TOKEN_ADDRESS", "not-an-address"},
+		"bad collector":   {"BSC_MONEY_FEE_COLLECTOR", "nope"},
+		"bad min deposit": {"BSC_MONEY_DRAIN_THRESHOLD_WEI", "abc"},
+		"negative fee":    {"BSC_MONEY_DEFAULT_FEE_CENTS", "-1"},
+		"negative sweep":  {"BSC_MONEY_HOUSE_SWEEP_MIN_CENTS", "-1"},
+		"zero batch":      {"BSC_CHAIN_BACKFILL_BATCH", "0"},
+		"low funding mul": {"BSC_GAS_FUNDING_MULTIPLIER", "0.9"},
+		"low gas mul":     {"BSC_GAS_PRICE_MULTIPLIER", "0.5"},
 	}
 	for name, kv := range tests {
 		withEnv(t, kv[0], kv[1])
@@ -112,12 +114,12 @@ func TestValidation(t *testing.T) {
 
 func TestOverrides(t *testing.T) {
 	withEnv(t,
-		"DB_PATH", "/var/lib/bsc/bsc.db",
-		"HTTP_ADDR", "127.0.0.1:9000",
-		"START_BLOCK", "48210577",
-		"DRAIN_THRESHOLD_WEI", "500",
-		"MAX_LAG_BLOCKS", "50",
-		"SNAPSHOT_DIR", "/var/backups/bsc",
+		"BSC_DB_PATH", "/var/lib/bsc/bsc.db",
+		"BSC_HTTP_ADDR", "127.0.0.1:9000",
+		"BSC_CHAIN_START_BLOCK", "48210577",
+		"BSC_MONEY_DRAIN_THRESHOLD_WEI", "500",
+		"BSC_CHAIN_MAX_LAG_BLOCKS", "50",
+		"BSC_SNAPSHOT_DIR", "/var/backups/bsc",
 	)
 	cfg, err := Load()
 	if err != nil {
@@ -139,7 +141,7 @@ func TestOverrides(t *testing.T) {
 
 func TestMasterSecretAcceptsAPrefixedForm(t *testing.T) {
 	// The secret is only parsed downstream, but it must survive config intact.
-	withEnv(t, "MASTER_SECRET", "0x"+secret)
+	withEnv(t, "BSC_MASTER_SECRET", "0x"+secret)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -184,8 +186,8 @@ func TestSwappingDefaultsToTheChainsRouter(t *testing.T) {
 func TestEnvironmentAlwaysBeatsTheChainDefaults(t *testing.T) {
 	// These are defaults, not policy.
 	withEnv(t,
-		"RPC_URL", "wss://my-own-node.example",
-		"TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955",
+		"BSC_CHAIN_RPC_URL", "wss://my-own-node.example",
+		"BSC_CHAIN_TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955",
 	)
 	cfg, err := Load()
 	if err != nil {
@@ -210,12 +212,12 @@ func TestEnablingSwapsDemandsCompleteConfiguration(t *testing.T) {
 	router := "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 
 	tests := map[string][]string{
-		"bad wrapped native": {"SWAP_ROUTER", router, "SWAP_WRAPPED_NATIVE", "nonsense"},
-		"bad router":         {"SWAP_ROUTER", "nonsense"},
-		"zero swap amount":   {"SWAP_ROUTER", router, "SWAP_AMOUNT_WEI", "0"},
-		"zero floor":         {"SWAP_ROUTER", router, "GAS_FLOOR_WEI", "0"},
-		"absurd slippage":    {"SWAP_ROUTER", router, "SWAP_SLIPPAGE_BPS", "10000"},
-		"no cooldown":        {"SWAP_ROUTER", router, "SWAP_COOLDOWN", "0s"},
+		"bad wrapped native": {"BSC_SWAP_ROUTER", router, "BSC_SWAP_WRAPPED_NATIVE", "nonsense"},
+		"bad router":         {"BSC_SWAP_ROUTER", "nonsense"},
+		"zero swap amount":   {"BSC_SWAP_ROUTER", router, "BSC_SWAP_AMOUNT_WEI", "0"},
+		"zero floor":         {"BSC_SWAP_ROUTER", router, "BSC_SWAP_GAS_FLOOR_WEI", "0"},
+		"absurd slippage":    {"BSC_SWAP_ROUTER", router, "BSC_SWAP_SLIPPAGE_BPS", "10000"},
+		"no cooldown":        {"BSC_SWAP_ROUTER", router, "BSC_SWAP_COOLDOWN", "0s"},
 	}
 	for name, env := range tests {
 		// A subtest per case: t.Setenv restores at the end of the *test*, so a
@@ -231,7 +233,7 @@ func TestEnablingSwapsDemandsCompleteConfiguration(t *testing.T) {
 	var cfg Config
 	t.Run("complete", func(t *testing.T) {
 		// The wrapped token is deliberately absent: the router reports its own.
-		withEnv(t, "SWAP_ROUTER", router)
+		withEnv(t, "BSC_SWAP_ROUTER", router)
 		var err error
 		cfg, err = Load()
 		if err != nil {
@@ -250,7 +252,7 @@ func TestEnablingSwapsDemandsCompleteConfiguration(t *testing.T) {
 // know which chain the endpoint speaks for. Leaving those fields empty is what
 // makes the mismatch impossible — there is no configured value to disagree.
 func TestNothingChainShapedIsKnownBeforeResolution(t *testing.T) {
-	withEnv(t, "RPC_URL", "wss://somewhere.example")
+	withEnv(t, "BSC_CHAIN_RPC_URL", "wss://somewhere.example")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -289,32 +291,32 @@ func TestResolveChainFollowsTheEndpoint(t *testing.T) {
 // startup failure naming exactly what is missing. Guessing would point a signer
 // at one chain's token while the endpoint served another.
 func TestUnknownChainMustBeNamedInFull(t *testing.T) {
-	withEnv(t, "RPC_URL", "wss://somewhere.example", "SWAP_ENABLED", "false")
+	withEnv(t, "BSC_CHAIN_RPC_URL", "wss://somewhere.example", "BSC_SWAP_ENABLED", "false")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if err := cfg.ResolveChain(1337); err == nil || !strings.Contains(err.Error(), "TOKEN_ADDRESS") {
-		t.Fatalf("err = %v, want it to name TOKEN_ADDRESS", err)
+	if err := cfg.ResolveChain(1337); err == nil || !strings.Contains(err.Error(), "BSC_CHAIN_TOKEN_ADDRESS") {
+		t.Fatalf("err = %v, want it to name chain.token_address", err)
 	}
 
 	// Swapping on, with no router we can resolve: it must say how to proceed
 	// rather than quietly never swapping, which would surface only as a dry
 	// master weeks later.
-	// SWAP_ENABLED is set back explicitly: t.Setenv unwinds at the end of the
+	// swap.enabled is set back explicitly: t.Setenv unwinds at the end of the
 	// test, not between withEnv calls inside one.
-	withEnv(t, "RPC_URL", "wss://somewhere.example", "SWAP_ENABLED", "true",
-		"TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955")
+	withEnv(t, "BSC_CHAIN_RPC_URL", "wss://somewhere.example", "BSC_SWAP_ENABLED", "true",
+		"BSC_CHAIN_TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955")
 	cfg, _ = Load()
 	err = cfg.ResolveChain(1337)
-	if err == nil || !strings.Contains(err.Error(), "SWAP_ENABLED=false") {
+	if err == nil || !strings.Contains(err.Error(), "swap.enabled=false") {
 		t.Fatalf("err = %v; it should say how to proceed", err)
 	}
 
 	// Naming both is a way forward.
-	withEnv(t, "RPC_URL", "wss://somewhere.example", "SWAP_ENABLED", "true",
-		"TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955",
-		"SWAP_ROUTER", "0x10ED43C718714eb63d5aA57B78B54704E256024E")
+	withEnv(t, "BSC_CHAIN_RPC_URL", "wss://somewhere.example", "BSC_SWAP_ENABLED", "true",
+		"BSC_CHAIN_TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955",
+		"BSC_SWAP_ROUTER", "0x10ED43C718714eb63d5aA57B78B54704E256024E")
 	cfg, _ = Load()
 	if err := cfg.ResolveChain(1337); err != nil {
 		t.Fatalf("a fully named unknown chain was rejected: %v", err)
@@ -328,5 +330,181 @@ func TestResolveChainRefusesAChainIdOfZero(t *testing.T) {
 	cfg, _ := Load()
 	if err := cfg.ResolveChain(0); err == nil {
 		t.Fatal("resolved against chain id 0")
+	}
+}
+
+// The file carries operations, the environment carries the one secret. That
+// split is the reason the config file exists (§30): with the secret in it, the
+// whole file has to be unreadable and unversionable, and "what changed last
+// month" stops being answerable.
+func TestFileCarriesOperationsAndTheEnvironmentCarriesTheSecret(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+db_path: /srv/bsc.db
+http_addr: 127.0.0.1:9100
+chain:
+  rpc_url: https://rpc.example
+  rpc_rate_limit: 33
+  max_lag_blocks: 400
+money:
+  default_fee_cents: 250
+  house_sweep_min_cents: 500
+swap:
+  enabled: false
+snapshot:
+  dir: /srv/backups
+  keep: 48
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BSC_MASTER_SECRET", secret)
+	v := New()
+	if err := ReadFile(v, path, true); err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	cfg, err := Parse(v)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if cfg.DBPath != "/srv/bsc.db" || cfg.HTTPAddr != "127.0.0.1:9100" {
+		t.Errorf("root keys not read: %+v", cfg)
+	}
+	if cfg.RPCURL != "https://rpc.example" || cfg.RPCRateLimit != 33 || cfg.MaxLagBlocks != 400 {
+		t.Errorf("chain group not read: %s %d %d", cfg.RPCURL, cfg.RPCRateLimit, cfg.MaxLagBlocks)
+	}
+	if cfg.DefaultFee != 250 || cfg.HouseSweepMin != 500 {
+		t.Errorf("money group not read: %d %d", cfg.DefaultFee, cfg.HouseSweepMin)
+	}
+	if cfg.SwapEnabled {
+		t.Error("swap.enabled: false was not read")
+	}
+	if cfg.SnapshotDir != "/srv/backups" || cfg.SnapshotKeep != 48 {
+		t.Errorf("snapshot group not read: %s %d", cfg.SnapshotDir, cfg.SnapshotKeep)
+	}
+	// Defaults still fill in what the file left out.
+	if cfg.PollInterval != 500*time.Millisecond {
+		t.Errorf("poll interval = %v, want the default", cfg.PollInterval)
+	}
+	// And the secret came from the environment, never the file.
+	if cfg.MasterSecret != secret {
+		t.Error("master_secret did not reach the config from the environment")
+	}
+}
+
+// Both spellings address the same setting, and the environment wins — which is
+// what lets a deployment keep a reviewed file and still override one value for
+// an incident without editing it.
+func TestEnvironmentOverridesTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("chain:\n  rpc_rate_limit: 33\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BSC_MASTER_SECRET", secret)
+	t.Setenv("BSC_CHAIN_RPC_RATE_LIMIT", "77")
+
+	v := New()
+	if err := ReadFile(v, path, true); err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	cfg, err := Parse(v)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.RPCRateLimit != 77 {
+		t.Fatalf("rate limit = %d, want the environment to beat the file", cfg.RPCRateLimit)
+	}
+}
+
+// A missing file at the default path is normal: every setting has a default and
+// the environment can carry the rest. A file the operator *named* and that
+// cannot be read is not — running on settings nobody chose is worse than
+// refusing to start.
+func TestMissingConfigFile(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "absent.yaml")
+	if err := ReadFile(New(), missing, false); err != nil {
+		t.Fatalf("an absent default path must be fine, got %v", err)
+	}
+	if err := ReadFile(New(), missing, true); err == nil {
+		t.Fatal("a named config file that does not exist must be an error")
+	}
+}
+
+// EnvVar is what error messages use to name the variable an operator actually
+// typed, so it has to match the replacer viper is configured with.
+func TestEnvVarNaming(t *testing.T) {
+	for key, want := range map[string]string{
+		"master_secret":        "BSC_MASTER_SECRET",
+		"db_path":              "BSC_DB_PATH",
+		"chain.rpc_rate_limit": "BSC_CHAIN_RPC_RATE_LIMIT",
+		"swap.gas_floor_wei":   "BSC_SWAP_GAS_FLOOR_WEI",
+	} {
+		if got := EnvVar(key); got != want {
+			t.Errorf("EnvVar(%q) = %q, want %q", key, got, want)
+		}
+	}
+}
+
+// deploy/config.yaml is the documented surface, and a documented surface that
+// has drifted from the code is worse than none: it is the file an operator
+// copies and trusts. This parses the shipped file and asserts it produces
+// exactly the defaults, which catches both a stale comment and a key that was
+// renamed on one side only.
+func TestShippedConfigMatchesTheDefaults(t *testing.T) {
+	t.Setenv("BSC_MASTER_SECRET", secret)
+
+	fromFile := New()
+	if err := ReadFile(fromFile, filepath.Join("..", "deploy", "config.yaml"), true); err != nil {
+		t.Fatalf("the shipped config does not parse: %v", err)
+	}
+	shipped, err := Parse(fromFile)
+	if err != nil {
+		t.Fatalf("the shipped config is not valid: %v", err)
+	}
+	defaults, err := Parse(New())
+	if err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+
+	// The paths are the deployment choices the file makes on your behalf; every
+	// other value must be the built-in default, or the file is documenting
+	// something the binary does not do.
+	if shipped.DBPath != "/var/lib/bsc/bsc.db" || shipped.SnapshotDir != "/var/backups/bsc" {
+		t.Errorf("shipped paths = %q, %q", shipped.DBPath, shipped.SnapshotDir)
+	}
+	shipped.DBPath, shipped.SnapshotDir = defaults.DBPath, defaults.SnapshotDir
+
+	if shipped.RPCURL != defaults.RPCURL {
+		t.Errorf("rpc_url = %q, want the default %q", shipped.RPCURL, defaults.RPCURL)
+	}
+	if shipped.RPCRateLimit != defaults.RPCRateLimit || shipped.MaxLagBlocks != defaults.MaxLagBlocks ||
+		shipped.PollInterval != defaults.PollInterval || shipped.BackfillBatch != defaults.BackfillBatch {
+		t.Errorf("chain group drifted: %+v", shipped)
+	}
+	if shipped.DefaultFee != defaults.DefaultFee || shipped.HouseSweepMin != defaults.HouseSweepMin ||
+		shipped.DrainThreshold.Cmp(defaults.DrainThreshold) != 0 {
+		t.Errorf("money group drifted: %d %d %s",
+			shipped.DefaultFee, shipped.HouseSweepMin, shipped.DrainThreshold)
+	}
+	if shipped.FundingMultiplier != defaults.FundingMultiplier ||
+		shipped.GasMultiplier != defaults.GasMultiplier ||
+		shipped.RebroadcastAfter != defaults.RebroadcastAfter ||
+		shipped.MasterPoll != defaults.MasterPoll {
+		t.Errorf("gas group drifted: %+v", shipped)
+	}
+	if shipped.SwapEnabled != defaults.SwapEnabled ||
+		shipped.SwapAmount.Cmp(defaults.SwapAmount) != 0 ||
+		shipped.GasFloor.Cmp(defaults.GasFloor) != 0 ||
+		shipped.SwapSlippage != defaults.SwapSlippage ||
+		shipped.SwapCooldown != defaults.SwapCooldown {
+		t.Errorf("swap group drifted: %+v", shipped)
+	}
+	if shipped.SnapshotInterval != defaults.SnapshotInterval || shipped.SnapshotKeep != defaults.SnapshotKeep {
+		t.Errorf("snapshot group drifted: %v %d", shipped.SnapshotInterval, shipped.SnapshotKeep)
+	}
+	// The whole reason the file exists: it must not carry the secret.
+	if fromFile.GetString("master_secret") != secret {
+		t.Error("the shipped config file sets master_secret — it must come only from the environment")
 	}
 }

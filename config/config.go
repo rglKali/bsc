@@ -1,15 +1,30 @@
-// Package config resolves bsc's configuration from the environment.
+// Package config resolves bsc's configuration from a YAML file and the
+// environment.
 //
 // There is one config for the whole service, replacing v1's three separate
 // matrices. Anything that can be derived is derived rather than configured:
 // gas amounts come from estimates, the fee collector defaults to the master
 // address, and the starting block defaults to the current finalized head.
+//
+// **The split between the file and the environment is a security boundary, not
+// a convenience.** `master_secret` is the one setting that can move every app's
+// money, so it belongs in a secrets manager and reaches the process as
+// BSC_MASTER_SECRET. Everything else is operational — thresholds, intervals,
+// fee policy — and belongs in a file you can review, diff and keep in version
+// control. Putting the two in one file is what forces the whole thing to be a
+// secret, and with it the answer to "what changed last month" (§30).
+//
+// Keys are nested, and an environment variable is the key path in upper case
+// with BSC_ in front: swap.amount_wei is BSC_SWAP_AMOUNT_WEI. Precedence is
+// flag, then environment, then file, then default.
 package config
 
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"math/big"
+	"strings"
 	"time"
 
 	"bsc/chain"
@@ -23,103 +38,156 @@ import (
 
 // Config is the whole service's runtime configuration.
 type Config struct {
-	DBPath   string // DB_PATH — the only datastore
-	HTTPAddr string // HTTP_ADDR — the only listener
+	DBPath   string // db_path — the only datastore
+	HTTPAddr string // http_addr — the only listener
 
-	MasterSecret string // MASTER_SECRET (32-byte hex; required)
-	RPCURL       string // RPC_URL — the one chain input; everything else follows it
-	RPCRateLimit int    // RPC_RATE_LIMIT — one budget shared by everything
+	// UIEnabled mounts the local dashboard at /ui/. Off by default, and that
+	// default is the security boundary: the listener has no authentication, so
+	// on a host where it is reachable by anyone else this hands them every
+	// app's money. It is a sandbox and an operator's window, not a product
+	// surface (§29).
+	UIEnabled bool // ui_enabled
+
+	MasterSecret string // BSC_MASTER_SECRET (32-byte hex; required; environment only)
+	RPCURL       string // chain.rpc_url — the one chain input; everything else follows it
+	RPCRateLimit int    // chain.rpc_rate_limit — one budget shared by everything
 
 	// ChainID and Token are *resolved*, not configured: ResolveChain fills them
 	// in once the endpoint has said which chain it is. Token may be overridden
-	// with TOKEN_ADDRESS, which is the only reason it is read here at all.
+	// with chain.token_address, which is the only reason it is read here at all.
 	ChainID uint64
 	Token   common.Address
 
-	StartBlock    uint64        // START_BLOCK — only on a fresh database; 0 = the finalized head
-	PollInterval  time.Duration // POLL_INTERVAL
-	BackfillBatch int           // BACKFILL_BATCH — blocks per write transaction while catching up
-	MaxLagBlocks  uint64        // MAX_LAG_BLOCKS — refuse withdrawals past this
+	StartBlock    uint64        // chain.start_block — only on a fresh database; 0 = the finalized head
+	PollInterval  time.Duration // chain.poll_interval
+	BackfillBatch int           // chain.backfill_batch — blocks per write transaction while catching up
+	MaxLagBlocks  uint64        // chain.max_lag_blocks — refuse withdrawals past this
 
 	// DrainThreshold is pure gas economics: don't spend a transaction moving
 	// less than this. It says nothing about what an app is credited — a deposit
 	// worth a whole cent is always recorded, and shows as pending until its
 	// drain is worth running (§22).
-	DrainThreshold *big.Int // DRAIN_THRESHOLD_WEI
+	DrainThreshold *big.Int // money.drain_threshold_wei
 
 	// HouseSweepMin is how much excess over an app's ledger — fees, sub-cent
 	// dust, stray transfers — is worth one transfer to collect. Zero disables
 	// sweeping, which is safe: the money is ours either way and simply
 	// accumulates in the wallet.
-	HouseSweepMin money.Cents // HOUSE_SWEEP_MIN_CENTS
+	HouseSweepMin money.Cents // money.house_sweep_min_cents
 
-	DefaultFee   money.Cents // DEFAULT_FEE_CENTS — a new app's withdrawal fee
-	FeeCollector string      // FEE_COLLECTOR — empty means the master
+	DefaultFee   money.Cents // money.default_fee_cents — a new app's withdrawal fee
+	FeeCollector string      // money.fee_collector — empty means the master
 
 	// Gas top-up: swapping collected fees back into gas. On by default — a
 	// gateway that runs out of gas stops completely — but it is still the only
 	// thing the service does on its own initiative, so it is bounded on every
 	// side and can be turned off outright.
-	SwapEnabled  bool          // SWAP_ENABLED
-	SwapRouter   string        // SWAP_ROUTER — a Uniswap-V2-style router; defaults per chain
-	SwapNative   string        // SWAP_WRAPPED_NATIVE — optional override; the router is asked otherwise
-	SwapAmount   *big.Int      // SWAP_AMOUNT_WEI — tokens traded per top-up
-	GasFloor     *big.Int      // GAS_FLOOR_WEI — native balance below which a top-up is due
-	SwapSlippage uint32        // SWAP_SLIPPAGE_BPS
-	SwapCooldown time.Duration // SWAP_COOLDOWN — minimum gap between attempts
+	SwapEnabled  bool          // swap.enabled
+	SwapRouter   string        // swap.router — a Uniswap-V2-style router; defaults per chain
+	SwapNative   string        // swap.wrapped_native — optional override; the router is asked otherwise
+	SwapAmount   *big.Int      // swap.amount_wei — tokens traded per top-up
+	GasFloor     *big.Int      // swap.gas_floor_wei — native balance below which a top-up is due
+	SwapSlippage uint32        // swap.slippage_bps
+	SwapCooldown time.Duration // swap.cooldown — minimum gap between attempts
 
-	FundingMultiplier float64       // FUNDING_MULTIPLIER — the only gas knobs
-	GasMultiplier     float64       // GAS_PRICE_MULTIPLIER
-	RebroadcastAfter  time.Duration // REBROADCAST_AFTER
-	MasterPoll        time.Duration // MASTER_POLL — how often to refresh the BNB gauge
+	FundingMultiplier float64       // gas.funding_multiplier — the only gas knobs
+	GasMultiplier     float64       // gas.price_multiplier
+	RebroadcastAfter  time.Duration // gas.rebroadcast_after
+	MasterPoll        time.Duration // gas.master_poll — how often to refresh the BNB gauge
 
-	SnapshotDir      string        // SNAPSHOT_DIR — empty disables self-backup
-	SnapshotInterval time.Duration // SNAPSHOT_INTERVAL
-	SnapshotKeep     int           // SNAPSHOT_KEEP
+	SnapshotDir      string        // snapshot.dir — empty disables self-backup
+	SnapshotInterval time.Duration // snapshot.interval
+	SnapshotKeep     int           // snapshot.keep
 }
 
 // oneUSDT is 10^18 wei: USDT on BSC has 18 decimals.
 var oneUSDT, _ = new(big.Int).SetString("1000000000000000000", 10)
 
+// DefaultPath is where a deployment normally keeps its configuration. The
+// systemd unit passes it explicitly; nothing reads it implicitly.
+const DefaultPath = "/etc/bsc/config.yaml"
+
+// EnvPrefix is prepended to every key path to form an environment variable:
+// swap.amount_wei is BSC_SWAP_AMOUNT_WEI.
+const EnvPrefix = "BSC"
+
+// EnvVar renders the environment variable that sets a key, which is what error
+// messages should name: an operator who set the wrong thing needs to be told
+// the spelling they used, and both spellings address the same setting.
+func EnvVar(key string) string {
+	return EnvPrefix + "_" + strings.ToUpper(strings.NewReplacer(".", "_").Replace(key))
+}
+
 // New returns a viper pre-loaded with bsc's defaults and reading the
 // environment. A CLI binds its flags to this before calling Parse, so a flag
-// beats an environment variable which beats the default.
+// beats an environment variable which beats the file which beats the default.
 func New() *viper.Viper {
 	v := viper.New()
 	v.SetDefault("db_path", "bsc.db")
 	v.SetDefault("http_addr", "127.0.0.1:8800")
-	v.SetDefault("rpc_url", "") // resolved from the chain the endpoint reports
+	v.SetDefault("ui_enabled", false) // see Config.UIEnabled
+	v.SetDefault("chain.rpc_url", "") // resolved from the chain the endpoint reports
 	// At ~0.45s blocks the watcher alone needs ~2.2 req/s sustained, and it has
 	// to outrun the chain to ever catch up after an outage — see docs/REWRITE.md §10.
-	v.SetDefault("rpc_rate_limit", 20)
-	v.SetDefault("token_address", "") // resolved from the chain the endpoint reports
-	v.SetDefault("start_block", 0)
-	v.SetDefault("poll_interval", 500*time.Millisecond)
-	v.SetDefault("backfill_batch", 100)
-	v.SetDefault("max_lag_blocks", 200)
-	v.SetDefault("drain_threshold_wei", oneUSDT.String())
-	v.SetDefault("default_fee_cents", 100)     // $1.00
-	v.SetDefault("house_sweep_min_cents", 100) // $1.00 of excess is worth a transfer
-	v.SetDefault("fee_collector", "")
-	v.SetDefault("funding_multiplier", 1.25)
-	v.SetDefault("gas_price_multiplier", 1.10)
-	v.SetDefault("rebroadcast_after", 2*time.Minute)
-	v.SetDefault("master_poll", 30*time.Second)
-	v.SetDefault("swap_enabled", true)
-	v.SetDefault("swap_router", "") // resolved from the chain the endpoint reports
-	v.SetDefault("swap_wrapped_native", "")
-	v.SetDefault("swap_amount_wei", new(big.Int).Mul(oneUSDT, big.NewInt(10)).String())
+	v.SetDefault("chain.rpc_rate_limit", 20)
+	v.SetDefault("chain.token_address", "") // resolved from the chain the endpoint reports
+	v.SetDefault("chain.start_block", 0)
+	v.SetDefault("chain.poll_interval", 500*time.Millisecond)
+	v.SetDefault("chain.backfill_batch", 100)
+	v.SetDefault("chain.max_lag_blocks", 200)
+	v.SetDefault("money.drain_threshold_wei", oneUSDT.String())
+	v.SetDefault("money.default_fee_cents", 100)     // $1.00
+	v.SetDefault("money.house_sweep_min_cents", 100) // $1.00 of excess is worth a transfer
+	v.SetDefault("money.fee_collector", "")
+	v.SetDefault("gas.funding_multiplier", 1.25)
+	v.SetDefault("gas.price_multiplier", 1.10)
+	v.SetDefault("gas.rebroadcast_after", 2*time.Minute)
+	v.SetDefault("gas.master_poll", 30*time.Second)
+	v.SetDefault("swap.enabled", true)
+	v.SetDefault("swap.router", "") // resolved from the chain the endpoint reports
+	v.SetDefault("swap.wrapped_native", "")
+	v.SetDefault("swap.amount_wei", new(big.Int).Mul(oneUSDT, big.NewInt(10)).String())
 	// A transfer costs well under a thousandth of a BNB, so this floor is a few
 	// hundred transactions of headroom — enough that a top-up has time to land
 	// before anything actually runs dry.
-	v.SetDefault("gas_floor_wei", "50000000000000000") // 0.05
-	v.SetDefault("swap_slippage_bps", 100)             // 1%
-	v.SetDefault("swap_cooldown", time.Hour)
-	v.SetDefault("snapshot_dir", "")
-	v.SetDefault("snapshot_interval", time.Hour)
-	v.SetDefault("snapshot_keep", 24)
+	v.SetDefault("swap.gas_floor_wei", "50000000000000000") // 0.05
+	v.SetDefault("swap.slippage_bps", 100)                  // 1%
+	v.SetDefault("swap.cooldown", time.Hour)
+	v.SetDefault("snapshot.dir", "")
+	v.SetDefault("snapshot.interval", time.Hour)
+	v.SetDefault("snapshot.keep", 24)
+	v.SetDefault("log.level", "info")
+
+	// Nested keys become underscored environment variables, so every setting is
+	// addressable both ways and neither spelling is second class.
+	v.SetEnvPrefix(EnvPrefix)
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
+
+	// AutomaticEnv only consults the environment for keys viper already knows,
+	// and master_secret has no default precisely because it must never have one.
+	// Binding it explicitly is what makes BSC_MASTER_SECRET reachable.
+	_ = v.BindEnv("master_secret")
 	return v
+}
+
+// ReadFile overlays a YAML configuration onto v. A missing file at the default
+// path is not an error — every setting has a default and the environment can
+// carry the rest — but a file the operator named explicitly and that cannot be
+// read is, because silently ignoring it would run the service on settings
+// nobody chose.
+func ReadFile(v *viper.Viper, path string, explicit bool) error {
+	if path == "" {
+		return nil
+	}
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil {
+		if !explicit && errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read config %s: %w", path, err)
+	}
+	return nil
 }
 
 // Load reads the configuration from the environment alone.
@@ -130,30 +198,31 @@ func Parse(v *viper.Viper) (Config, error) {
 	cfg := Config{
 		DBPath:            v.GetString("db_path"),
 		HTTPAddr:          v.GetString("http_addr"),
+		UIEnabled:         v.GetBool("ui_enabled"),
 		MasterSecret:      v.GetString("master_secret"),
-		RPCURL:            v.GetString("rpc_url"),
-		RPCRateLimit:      v.GetInt("rpc_rate_limit"),
-		StartBlock:        v.GetUint64("start_block"),
-		PollInterval:      v.GetDuration("poll_interval"),
-		BackfillBatch:     v.GetInt("backfill_batch"),
-		MaxLagBlocks:      v.GetUint64("max_lag_blocks"),
-		FeeCollector:      v.GetString("fee_collector"),
-		FundingMultiplier: v.GetFloat64("funding_multiplier"),
-		GasMultiplier:     v.GetFloat64("gas_price_multiplier"),
-		RebroadcastAfter:  v.GetDuration("rebroadcast_after"),
-		MasterPoll:        v.GetDuration("master_poll"),
-		SwapEnabled:       v.GetBool("swap_enabled"),
-		SwapRouter:        v.GetString("swap_router"),
-		SwapNative:        v.GetString("swap_wrapped_native"),
-		SwapSlippage:      uint32(v.GetUint64("swap_slippage_bps")),
-		SwapCooldown:      v.GetDuration("swap_cooldown"),
-		SnapshotDir:       v.GetString("snapshot_dir"),
-		SnapshotInterval:  v.GetDuration("snapshot_interval"),
-		SnapshotKeep:      v.GetInt("snapshot_keep"),
+		RPCURL:            v.GetString("chain.rpc_url"),
+		RPCRateLimit:      v.GetInt("chain.rpc_rate_limit"),
+		StartBlock:        v.GetUint64("chain.start_block"),
+		PollInterval:      v.GetDuration("chain.poll_interval"),
+		BackfillBatch:     v.GetInt("chain.backfill_batch"),
+		MaxLagBlocks:      v.GetUint64("chain.max_lag_blocks"),
+		FeeCollector:      v.GetString("money.fee_collector"),
+		FundingMultiplier: v.GetFloat64("gas.funding_multiplier"),
+		GasMultiplier:     v.GetFloat64("gas.price_multiplier"),
+		RebroadcastAfter:  v.GetDuration("gas.rebroadcast_after"),
+		MasterPoll:        v.GetDuration("gas.master_poll"),
+		SwapEnabled:       v.GetBool("swap.enabled"),
+		SwapRouter:        v.GetString("swap.router"),
+		SwapNative:        v.GetString("swap.wrapped_native"),
+		SwapSlippage:      uint32(v.GetUint64("swap.slippage_bps")),
+		SwapCooldown:      v.GetDuration("swap.cooldown"),
+		SnapshotDir:       v.GetString("snapshot.dir"),
+		SnapshotInterval:  v.GetDuration("snapshot.interval"),
+		SnapshotKeep:      v.GetInt("snapshot.keep"),
 	}
 
 	if cfg.MasterSecret == "" {
-		return Config{}, errors.New("MASTER_SECRET is required")
+		return Config{}, fmt.Errorf("master_secret is required: set %s in the environment (never in the config file)", EnvVar("master_secret"))
 	}
 
 	// The endpoint is the one chain input, so it is the one with a literal
@@ -166,55 +235,55 @@ func Parse(v *viper.Viper) (Config, error) {
 	// Validated here, resolved in ResolveChain: a bad address should be refused
 	// before anything dials, but a *missing* one cannot be filled in until the
 	// chain has identified itself.
-	if token := v.GetString("token_address"); token != "" {
+	if token := v.GetString("chain.token_address"); token != "" {
 		if !common.IsHexAddress(token) {
-			return Config{}, fmt.Errorf("TOKEN_ADDRESS %q is not a hex address", token)
+			return Config{}, fmt.Errorf("chain.token_address (%s) %q is not a hex address", EnvVar("chain.token_address"), token)
 		}
 		cfg.Token = common.HexToAddress(token)
 	}
 
 	if cfg.FeeCollector != "" && !common.IsHexAddress(cfg.FeeCollector) {
-		return Config{}, fmt.Errorf("FEE_COLLECTOR %q is not a hex address", cfg.FeeCollector)
+		return Config{}, fmt.Errorf("money.fee_collector (%s) %q is not a hex address", EnvVar("money.fee_collector"), cfg.FeeCollector)
 	}
 
 	var err error
-	if cfg.DrainThreshold, err = wei(v, "drain_threshold_wei"); err != nil {
+	if cfg.DrainThreshold, err = wei(v, "money.drain_threshold_wei"); err != nil {
 		return Config{}, err
 	}
-	if cfg.SwapAmount, err = wei(v, "swap_amount_wei"); err != nil {
+	if cfg.SwapAmount, err = wei(v, "swap.amount_wei"); err != nil {
 		return Config{}, err
 	}
-	if cfg.GasFloor, err = wei(v, "gas_floor_wei"); err != nil {
+	if cfg.GasFloor, err = wei(v, "swap.gas_floor_wei"); err != nil {
 		return Config{}, err
 	}
 	if cfg.SwapEnabled {
 		// A router the operator did not name is resolved from the chain in
 		// ResolveChain; only an explicit one can be checked this early.
 		if cfg.SwapRouter != "" && !common.IsHexAddress(cfg.SwapRouter) {
-			return Config{}, fmt.Errorf("SWAP_ROUTER %q is not a hex address", cfg.SwapRouter)
+			return Config{}, fmt.Errorf("swap.router (%s) %q is not a hex address", EnvVar("swap.router"), cfg.SwapRouter)
 		}
 		// Normally unset: the router reports its own wrapped token, which cannot
 		// then disagree with it. Only validated when overridden.
 		if cfg.SwapNative != "" && !common.IsHexAddress(cfg.SwapNative) {
-			return Config{}, fmt.Errorf("SWAP_WRAPPED_NATIVE %q is not a hex address", cfg.SwapNative)
+			return Config{}, fmt.Errorf("swap.wrapped_native (%s) %q is not a hex address", EnvVar("swap.wrapped_native"), cfg.SwapNative)
 		}
 		if cfg.SwapAmount.Sign() <= 0 || cfg.GasFloor.Sign() <= 0 {
-			return Config{}, errors.New("SWAP_AMOUNT_WEI and GAS_FLOOR_WEI must be positive when swapping is enabled")
+			return Config{}, errors.New("swap.amount_wei and swap.gas_floor_wei must be positive when swapping is enabled")
 		}
 		if cfg.SwapSlippage >= 10_000 {
-			return Config{}, fmt.Errorf("SWAP_SLIPPAGE_BPS %d would accept any price at all", cfg.SwapSlippage)
+			return Config{}, fmt.Errorf("swap.slippage_bps %d would accept any price at all", cfg.SwapSlippage)
 		}
 		if cfg.SwapCooldown <= 0 {
-			return Config{}, errors.New("SWAP_COOLDOWN must be positive: it is what bounds a losing swap loop")
+			return Config{}, errors.New("swap.cooldown must be positive: it is what bounds a losing swap loop")
 		}
 	}
-	cfg.DefaultFee = money.Cents(v.GetInt64("default_fee_cents"))
-	cfg.HouseSweepMin = money.Cents(v.GetInt64("house_sweep_min_cents"))
+	cfg.DefaultFee = money.Cents(v.GetInt64("money.default_fee_cents"))
+	cfg.HouseSweepMin = money.Cents(v.GetInt64("money.house_sweep_min_cents"))
 	if cfg.DefaultFee < 0 {
-		return Config{}, errors.New("DEFAULT_FEE_CENTS must not be negative")
+		return Config{}, errors.New("money.default_fee_cents must not be negative")
 	}
 	if cfg.HouseSweepMin < 0 {
-		return Config{}, errors.New("HOUSE_SWEEP_MIN_CENTS must not be negative")
+		return Config{}, errors.New("money.house_sweep_min_cents must not be negative")
 	}
 
 	// The rate limit has to clear the block rate by a wide margin or the
@@ -222,14 +291,14 @@ func Parse(v *viper.Viper) (Config, error) {
 	// keep up beats discovering it during an incident.
 	if cfg.RPCRateLimit < 5 {
 		return Config{}, fmt.Errorf(
-			"RPC_RATE_LIMIT %d is below 5/s; at ~2.2 blocks/s the watcher could not outrun the chain",
+			"chain.rpc_rate_limit %d is below 5/s; at ~2.2 blocks/s the watcher could not outrun the chain",
 			cfg.RPCRateLimit)
 	}
 	if cfg.BackfillBatch <= 0 {
-		return Config{}, fmt.Errorf("BACKFILL_BATCH must be positive (got %d)", cfg.BackfillBatch)
+		return Config{}, fmt.Errorf("chain.backfill_batch must be positive (got %d)", cfg.BackfillBatch)
 	}
 	if cfg.FundingMultiplier < 1 || cfg.GasMultiplier < 1 {
-		return Config{}, errors.New("FUNDING_MULTIPLIER and GAS_PRICE_MULTIPLIER must be at least 1.0")
+		return Config{}, errors.New("gas.funding_multiplier and gas.price_multiplier must be at least 1.0")
 	}
 	return cfg, nil
 }
@@ -247,7 +316,7 @@ func wei(v *viper.Viper, key string) (*big.Int, error) {
 // ResolveChain fills in everything that depends on which chain we are actually
 // talking to, using the id the endpoint reported after connecting.
 //
-// This is a separate step from Load because Load does no I/O — it must be
+// This is a separate step from Parse because Parse does no I/O — it must be
 // testable and it must fail on a bad value before anything dials — while the
 // chain id is, by design, something only the chain can tell us. The alternative
 // was a CHAIN_ID setting, and a setting that can disagree with the endpoint is
@@ -255,7 +324,7 @@ func wei(v *viper.Viper, key string) (*big.Int, error) {
 // mismatch leaves a service that reads blocks perfectly and cannot send
 // anything, with nothing in the logs to explain it.
 //
-// An explicit TOKEN_ADDRESS or SWAP_ROUTER still wins; this only supplies what
+// An explicit chain.token_address or swap.router still wins; this only supplies what
 // the operator left out.
 func (c *Config) ResolveChain(chainID uint64) error {
 	if chainID == 0 {
@@ -274,8 +343,8 @@ func (c *Config) ResolveChain(chainID uint64) error {
 			c.Token = usdt.TestnetAddress
 		default:
 			return fmt.Errorf(
-				"TOKEN_ADDRESS must be set: %s is chain %d, which has no default token",
-				c.RPCURL, chainID)
+				"chain.token_address (%s) must be set: %s is chain %d, which has no default token",
+				EnvVar("chain.token_address"), c.RPCURL, chainID)
 		}
 	}
 
@@ -292,8 +361,8 @@ func (c *Config) ResolveChain(chainID uint64) error {
 		c.SwapRouter = swap.PancakeV2Testnet.Hex()
 	default:
 		return fmt.Errorf(
-			"no default swap router for chain %d: set SWAP_ROUTER, or SWAP_ENABLED=false to run without gas top-ups",
-			chainID)
+			"no default swap router for chain %d: set swap.router (%s), or swap.enabled=false (%s=false) to run without gas top-ups",
+			chainID, EnvVar("swap.router"), EnvVar("swap.enabled"))
 	}
 	return nil
 }

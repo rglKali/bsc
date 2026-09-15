@@ -8,7 +8,7 @@ Everything here is flat; each file is copied somewhere on the box:
 | File | Goes to |
 | --- | --- |
 | `bsc.service` | `/etc/systemd/system/` |
-| `bsc.env.example` | copy to `/etc/bsc/bsc.env` and fill in |
+| `config.yaml` | copy to `/etc/bsc/config.yaml` — every setting, documented |
 | `prometheus.yml` | included by the host's Prometheus |
 | `dashboard.json` | imported into Grafana |
 
@@ -30,13 +30,32 @@ sudo cp deploy/bsc.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
 
-Start from `deploy/bsc.env.example` — copy it to `/etc/bsc/bsc.env` and fill in
-at least `MASTER_SECRET` and `RPC_URL`. Then lock it down; it holds the key to
-every managed wallet:
+Configuration is two files, and the split is deliberate. `deploy/config.yaml`
+holds every operational setting with its default and what it does — copy it to
+`/etc/bsc/config.yaml` and edit what you need. The master secret goes somewhere
+else entirely, because a file containing it has to be unreadable and
+unversionable and the rest of your configuration should not have to be (§30).
 
 ```sh
+sudo cp deploy/config.yaml /etc/bsc/
+```
+
+It needs no special permissions — root-owned and world-readable is correct, and
+being able to leave it that way is the point of keeping the secret out of it.
+
+Then the secret. The unit loads it from **`/etc/bsc/bsc.env`**, which holds that
+one value and nothing else. There is no example of it in the repo — create it on
+the box from wherever you keep secrets:
+
+```sh
+printf 'BSC_MASTER_SECRET=%s\n' "$(your-secrets-manager get bsc/master)" \
+  | sudo tee /etc/bsc/bsc.env > /dev/null
 sudo chown root:bsc /etc/bsc/bsc.env && sudo chmod 640 /etc/bsc/bsc.env
 ```
+
+Anything in `config.yaml` can also be overridden there as `BSC_*`, which is
+useful during an incident. It is not a place to keep configuration: nothing in
+it is reviewable.
 
 ## 3. Start
 
@@ -50,42 +69,40 @@ every activation, drain and payout, and nothing tops it up automatically.
 
 ## Configuration
 
-Everything comes from the environment. A handful of settings also have flags
-(`bsc --help`), which override the environment for a one-off run.
+Two files. `config.yaml` is every operational setting, each one documented with
+its default; `bsc.env` is the master secret and nothing else. The split exists
+so that the secret's secrecy does not have to spread to the other twenty-five
+settings, which are then safe to review, diff and keep in version control (§30).
 
-| Variable | Default | Notes |
-| --- | --- | --- |
-| `MASTER_SECRET` | — | **Required.** 32-byte hex. Signs everything; holds an unlimited allowance on every derived wallet. Secrets manager only. |
-| `DB_PATH` | `bsc.db` | The only datastore. Put it under `/var/lib/bsc`. |
-| `HTTP_ADDR` | `127.0.0.1:8800` | The only listener. There is no authentication — keep it on loopback. |
-| `RPC_URL` | mainnet public node | **The one chain setting.** Everything else chain-shaped follows what this endpoint reports for `eth_chainId`: the token, the swap router, and the id every signature is bound to. Point it at a testnet node and the whole service follows. |
-| `RPC_RATE_LIMIT` | `20` | Requests per second, shared by everything. **Must clear the block rate with room to spare** — see below. Refused below 5. |
-| `TOKEN_ADDRESS` | per chain | Defaults to USDT for the chain the endpoint reports. Defaulting to the mainnet address everywhere would be quietly wrong elsewhere: the contract would not exist and the watcher would simply see nothing. An endpoint on a chain with no default must name this. |
-| `START_BLOCK` | `0` | Only used on a fresh database. `0` means *the current finalized head*, never genesis. |
-| `POLL_INTERVAL` | `500ms` | Head poll once caught up; no sleep at all while behind. |
-| `BACKFILL_BATCH` | `100` | Blocks per write transaction while catching up. |
-| `MAX_LAG_BLOCKS` | `200` | Withdrawals are refused past this (~90s). Reads keep working. |
-| `DRAIN_THRESHOLD_WEI` | `1e18` | Don't spend gas moving less than this, applied to a deposit wallet's total. It has no effect on what an app is credited — anything worth a whole cent is recorded and shows as `pending` until the drain runs. |
-| `DEFAULT_FEE_CENTS` | `100` | A newly registered app's fee ($1.00), which it may then change itself. |
-| `HOUSE_SWEEP_MIN_CENTS` | `100` | How much a wallet must hold *over* its app's ledger — fees, sub-cent dust, stray transfers — before one transfer is worth collecting it. `0` disables sweeping; the money is still yours and simply accumulates. |
-| `FEE_COLLECTOR` | the master | Where the house's money lands. |
-| `FUNDING_MULTIPLIER` | `1.25` | Headroom over the estimated activation cost. Keep modest: unused gas is refunded, so the surplus stays as dust in each deposit wallet. |
-| `GAS_PRICE_MULTIPLIER` | `1.10` | Bump over the suggested price. These two are the *only* gas knobs; amounts are estimated. |
-| `REBROADCAST_AFTER` | `2m` | How long before an unconfirmed transaction is re-sent (the same signed bytes). |
-| `MASTER_POLL` | `30s` | How often the master BNB gauge refreshes. |
-| `SWAP_ENABLED` | `true` | Trade collected fees back into gas when the master runs low. |
-| `SWAP_ROUTER` | per chain | A Uniswap-V2-interface router. Defaults to the verified PancakeSwap V2 deployment for the chain the endpoint reports; an unknown chain must name one or set `SWAP_ENABLED=false`. |
-| `SWAP_WRAPPED_NATIVE` | asked of the router | Override only, for a fork that names the accessor something other than `WETH()`. |
-| `SWAP_AMOUNT_WEI` | `10e18` | Tokens traded per top-up. |
-| `GAS_FLOOR_WEI` | `0.05` BNB | Native balance below which a top-up is due. Well above the cost of the swap itself — below that, the master could not afford to rescue itself. |
-| `SWAP_SLIPPAGE_BPS` | `100` (1%) | Bound computed from the router's own quote. |
-| `SWAP_COOLDOWN` | `1h` | Minimum gap between attempts. This is what stops a swap that does not lift the balance from trading away every fee. |
-| `SNAPSHOT_DIR` | — | Unset disables self-backup. Set it. |
-| `SNAPSHOT_INTERVAL` | `1h` | |
-| `SNAPSHOT_KEEP` | `24` | Older snapshots are pruned. |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. Logs are JSON. |
+**`deploy/config.yaml` is the reference.** It lists every setting that exists,
+so there is no second table here to drift out of step with it — and
+`TestShippedConfigMatchesTheDefaults` parses that file on every run and fails if
+any value in it stops matching the binary's default.
 
-### On `RPC_RATE_LIMIT`
+Every setting is addressable both ways. An environment variable is the key path
+in upper case with `BSC_` in front:
+
+| In the file | In the environment |
+| --- | --- |
+| `db_path` | `BSC_DB_PATH` |
+| `chain.rpc_rate_limit` | `BSC_CHAIN_RPC_RATE_LIMIT` |
+| `swap.amount_wei` | `BSC_SWAP_AMOUNT_WEI` |
+| `money.house_sweep_min_cents` | `BSC_MONEY_HOUSE_SWEEP_MIN_CENTS` |
+
+Precedence is **flag, then environment, then file, then default** — so you can
+override one value during an incident without editing a reviewed file, and the
+edit you did not make is not one you have to remember to revert.
+
+A handful of settings also have flags (`bsc --help`): `--db`, `--http-addr`,
+`--rpc-url`, `--rpc-rate-limit`, `--snapshot-dir`, `--ui`, `--log-level`, and
+`--config` for the file itself.
+
+> **`BSC_MASTER_SECRET` is required, and is environment-only by policy rather
+> than by mechanism.** 32-byte hex. It signs everything and holds an unlimited
+> allowance on every derived wallet, so whoever has it can move every app's
+> funds. Secrets manager only — never in `config.yaml`, never in git.
+
+### On `chain.rpc_rate_limit`
 
 At ~0.45s block times the watcher needs about 2.2 requests per second just to
 keep pace, and it must *outrun* the chain to recover from any downtime. At 20/s
@@ -108,8 +125,8 @@ reverse proxy.
 
 ## Backups
 
-With `SNAPSHOT_DIR` set the service writes a consistent copy of the whole
-database on a timer, and prunes to `SNAPSHOT_KEEP`. **Ship those off the
+With `snapshot.dir` set the service writes a consistent copy of the whole
+database on a timer, and prunes to `snapshot.keep`. **Ship those off the
 machine.** Losing the file loses the wallet UUIDs, and without them every address
 ever derived is unrecoverable even though you still hold the master secret.
 
@@ -143,7 +160,7 @@ The top row is what an operator actually watches, and
   the same panel plots `bsc_master_usdt_wei` beside it. Native falling while
   tokens sit at zero is the combination that needs a human.
 - **Blocks behind** — sustained growth means the RPC cannot keep up, and
-  withdrawals start being refused once it passes `MAX_LAG_BLOCKS`.
+  withdrawals start being refused once it passes `chain.max_lag_blocks`.
 - **In-flight age** — signing is sequential, so this growing means one
   transaction is wedged and everything is queued behind it.
 

@@ -16,6 +16,7 @@ import (
 	"syscall"
 
 	"bsc/app"
+	"bsc/buildinfo"
 	"bsc/config"
 	"bsc/store"
 
@@ -23,11 +24,7 @@ import (
 	"github.com/spf13/viper"
 )
 
-// version is stamped at build time; see the Taskfile.
-var version = "dev"
-
-// SetVersion lets main pass in the build-time stamp.
-func SetVersion(v string) { version = v }
+// (the version now lives in bsc/buildinfo, stamped at link time)
 
 // Execute runs the command line, returning the process exit code.
 func Execute() int {
@@ -44,23 +41,38 @@ func Execute() int {
 // Exported so tests can drive it with their own output and arguments.
 func Root(code *int) *cobra.Command {
 	v := config.New()
+	// Set by the --config flag, read in PersistentPreRunE before any command
+	// looks at a setting. An empty path means the default location, which is
+	// allowed to be absent; a path the operator named must exist.
+	configPath := ""
 
 	cmd := &cobra.Command{
 		Use:   "bsc",
 		Short: "USDT chain gateway",
 		Long: "bsc watches finalized BSC blocks, derives and drains deposit wallets,\n" +
 			"and pays out withdrawals for the apps registered with it.\n\n" +
-			"Run with no subcommand to start the service. Configuration comes from the\n" +
-			"environment (MASTER_SECRET is required); flags below override it.",
+			"Run with no subcommand to start the service. Settings come from the config\n" +
+			"file (see deploy/config.yaml) and BSC_* environment variables; flags below\n" +
+			"override both. BSC_MASTER_SECRET is required and belongs only in the\n" +
+			"environment — never in the file.",
 		SilenceUsage:  true, // a runtime failure is not a usage error
 		SilenceErrors: false,
 		Args:          cobra.NoArgs,
+		// Runs for every subcommand, so `inspect --rpc` reads the same file the
+		// service does rather than a second, divergent configuration.
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			path, explicit := configPath, configPath != ""
+			if !explicit {
+				path = config.DefaultPath
+			}
+			return config.ReadFile(v, path, explicit)
+		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := config.Parse(v)
 			if err != nil {
 				return fmt.Errorf("config: %w", err)
 			}
-			setupLogging(v.GetString("log_level"))
+			setupLogging(v.GetString("log.level"))
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
@@ -71,21 +83,25 @@ func Root(code *int) *cobra.Command {
 	// Only the settings worth overriding by hand get flags; everything else
 	// stays environment-only rather than growing a flag per variable.
 	flags := cmd.Flags()
-	flags.String("db", "", "path to the database file (DB_PATH)")
-	flags.String("http-addr", "", "listen address (HTTP_ADDR)")
-	flags.String("rpc-url", "", "BSC RPC endpoint (RPC_URL)")
-	flags.Int("rpc-rate-limit", 0, "shared RPC budget in requests per second (RPC_RATE_LIMIT)")
-	flags.String("snapshot-dir", "", "directory for periodic backups; empty disables them (SNAPSHOT_DIR)")
-	cmd.PersistentFlags().String("log-level", "", "debug, info, warn or error (LOG_LEVEL)")
+	flags.String("db", "", "path to the database file (db_path)")
+	flags.String("http-addr", "", "listen address (http_addr)")
+	flags.String("rpc-url", "", "BSC RPC endpoint (chain.rpc_url)")
+	flags.Int("rpc-rate-limit", 0, "shared RPC budget in requests per second (chain.rpc_rate_limit)")
+	flags.String("snapshot-dir", "", "directory for periodic backups; empty disables them (snapshot.dir)")
+	flags.Bool("ui", false, "mount the dashboard at /ui/ — no authentication (ui_enabled)")
+	cmd.PersistentFlags().StringVar(&configPath, "config", "",
+		"path to the YAML configuration (default "+config.DefaultPath+", which may be absent)")
+	cmd.PersistentFlags().String("log-level", "", "debug, info, warn or error (log.level)")
 
 	bind(v, cmd, map[string]string{
 		"db":             "db_path",
 		"http-addr":      "http_addr",
-		"rpc-url":        "rpc_url",
-		"rpc-rate-limit": "rpc_rate_limit",
-		"snapshot-dir":   "snapshot_dir",
+		"rpc-url":        "chain.rpc_url",
+		"rpc-rate-limit": "chain.rpc_rate_limit",
+		"snapshot-dir":   "snapshot.dir",
+		"ui":             "ui_enabled",
 	})
-	_ = v.BindPFlag("log_level", cmd.PersistentFlags().Lookup("log-level"))
+	_ = v.BindPFlag("log.level", cmd.PersistentFlags().Lookup("log-level"))
 
 	cmd.AddCommand(inspectCmd(v, code), versionCmd())
 	return cmd
@@ -117,7 +133,7 @@ func inspectCmd(v *viper.Viper, code *int) *cobra.Command {
 			"Pass --rpc to compare every balance against the chain.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			setupLogging(v.GetString("log_level"))
+			setupLogging(v.GetString("log.level"))
 
 			var (
 				rep store.Report
@@ -150,7 +166,7 @@ func versionCmd() *cobra.Command {
 		Short: "Print the build version",
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Fprintln(cmd.OutOrStdout(), "bsc", version)
+			fmt.Fprintln(cmd.OutOrStdout(), "bsc", buildinfo.Version)
 		},
 	}
 }

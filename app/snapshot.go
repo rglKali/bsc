@@ -31,7 +31,7 @@ const snapshotPrefix = "bsc-"
 // whatever ships these off the machine, not here.
 func runSnapshots(ctx context.Context, st *store.Store, cfg config.Config, log *slog.Logger) error {
 	if cfg.SnapshotDir == "" {
-		log.Info("snapshots disabled", "reason", "SNAPSHOT_DIR is unset")
+		log.Info("snapshots disabled", "reason", "snapshot.dir is unset")
 		return nil
 	}
 	if err := os.MkdirAll(cfg.SnapshotDir, 0o700); err != nil {

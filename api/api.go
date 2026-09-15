@@ -52,6 +52,19 @@ type Options struct {
 
 	// Notify nudges the sender after work is created. Optional.
 	Notify func()
+
+	// UI mounts the local dashboard at /ui/ along with its read model. Off
+	// unless the operator asked for it: this listener has no authentication
+	// (§29).
+	UI bool
+
+	// FeeCollector is where the house's money lands, shown on the dashboard.
+	// Zero means the master pays and collects, which is also the default.
+	FeeCollector common.Address
+
+	// Health supplies what /healthz cannot derive for itself. The zero value
+	// simply makes the gas check a no-op.
+	Health Health
 }
 
 // Server holds the handlers' dependencies.
@@ -106,10 +119,14 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /v1/apps/{slug}/deposits", s.handle(s.listDeposits))
 
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
+	// The dashboard and its read model, when the operator asked for them. They
+	// are mounted last and live outside /v1 entirely, so the app contract is
+	// unchanged whether this is on or off (§29).
+	if s.opts.UI {
+		s.mountUI(mux)
+	}
+
+	mux.HandleFunc("GET /healthz", s.handle(s.getHealth))
 }
 
 // --- errors ---

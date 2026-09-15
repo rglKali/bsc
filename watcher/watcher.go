@@ -89,10 +89,26 @@ type Watcher struct {
 	// API: balances are only current once we reach the head, so accepting a
 	// withdrawal while far behind would reserve against a stale balance.
 	behind atomic.Uint64
+
+	// masterGas is the master's last observed native balance, published for
+	// /healthz. It is the one quantity in the service that cannot be derived
+	// from logs — a manual gas top-up is a plain value transfer and emits
+	// nothing — so this poll is the only moment anything knows it.
+	masterGas atomic.Pointer[big.Int]
 }
 
 // Behind reports how many finalized blocks remain unprocessed.
 func (w *Watcher) Behind() uint64 { return w.behind.Load() }
+
+// MasterGas reports the master's native balance as of the last poll, or nil if
+// it has not been observed yet — which is the honest answer during the first
+// few seconds and after every failed poll, and is not the same as zero.
+func (w *Watcher) MasterGas() *big.Int {
+	if v := w.masterGas.Load(); v != nil {
+		return new(big.Int).Set(v)
+	}
+	return nil
+}
 
 // New builds a watcher. addrs is shared with whatever creates wallets, so newly
 // derived deposit addresses are matched from the next block onwards.
@@ -312,6 +328,7 @@ func (w *Watcher) pollMaster(ctx context.Context) {
 	}
 	f, _ := new(big.Float).SetInt(bal).Float64()
 	metrics.MasterBNB.Set(f)
+	w.masterGas.Store(new(big.Int).Set(bal))
 
 	if w.opts.MasterWallet == uuid.Nil {
 		return

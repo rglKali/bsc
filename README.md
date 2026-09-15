@@ -37,11 +37,11 @@ time.
 Needs nothing but a BSC RPC endpoint — no database server, no message broker.
 
 ```sh
-MASTER_SECRET=<32-byte-hex> task run
+BSC_MASTER_SECRET=<32-byte-hex> task run
 curl -X PUT localhost:8800/v1/apps/demo
 ```
 
-`MASTER_SECRET` is the whole security model: it signs everything and holds an
+`BSC_MASTER_SECRET` is the whole security model: it signs everything and holds an
 unlimited allowance on every wallet the service derives. Keep it in a secrets
 manager, never in the database and never on disk.
 
@@ -53,6 +53,7 @@ GOOS=linux GOARCH=amd64 task binary  # cross-compile for a VPS
 task unit                            # offline: no chain, no network, no server
 task cover                           # coverage across the service packages
 task inspect -- snapshot.db          # audit a database file
+task sandbox                         # testnet + the dashboard at /ui/
 ```
 
 Every test in `task unit` runs offline — the store is a temp file, the chain is a
@@ -98,6 +99,8 @@ engine/   transactional glue: advance a flow, settle it, evaluate the rules
 watcher/  follows finalized blocks; one write transaction per block
 sender/   the only code that touches private keys
 api/      the HTTP surface · metrics/ the bsc_* namespace
+ui/       the optional dashboard, embedded; off unless ui_enabled
+buildinfo/ the version, stamped at link time
 app/      composition · cli/ the command tree · config/ one env config
 
 e2e/      the only tests that spend real funds — build-tagged, skip unless configured

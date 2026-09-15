@@ -5,7 +5,7 @@ import "github.com/ethereum/go-ethereum/common"
 // Known routers implementing the Uniswap-V2 interface this package encodes.
 //
 // These are references, not defaults: swapping stays off until an operator sets
-// SWAP_ROUTER deliberately, because it is the only thing the service does on its
+// swap.router deliberately, because it is the only thing the service does on its
 // own initiative. Verified against BscScan and PancakeSwap's own announcement,
 // September 2026.
 //

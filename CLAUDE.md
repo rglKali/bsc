@@ -63,7 +63,12 @@ that way — a test that needs infrastructure will not get run.
 | `engine/` | transactional glue: advance a flow, settle it, evaluate the work rules |
 | `watcher/` | follows finalized blocks; one write transaction per block |
 | `sender/` | the only code that touches private keys: signs, journals, broadcasts |
+| `swap/` | the router calldata for turning collected fees back into gas |
+| `usdt/` | generated token bindings (`task abi`) |
 | `api/` | the HTTP surface |
+| `metrics/` | the one `bsc_*` namespace, served from the same listener |
+| `buildinfo/` | the version, stamped at link time; no dependencies |
+| `ui/` | the optional dashboard, embedded and off by default (§29) |
 | `config/`, `cli/`, `app/` | configuration, the cobra command tree, composition |
 
 ### Invariants you must not break
@@ -75,7 +80,7 @@ that way — a test that needs infrastructure will not get run.
 - **Signing is strictly sequential.** One transaction in flight at a time, which
   is what keeps a pending-nonce read gapless without a nonce manager.
 - **Nonces come from the chain, never a local counter.** The operator holds
-  `MASTER_SECRET` and signs by hand for gas top-ups; a stored counter would
+  `BSC_MASTER_SECRET` and signs by hand for gas top-ups; a stored counter would
   silently desync the moment they did.
 - **One write transaction per block.** Confirmations, balances, deposits, newly
   started flows and the cursor commit together. This is what makes a block
@@ -185,26 +190,39 @@ see `docs/ARCHITECTURE.md`.
 
 ## Gotchas
 
-- **Never edit `deploy/*.env.example` or any `.env`**, and never write
-  `MASTER_SECRET` anywhere but a secrets manager. It signs everything and holds a
+- **Configuration is two files (§30).** `deploy/config.yaml` is every
+  operational setting, documented, and safe to commit;
+  `BSC_MASTER_SECRET` reaches the process through the environment and nothing
+  else. Never put the secret in the YAML, never commit an example of it, and
+  never write it anywhere but a secrets manager.
+  Keys are grouped and the environment form is the key path upper-cased behind
+  `BSC_` (`swap.amount_wei` → `BSC_SWAP_AMOUNT_WEI`).
+  `TestShippedConfigMatchesTheDefaults` fails if the shipped YAML drifts from
+  the binary's defaults — fix the YAML, don't weaken the test. It signs everything and holds a
   `MaxUint256` allowance on every managed wallet, so whoever has it can move
   every app's funds.
 - `usdt/abi.go` is generated (`task abi`) — regenerate, don't hand-edit.
-- **`MIN_DEPOSIT_WEI` is gone.** `DRAIN_THRESHOLD_WEI` replaced it and means
+- **`ui_enabled` is off by default and that is a security boundary**, not a
+  preference: the listener has no authentication, so the dashboard hands every
+  app's money to anyone who can reach the port — strictly worse than one app's
+  slug. Its `/ui/state` endpoint is the operator view and deliberately carries
+  everything §27 keeps off the app contract; it lives outside `/v1` so both stay
+  true, and `api/contract_test.go` walks only the app surface.
+- **`MIN_DEPOSIT_WEI` is gone.** `money.drain_threshold_wei` replaced it and means
   something narrower: don't spend gas on a small move. It must never decide
   whether a user is credited — that threshold is one cent, intrinsic, and a
   configurable one could silently confiscate most of a dollar (§23).
-- `RPC_RATE_LIMIT` must clear the block rate by a wide margin. At ~0.45s blocks
+- `chain.rpc_rate_limit` must clear the block rate by a wide margin. At ~0.45s blocks
   the watcher needs ~2.2 req/s just to keep up, and a limit that cannot outrun
   the chain leaves it permanently unable to catch up. Config refuses below 5.
-- **There is no `CHAIN_ID`.** `RPC_URL` is the one chain input; `eth_chainId`
+- **There is no `CHAIN_ID`.** `chain.rpc_url` is the one chain input; `eth_chainId`
   after connecting decides the token, the router and the signer, and the answer
   is recorded in `data/` so a database cannot be opened against another chain
-  (§26). `config.Load` stays I/O-free — `Config.ResolveChain` is the step that
-  needs the dial.
-- `START_BLOCK=0` means "the current finalized head", not genesis.
+  (§26). `config.Parse` stays I/O-free — the YAML file is read while viper is
+  built, and `Config.ResolveChain` is the step that needs the dial.
+- ``chain.start_block: 0`` means "the current finalized head", not genesis.
 - The watcher must never be starved: it is what observes finality, so anything
   that blocks it stops every in-flight transfer too. Shutdown is decided by
   `ctx.Err()`, never by inspecting an error for `context.DeadlineExceeded`.
-- Withdrawals are refused (503) while the watcher is more than `MAX_LAG_BLOCKS`
+- Withdrawals are refused (503) while the watcher is more than `chain.max_lag_blocks`
   behind — reserving against a stale balance could overdraw an app.

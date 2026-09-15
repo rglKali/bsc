@@ -27,7 +27,7 @@ watcher to the sender so it need not poll.
 | --- | --- | --- |
 | watcher | finalized head → block receipts → match → **one write transaction** per block | poll interval |
 | sender | claims the work a flow's state owes: signs, journals, broadcasts | a nudge, or a tick |
-| api | the HTTP surface plus `/metrics` and `/healthz` | requests |
+| api | the HTTP surface plus `/metrics`, `/healthz` and — when enabled — `/ui/` | requests |
 | snapshotter | periodic consistent backups | interval |
 
 ## The store is the design
@@ -96,9 +96,9 @@ Rather than "a deposit creates a drain job", the service states what should exis
 and converges on it. The rules are evaluated inside the block transaction, right
 after any flow terminates, and once at startup:
 
-> a **deposit** wallet with `balance ≥ DRAIN_THRESHOLD_WEI`, no live flow, and past its retry deadline is owed a **drain**
+> a **deposit** wallet with `balance ≥ money.drain_threshold_wei`, no live flow, and past its retry deadline is owed a **drain**
 > an app with a pending withdrawal, an idle top-level, and past its retry deadline is owed a **withdrawal**
-> an app whose wallet holds more than its ledger, by at least `HOUSE_SWEEP_MIN_CENTS`, is owed a **house sweep**
+> an app whose wallet holds more than its ledger, by at least `money.house_sweep_min_cents`, is owed a **house sweep**
 
 Two deposits in one block are credited before the check runs, so the wallet is
 evaluated once with the summed balance and exactly one drain starts. A deposit
@@ -226,6 +226,9 @@ Add an entry rather than silently changing a documented decision.
     operator's read surface. Write-side operator actions did not survive
     scrutiny: master BNB is a gauge, retrying a genuinely failed transfer cannot
     succeed, and pausing a first-party app is something the app can do itself.
+    *(The "no UI" half is superseded by §29: there is an optional dashboard now,
+    off by default. The "no admin API" half stands — it adds no operator write
+    the app API did not already have.)*
 14. **No reconciler.** Everything on the USDT side is log-derivable. The one
     exception — native BNB arriving at the master — is a gauge. Correctness is
     checked at the point of spending and by `bsc inspect` on demand.
@@ -308,7 +311,7 @@ Add an entry rather than silently changing a documented decision.
     Transfers worth less than a cent get **no record at all**. `MIN_DEPOSIT_WEI`
     is gone: a threshold that decided whether a user was credited was a threshold
     that could silently confiscate most of a dollar. What replaces it,
-    `DRAIN_THRESHOLD_WEI`, decides only whether moving the money is worth the
+    `money.drain_threshold_wei`, decides only whether moving the money is worth the
     gas — the app is credited either way, and sees the difference as `pending`.
 24. **A withdrawal is one transfer again, and the fee is collected by not paying
     it.** The fee leaves the app's ledger with the payout but never moves on its
@@ -325,7 +328,7 @@ Add an entry rather than silently changing a documented decision.
 
     "Everything" is the top-level wallet's excess, which is narrower than it
     sounds: the sweep is scoped to `KindTopLevel` and the drain to `KindDeposit`
-    above `DRAIN_THRESHOLD_WEI`, so a deposit address that only ever receives
+    above `money.drain_threshold_wei`, so a deposit address that only ever receives
     sub-threshold amounts holds them indefinitely — its dust never reaches a
     wallet the sweep looks at. Later deposits push it over and carry the old dust
     along, so this only strands anything on an address that is never used again.
@@ -350,17 +353,17 @@ Add an entry rather than silently changing a documented decision.
 26. **The endpoint says which chain this is; `CHAIN_ID` is gone.** It used to be
     the setting everything else followed — the endpoint, the token and the swap
     router all defaulted from it. Nothing checked it against the endpoint, and
-    the default was mainnet, so pointing `RPC_URL` at testnet and forgetting it
+    the default was mainnet, so pointing `chain.rpc_url` at testnet and forgetting it
     produced a service that synced blocks, recorded deposits correctly, and had
     every single transaction rejected: the signer binds each one to the
     configured id (EIP-155), so the node refuses them all. Reads work, writes
     fail, and nothing in the logs says why.
 
-    Now `RPC_URL` is the one chain input. `eth_chainId` after connecting decides
+    Now `chain.rpc_url` is the one chain input. `eth_chainId` after connecting decides
     the token, the router and the signer, so there is no second value left to
-    disagree. `Config.Load` still does no I/O and still refuses a malformed
+    disagree. `config.Parse` still does no I/O and still refuses a malformed
     address before anything dials; `Config.ResolveChain` fills in what only the
-    chain can answer. An explicit `TOKEN_ADDRESS` or `SWAP_ROUTER` still wins,
+    chain can answer. An explicit `chain.token_address` or `swap.router` still wins,
     and an endpoint we have no defaults for is a startup error naming exactly
     what is missing.
 
@@ -441,12 +444,118 @@ Add an entry rather than silently changing a documented decision.
     this design: a token with a transfer blacklist can make one specific
     destination permanently unpayable. The default BSC deployment (Binance-Peg
     BSC-USD) has no such list; mainnet Ethereum Tether does. Since
-    `TOKEN_ADDRESS` is configurable, the posture is to retry and make it visible
+    `chain.token_address` is configurable, the posture is to retry and make it visible
     rather than to guess — `attempts` climbing into double digits is an
     operator's signal, not a retry's, and the remedy today is editing the
     record. A cancel is the obvious follow-up and is deliberately unbuilt
     (`docs/ROADMAP.md`): releasing a reservation for a payout that might still
     land is the one way this design could pay twice.
+
+
+29. **An optional dashboard, off by default.** `ui_enabled: true` mounts a plain
+    HTML/CSS/JS page at `/ui/`, for driving the service by hand in a sandbox and
+    for watching it work in real time. It is embedded in the binary, so there is
+    still one artefact to ship and no build step to keep alive.
+
+    §13 said no UI, and the reasoning there was about *write* actions: nothing an
+    operator needed to do was missing from the app API. That still holds, and the
+    dashboard adds no write of its own — every button on it calls the same
+    `/v1/apps/...` endpoints an integrating service calls, so what you watch work
+    there is exactly what an app gets. What §13 undervalued is reading: `curl`
+    against six endpoints, `/metrics` in Prometheus text, and a flow table that
+    was not exposed at all is a poor way to answer "why has nothing moved for ten
+    minutes".
+
+    So the page has one endpoint of its own, `GET /ui/state`, and it is
+    deliberately everything the app contract refuses to carry (§27): custody in
+    wei beside the ledger in cents, the excess and whether it has gone negative,
+    the block height and lag, and the live flow list with each one's state,
+    attempt and backoff. That is the operator's view, and keeping it at `/ui/`
+    rather than under `/v1` is what lets both contracts be true at once —
+    `api/contract_test.go` walks only the app surface, and
+    `TestDashboardDoesNotChangeTheAppContract` asserts that turning the dashboard
+    on changes not one byte of it.
+
+    **Off by default is the security boundary, not a preference.** This listener
+    has no authentication and never will (§12), so the page is as trusted as the
+    network it is reachable from — and unlike an app's slug, which buys the
+    holder one app, the dashboard hands over every app at once. Enabling it logs
+    a warning saying so. It belongs on a laptop and on a box only the operator
+    can reach; it does not belong anywhere else.
+
+
+30. **A reviewable config file, and one secret in the environment.** Settings
+    were environment-only, which meant `BSC_MASTER_SECRET` and twenty-five
+    operational values shared one file. That file therefore had to be `640
+    root:bsc` and could never be committed — so the thresholds, fee policy and
+    intervals this service moves money on were unreviewable, and "what changed
+    last month" was unanswerable.
+
+    Now `deploy/config.yaml` carries everything operational, documented per
+    setting, and `BSC_MASTER_SECRET` is the one value that reaches the process
+    through the environment. The split is a security boundary in one direction
+    only: the secret must not be in the file, but the file gains nothing from
+    being secret. Keys are grouped — `chain`, `money`, `gas`, `swap`,
+    `snapshot` — and each is addressable either way, the environment form being
+    the key path upper-cased behind `BSC_`. Precedence is flag, environment,
+    file, default, so one value can be overridden during an incident without
+    editing a file someone reviewed.
+
+    The repo ships `deploy/config.yaml` and no environment file at all. On a box
+    the secret lives in `/etc/bsc/bsc.env` (0640 root:bsc), which the unit loads
+    and which holds that one value — but there is nothing to copy it from here,
+    because the only thing such a template could contain is the secret itself.
+
+    Two things were deliberately not done. The `Config` struct stayed flat and
+    `Parse` kept its explicit `v.GetX` calls rather than becoming an
+    `Unmarshal` with `mapstructure` tags: the per-setting validation is the
+    valuable part — "swap.slippage_bps 10000 would accept any price at all"
+    beats a decoder error — and reflection would have cost that while forcing
+    every consumer to learn a nested shape. And `Parse` still does no I/O; the
+    file is read while viper is being built, so the property §26 relies on —
+    that configuration fails on a bad value before anything dials — is unchanged.
+
+    `TestShippedConfigMatchesTheDefaults` parses `deploy/config.yaml` on every
+    test run and fails if any value in it stops matching the binary's default,
+    because a documented surface that has drifted is worse than none: it is the
+    file an operator copies and trusts. It caught a wrong default the first time
+    it ran.
+
+
+31. **A health check that can fail, and a build you can name.** `/healthz` used
+    to answer a static `ok`, which told you the process was running — the one
+    thing a refused connection had already told you. It now reports the three
+    conditions that leave the service answering requests while unable to do its
+    job: a store that will not answer, a sync far enough behind that withdrawals
+    are being refused (§21), and a master that cannot pay for gas.
+
+    That last check is a conjunction on purpose. A master below the gas floor is
+    the *normal* case — the top-up sells collected fees back into gas without
+    being asked, and reporting it would cry wolf on something that fixes itself
+    routinely. It is a finding only when it is low **and** cannot recover: either
+    swapping is off, or it holds less than `swap.amount_wei` to sell. That is the
+    same combination `deploy/README.md` builds the Grafana master panel around,
+    and it is the one an operator must not sleep through.
+
+    The native balance is handed in rather than read, because it is the one
+    quantity in the service that cannot be derived from logs: a manual gas
+    top-up is a plain value transfer and emits nothing (§14). The watcher
+    publishes its last observation, and "not yet observed" stays distinct from
+    zero so a fresh start is silent rather than degraded.
+
+    `/healthz` is for monitoring, never for restarting. Nothing it reports is
+    fixed by starting the process again, and a restart mid-sync makes the lag
+    worse.
+
+    Alongside it, `bsc/buildinfo` holds the version, stamped at link time. It
+    previously travelled main → `cli.SetVersion` → `app.Version` →
+    `api.Options`, and each hop was somewhere one of them could end up reporting
+    a different build from the one running.
+
+    Not taken from the same source: per-route HTTP metrics and a request
+    middleware. Both earn their place on a public edge; this surface is
+    loopback-only and first-party, and `/metrics` already carries every quantity
+    that decides whether the money moves.
 
 
 ## Verification

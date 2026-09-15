@@ -31,7 +31,7 @@ tasks:
       CGO_ENABLED: '0'
     cmds:
       - mkdir -p bin
-      - go build -trimpath -ldflags="-s -w -X main.version={{.VERSION}}" -o bin/bsc .
+      - go build -trimpath -ldflags="-s -w -X bsc/buildinfo.Version={{.VERSION}}" -o bin/bsc .
 
   unit:
     desc: Run the unit tests (no chain, no network, no database server)
@@ -55,7 +55,21 @@ tasks:
       - go vet ./...
 
   run:
-    desc: Run the service (needs MASTER_SECRET; see deploy/README.md)
+    desc: Run the service (needs BSC_MASTER_SECRET; see deploy/README.md)
+    cmds:
+      - go run . {{.CLI_ARGS}}
+
+  sandbox:
+    desc: 'Testnet + dashboard at http://127.0.0.1:8800/ui/ (needs BSC_MASTER_SECRET)'
+    # Chapel, not mainnet: this task exists to be clicked around in, and the one
+    # thing that must never be a mistake here is doing it against real money.
+    # Its own database because a database records the chain it was built against
+    # and refuses to open against another (§26) — sharing bsc.db with `task run`
+    # would just fail to start.
+    env:
+      BSC_UI_ENABLED: 'true'
+      BSC_CHAIN_RPC_URL: wss://bsc-testnet-rpc.publicnode.com
+      BSC_DB_PATH: bsc-sandbox.db
     cmds:
       - go run . {{.CLI_ARGS}}
 

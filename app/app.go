@@ -149,6 +149,13 @@ func Run(ctx context.Context, cfg config.Config) error {
 		MaxLagBlocks: cfg.MaxLagBlocks,
 		DefaultFee:   store.FeePolicy{Flat: cfg.DefaultFee},
 		Notify:       snd.Notify,
+		UI:           cfg.UIEnabled,
+		FeeCollector: collector,
+		Health: api.Health{
+			MasterGas:  wat.MasterGas,
+			Floor:      cfg.GasFloor,
+			SwapAmount: swapAmountOrNil(cfg),
+		},
 	})
 
 	addrs.Add(masterWallet.Address, masterWallet.ID)
@@ -227,4 +234,14 @@ func ensureMasterWallet(st *store.Store, addr common.Address) (store.Wallet, err
 		return tx.PutWallet(out)
 	})
 	return out, err
+}
+
+// swapAmountOrNil is what a gas top-up would have to sell, or nil when there is
+// no top-up. The distinction is what lets /healthz tell a master that will
+// recover from one that will not.
+func swapAmountOrNil(cfg config.Config) *big.Int {
+	if !cfg.SwapEnabled {
+		return nil
+	}
+	return cfg.SwapAmount
 }

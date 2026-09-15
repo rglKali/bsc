@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bsc/buildinfo"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -76,6 +77,9 @@ func newStack(t *testing.T) *stack {
 	})
 	srv := api.New(st, ring, addrs, wat, api.Options{
 		DefaultFee: store.FeePolicy{Flat: 100}, // $1.00
+		// The dashboard is mounted here so its read model is exercised against
+		// real money moving, not just against a fixture.
+		UI: true,
 	})
 	mux := http.NewServeMux()
 	srv.Routes(mux)
@@ -385,4 +389,123 @@ func TestSecondDepositOnAnActiveWalletSkipsActivation(t *testing.T) {
 		t.Fatalf("available = %s, want both deposits", app.Balance.AvailableCents)
 	}
 	s.audit()
+}
+
+// uiState is the dashboard's read model, as the page receives it.
+type uiState struct {
+	Service struct {
+		Version      string `json:"version"`
+		Block        uint64 `json:"block"`
+		BlocksBehind uint64 `json:"blocks_behind"`
+		Lagging      bool   `json:"lagging"`
+		Decimals     uint8  `json:"decimals"`
+	} `json:"service"`
+	Apps []struct {
+		Slug       string `json:"slug"`
+		CustodyWei string `json:"custody_wei"`
+		ExcessWei  string `json:"excess_wei"`
+		Solvent    bool   `json:"solvent"`
+		Addresses  int    `json:"addresses"`
+		Balance    struct {
+			AvailableCents string `json:"available_cents"`
+			ReservedCents  string `json:"reserved_cents"`
+			PendingCents   string `json:"pending_cents"`
+			TotalCents     string `json:"total_cents"`
+		} `json:"balance"`
+	} `json:"apps"`
+	Flows []struct {
+		Kind  string `json:"kind"`
+		State string `json:"state"`
+		App   string `json:"app"`
+	} `json:"flows"`
+}
+
+func (s *stack) uiState() uiState {
+	s.t.Helper()
+	var out uiState
+	s.call("GET", "/ui/state", nil, http.StatusOK, &out)
+	return out
+}
+
+// The dashboard is only worth mounting if it tells the truth while money is
+// actually moving. This walks the same path as TestFullMoneyLifecycle and
+// checks the operator view at each step — in particular that custody and the
+// ledger are shown as the two different quantities they are (§22), and that the
+// excess the house is owed appears once a fee has been charged.
+func TestDashboardTracksTheMoney(t *testing.T) {
+	s := newStack(t)
+
+	var app struct {
+		Address string `json:"address"`
+	}
+	s.call("PUT", "/v1/apps/df", map[string]any{}, http.StatusCreated, &app)
+	s.settle()
+
+	state := s.uiState()
+	if state.Service.Version != buildinfo.Version {
+		t.Fatalf("version = %q, want the build stamp %q", state.Service.Version, buildinfo.Version)
+	}
+	if len(state.Apps) != 1 || state.Apps[0].Slug != "df" {
+		t.Fatalf("apps = %+v", state.Apps)
+	}
+	if !state.Apps[0].Solvent || state.Apps[0].Balance.TotalCents != "0" {
+		t.Fatalf("a fresh app should be solvent and empty: %+v", state.Apps[0])
+	}
+
+	var addr struct {
+		Address string `json:"address"`
+	}
+	s.call("POST", "/v1/apps/df/addresses", map[string]any{"ref": "cust-1"}, http.StatusCreated, &addr)
+	if got := s.uiState().Apps[0].Addresses; got != 1 {
+		t.Fatalf("addresses = %d, want 1", got)
+	}
+
+	// 50 USDT arrives and is drained into the hot wallet.
+	s.sim.deposit(common.HexToAddress(addr.Address), ether(50))
+	s.settle()
+
+	state = s.uiState()
+	a := state.Apps[0]
+	if a.Balance.AvailableCents != "5000" || a.Balance.PendingCents != "0" {
+		t.Fatalf("after the drain: %+v, want 5000 available and nothing pending", a.Balance)
+	}
+	// Custody is wei and the ledger is cents: the dashboard shows both because
+	// no arithmetic on one can produce the other.
+	if a.CustodyWei != ether(50).String() {
+		t.Fatalf("custody = %s, want the whole 50 USDT on-chain", a.CustodyWei)
+	}
+	if !a.Solvent || a.ExcessWei != "0" {
+		t.Fatalf("nothing is owed to the house yet: %+v", a)
+	}
+
+	// A payout charges a $1.00 fee, which stays in the wallet uncredited — and
+	// therefore shows up as the house's excess (§24, §25).
+	dest := common.HexToAddress("0x00000000000000000000000000000000000000dd")
+	collector := common.HexToAddress("0x00000000000000000000000000000000000000fe")
+	s.call("POST", "/v1/apps/df/withdrawals", map[string]any{
+		"destination": dest.Hex(), "amount_cents": "2000",
+	}, http.StatusCreated, nil)
+
+	if got := s.uiState().Apps[0].Balance.ReservedCents; got != "2100" {
+		t.Fatalf("reserved = %s, want payout+fee held before it settles", got)
+	}
+	s.settle()
+
+	a = s.uiState().Apps[0]
+	if a.Balance.AvailableCents != "2900" || a.Balance.ReservedCents != "0" {
+		t.Fatalf("after the payout: %+v, want 2900 available and nothing reserved", a.Balance)
+	}
+	// The $1.00 fee is exactly HouseSweepMin here, so it is collected in the
+	// same settle rather than sitting as excess. What the dashboard must show
+	// either way is that the app is not short and its custody now matches its
+	// ledger to the cent.
+	if !a.Solvent || a.ExcessWei != "0" {
+		t.Fatalf("after the sweep: %+v, want no excess left and the app solvent", a)
+	}
+	if got := s.sim.usdtOf(collector); got.Cmp(ether(1)) != 0 {
+		t.Fatalf("collector holds %s, want the $1.00 fee swept to it", got)
+	}
+	if a.CustodyWei != ether(29).String() {
+		t.Fatalf("custody = %s, want 50 less the 20 paid out less the 1 swept", a.CustodyWei)
+	}
 }

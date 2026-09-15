@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bsc — dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>bsc <span class="tag">dashboard</span></h1>
+  <p class="sub">Local operator surface. No authentication — anyone who can load this page can move every app's money.</p>
+</header>
+
+<section class="strip" id="strip">
+  <div class="stat"><span class="label">chain</span><span class="value" id="s-chain">—</span></div>
+  <div class="stat"><span class="label">block</span><span class="value" id="s-block">—</span></div>
+  <div class="stat" id="s-behind-stat"><span class="label">behind</span><span class="value" id="s-behind">—</span></div>
+  <div class="stat"><span class="label">master gas</span><span class="value" id="s-bnb">—</span></div>
+  <div class="stat"><span class="label">master USDT</span><span class="value" id="s-usdt">—</span></div>
+  <div class="stat"><span class="label">in flight</span><span class="value" id="s-inflight">—</span></div>
+  <span class="spacer"></span>
+  <span class="hint" id="tick">connecting…</span>
+</section>
+
+<section class="strip addresses">
+  <div class="stat wide">
+    <span class="label">master — pays all gas, signs everything</span>
+    <span class="value" id="s-master">—</span>
+  </div>
+  <div class="stat wide" id="s-collector-stat">
+    <span class="label">fee collector</span>
+    <span class="value" id="s-collector">—</span>
+  </div>
+</section>
+
+<main>
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Apps</h2>
+      <form class="row" id="register-form">
+        <input id="register-slug" placeholder="new-app-slug" size="16" required>
+        <button>Register</button>
+      </form>
+    </div>
+    <p class="hint">Balances are the ledger, in cents. Custody and excess are the chain-side truth
+      behind them — the wallet also holds the house's fees and dust, which is why the two differ.</p>
+    <table>
+      <thead><tr>
+        <th>App</th><th>Hot wallet</th><th class="num">Available</th><th class="num">Reserved</th>
+        <th class="num">Pending</th><th class="num">Total</th><th class="num">Excess</th>
+        <th class="num">Addrs</th><th>Fee</th><th></th>
+      </tr></thead>
+      <tbody id="apps-body"></tbody>
+    </table>
+  </section>
+
+  <section class="panel" id="detail" hidden>
+    <div class="panel-head">
+      <h2>App <code id="d-slug"></code></h2>
+      <button class="ghost" id="d-close">close</button>
+    </div>
+
+    <div class="detail-grid">
+      <div>
+        <h3>New deposit address</h3>
+        <form class="row" id="addr-form">
+          <input id="addr-ref" placeholder="your ref (e.g. cust-1)" required>
+          <button>Create</button>
+        </form>
+        <p class="status" id="addr-status"></p>
+        <table class="mini"><thead><tr><th>Ref</th><th>Address</th></tr></thead><tbody id="addrs-body"></tbody></table>
+      </div>
+
+      <div>
+        <h3>Withdraw</h3>
+        <form id="wd-form">
+          <div class="row wrap">
+            <input id="wd-dest" placeholder="0x destination" size="26" required>
+            <label>cents <input id="wd-amount" type="number" min="1" value="100" required></label>
+            <label class="check"><input id="wd-deduct" type="checkbox"> deduct fee</label>
+            <button>Send</button>
+          </div>
+        </form>
+        <p class="status" id="wd-status"></p>
+        <p class="hint">Quoted against the app's own fee policy before it is created. A refusal here
+          is the whole error path: once accepted, a withdrawal has no failure state.</p>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="deposits">Deposits</button>
+      <button class="tab" data-tab="withdrawals">Withdrawals</button>
+    </div>
+    <div class="tab-body" id="tab-deposits">
+      <table><thead><tr><th>Ref</th><th class="num">Amount</th><th>Status</th><th>From</th><th>Tx</th><th>When</th></tr></thead><tbody id="deposits-body"></tbody></table>
+    </div>
+    <div class="tab-body" id="tab-withdrawals" hidden>
+      <table><thead><tr><th>Destination</th><th class="num">Payout</th><th class="num">Fee</th><th>Status</th><th class="num">Attempts</th><th>Tx</th><th>Last error</th></tr></thead><tbody id="withdrawals-body"></tbody></table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Flows</h2>
+      <span class="hint">Work the service believes it owes. A wedged one shows up here long before it shows up in a balance.</span>
+    </div>
+    <table><thead><tr><th>Kind</th><th>State</th><th>App</th><th>Wallet</th><th class="num">Attempt</th><th>Retry after</th><th>Tx</th><th>Error</th></tr></thead><tbody id="flows-body"></tbody></table>
+    <p class="status" id="flows-empty">Nothing in flight.</p>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

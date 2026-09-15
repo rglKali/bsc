@@ -9,7 +9,7 @@ Roughly ordered by value, none committed.
   `bsc_master_bnb_wei`, so a bare low-balance rule would mostly fire on a
   condition that fixes itself. What is worth alerting on is the residue: the
   balance low *and* staying low, which means there were no fees to sell, the swap
-  kept reverting, or `SWAP_ENABLED=false`. Belongs in Grafana, not the service.
+  kept reverting, or `swap.enabled=false`. Belongs in Grafana, not the service.
 - [ ] **Stuck-transaction alert.** Alert on `bsc_in_flight_age_seconds` rather
   than on `bsc_transactions_in_flight`, which is 0 or 1 by design.
 - [ ] Tracing across the deposit → drain → settlement path.
@@ -84,7 +84,7 @@ Roughly ordered by value, none committed.
 
 ## Explicitly not doing
 
-- **Draining the master.** You hold `MASTER_SECRET` and can move collected fees
+- **Draining the master.** You hold `BSC_MASTER_SECRET` and can move collected fees
   out at any time; building it in adds risk for no gain. (Swapping USDT→BNB was
   in this list and is now **built** — see decisions 19 and 20.)
 - **An admin API or UI.** With slug addressing the app API is already the

@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"bsc/store"
@@ -301,5 +302,39 @@ func TestFeeSnapshotSurvivesAPolicyChange(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("View: %v", err)
+	}
+}
+
+// Quoting and creating take different bodies, and the difference is load-
+// bearing: pricing depends only on the amount and the fee direction, so a quote
+// has no destination to give. Because the decoder rejects unknown fields — so an
+// integrator's misspelling is an error rather than a silently ignored setting —
+// sending one body to both endpoints is a 400, not a convenience.
+//
+// This is pinned because it is an inviting thing to "simplify". The dashboard
+// made exactly that mistake and the strictness caught it.
+func TestQuoteAndCreateTakeDifferentBodies(t *testing.T) {
+	f := newFixture(t)
+	f.register("df")
+	f.credit("df", 1000)
+
+	// What each endpoint is actually given by a correct caller.
+	if w := f.do("POST", "/v1/apps/df/withdrawals/quote",
+		map[string]any{"amount_cents": "100", "deduct_fee": false}); w.Code != http.StatusOK {
+		t.Fatalf("quote: status %d, body %s", w.Code, w.Body)
+	}
+	if w := f.do("POST", "/v1/apps/df/withdrawals",
+		map[string]any{"amount_cents": "100", "deduct_fee": false, "destination": dest}); w.Code != http.StatusCreated {
+		t.Fatalf("create: status %d, body %s", w.Code, w.Body)
+	}
+
+	// A create body sent to the quote endpoint is refused, naming the field.
+	w := f.do("POST", "/v1/apps/df/withdrawals/quote",
+		map[string]any{"amount_cents": "100", "deduct_fee": false, "destination": dest})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("quote with a destination: status %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "destination") {
+		t.Fatalf("the refusal must name the offending field, got %s", w.Body)
 	}
 }

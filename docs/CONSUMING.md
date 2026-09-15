@@ -225,7 +225,7 @@ POST   /v1/apps/{slug}/withdrawals        {destination, amount_cents, deduct_fee
 GET    /v1/apps/{slug}/withdrawals        ?status=pending|debited|all&limit=
 GET    /v1/apps/{slug}/withdrawals/{id}
 
-GET    /healthz    GET /metrics
+GET    /healthz    GET /metrics      (operator surface, not part of the app contract)
 ```
 
 Statuses, in full: deposits are `pending` → `credited`, withdrawals are

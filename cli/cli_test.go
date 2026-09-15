@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bsc/buildinfo"
 	"bytes"
 	"math/big"
 	"path/filepath"
@@ -59,8 +60,12 @@ func database(t *testing.T) string {
 }
 
 func TestVersion(t *testing.T) {
-	SetVersion("1.2.3")
-	t.Cleanup(func() { SetVersion("dev") })
+	// Stamped into bsc/buildinfo at link time rather than passed in, so the
+	// reported version cannot disagree with the binary it came from.
+	was := buildinfo.Version
+	buildinfo.Version = "1.2.3"
+	t.Cleanup(func() { buildinfo.Version = was })
+
 	out, code, err := run(t, "version")
 	if err != nil || code != 0 {
 		t.Fatalf("err=%v code=%d", err, code)
@@ -145,10 +150,10 @@ func TestFlagsOverrideTheEnvironment(t *testing.T) {
 	// systemd supplies the environment; an operator running it by hand wants to
 	// override one thing without editing a unit file. This exercises the same
 	// binding Root sets up.
-	t.Setenv("MASTER_SECRET", strings.Repeat("11", 32))
-	t.Setenv("DB_PATH", "/from/env.db")
-	t.Setenv("RPC_RATE_LIMIT", "20")
-	t.Setenv("HTTP_ADDR", "127.0.0.1:9999")
+	t.Setenv("BSC_MASTER_SECRET", strings.Repeat("11", 32))
+	t.Setenv("BSC_DB_PATH", "/from/env.db")
+	t.Setenv("BSC_CHAIN_RPC_RATE_LIMIT", "20")
+	t.Setenv("BSC_HTTP_ADDR", "127.0.0.1:9999")
 
 	v := config.New()
 	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
@@ -159,7 +164,7 @@ func TestFlagsOverrideTheEnvironment(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	for flag, key := range map[string]string{
-		"db": "db_path", "rpc-rate-limit": "rpc_rate_limit", "http-addr": "http_addr",
+		"db": "db_path", "rpc-rate-limit": "chain.rpc_rate_limit", "http-addr": "http_addr",
 	} {
 		if err := v.BindPFlag(key, fs.Lookup(flag)); err != nil {
 			t.Fatalf("bind %s: %v", flag, err)

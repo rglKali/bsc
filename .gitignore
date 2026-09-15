@@ -2,7 +2,8 @@
 *.db
 *.db.lock
 
-# local env files (commit deploy/*.env.example instead)
+# Local env files. The deployed one is /etc/bsc/bsc.env on the box, holding only
+# BSC_MASTER_SECRET; nothing of the sort belongs in the repo.
 *.env
 
 # built binaries

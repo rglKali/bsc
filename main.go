@@ -9,10 +9,8 @@ import (
 	"bsc/cli"
 )
 
-// version is stamped at build time (see the Taskfile).
-var version = "dev"
-
+// The version is stamped straight into bsc/buildinfo at link time (see the
+// Taskfile), so nothing has to be threaded through here.
 func main() {
-	cli.SetVersion(version)
 	os.Exit(cli.Execute())
 }

@@ -1,0 +1,175 @@
+/* Deliberately the same palette and spacing as the vid sandbox: these are two
+   windows onto the same box, and an operator switching between them should not
+   have to relearn what a colour means. */
+:root {
+  --bg: #14161a;
+  --panel: #1b1e24;
+  --line: #2b3038;
+  --ink: #e6e8ec;
+  --dim: #9aa3af;
+  --accent: #5aa9e6;
+  --ok: #6cc070;
+  --warn: #d9a441;
+  --bad: #e0625f;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 0 0 4rem;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+header { padding: 1.5rem 2rem 1rem; border-bottom: 1px solid var(--line); }
+
+h1 { margin: 0; font-size: 1.3rem; font-weight: 600; letter-spacing: -0.01em; }
+h2 { margin: 0; font-size: 1rem; font-weight: 600; }
+h3 { margin: 1rem 0 0.4rem; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); }
+
+.tag {
+  font: 600 0.65rem/1 var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: 3px;
+  padding: 0.25em 0.45em;
+  vertical-align: 0.25em;
+}
+
+.sub, .hint { color: var(--dim); font-size: 0.85rem; margin: 0.4rem 0 0; }
+.hint { font-size: 0.8rem; }
+
+main { padding: 1.25rem 2rem; display: flex; flex-direction: column; gap: 1.25rem; max-width: 1500px; }
+
+/* The strip is the "is anything on fire" line: it is the first thing on the
+   page because blocks-behind and a dry master are the two conditions that stop
+   every transfer in the service. */
+.strip {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  padding: 0.85rem 2rem;
+  border-bottom: 1px solid var(--line);
+  background: #171a20;
+  flex-wrap: wrap;
+}
+.strip .spacer { flex: 1; }
+.stat { display: flex; flex-direction: column; gap: 0.15rem; }
+.stat .label { font: 600 0.65rem/1 system-ui, sans-serif; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); }
+.stat .value { font: 0.95rem var(--mono); }
+.stat.alert .value { color: var(--bad); }
+.stat.warn .value { color: var(--warn); }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 1.1rem 1.25rem; }
+.panel-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+.panel-head .hint { margin: 0; max-width: 46rem; }
+
+.row { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.8rem; }
+.row.wrap { flex-wrap: wrap; }
+.panel-head .row { margin-top: 0; }
+
+button {
+  background: var(--accent);
+  color: #0c1116;
+  border: 0;
+  border-radius: 5px;
+  padding: 0.45rem 0.9rem;
+  font: 600 0.85rem system-ui, sans-serif;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.4; cursor: default; }
+button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); }
+button.ghost:hover { color: var(--ink); border-color: var(--dim); }
+button.danger { background: transparent; color: var(--bad); border: 1px solid rgba(224,98,95,0.4); }
+button.danger:hover { background: rgba(224,98,95,0.12); border-color: var(--bad); }
+button.tiny { padding: 0.2rem 0.5rem; font-size: 0.72rem; }
+
+input[type=text], input[type=number], input:not([type]) {
+  background: #11141a;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  border-radius: 5px;
+  padding: 0.35rem 0.5rem;
+  font: 0.8rem var(--mono);
+}
+input[type=number] { width: 6.5rem; }
+label { color: var(--dim); font-size: 0.8rem; display: inline-flex; align-items: center; gap: 0.4rem; }
+label.check { gap: 0.3rem; }
+
+.status { font: 0.8rem var(--mono); color: var(--dim); margin: 0.6rem 0 0; min-height: 1.2em; }
+.status.ok { color: var(--ok); }
+.status.bad { color: var(--bad); }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.82rem; margin-top: 0.8rem; }
+th {
+  text-align: left;
+  font: 600 0.7rem/1 system-ui, sans-serif;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  padding: 0 0.6rem 0.5rem 0;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+td { padding: 0.45rem 0.6rem 0.45rem 0; border-bottom: 1px solid #23272f; font-family: var(--mono); font-size: 0.78rem; }
+th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr.clickable:hover { background: #20242c; cursor: pointer; }
+tbody tr.selected { background: #20242c; }
+td.err { color: var(--bad); white-space: pre-wrap; word-break: break-word; max-width: 26rem; }
+
+/* Money is the point of this page, so it gets the one piece of typographic
+   emphasis: aligned digits and a dim minor unit. */
+.money { font-variant-numeric: tabular-nums; }
+.money .cents { color: var(--dim); }
+.zero { color: var(--dim); }
+
+.pill { display: inline-block; padding: 0.15em 0.5em; border-radius: 10px; font-size: 0.7rem; font-weight: 600; }
+.pill.credited, .pill.debited { background: rgba(108,192,112,0.15); color: var(--ok); }
+.pill.pending { background: rgba(217,164,65,0.15); color: var(--warn); }
+.pill.paused, .pill.failed { background: rgba(224,98,95,0.15); color: var(--bad); }
+.pill.done { background: rgba(90,169,230,0.15); color: var(--accent); }
+.pill.funding, .pill.approving, .pill.approving_router, .pill.sweeping,
+.pill.sweeping_house, .pill.paying, .pill.swapping { background: rgba(90,169,230,0.15); color: var(--accent); }
+
+.tabs { display: flex; align-items: center; gap: 0.4rem; margin: 1.1rem 0 0; }
+.tab { background: transparent; color: var(--dim); border: 1px solid transparent; padding: 0.3rem 0.7rem; }
+.tab.active { color: var(--ink); border-color: var(--line); background: #20242c; }
+
+.detail-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.5rem; margin-top: 0.5rem; }
+@media (max-width: 900px) { .detail-grid { grid-template-columns: 1fr; } }
+
+code { font-family: var(--mono); font-size: 0.85em; color: var(--accent); }
+table.mini { margin-top: 0.5rem; }
+table.mini td { border: 0; padding: 0.2rem 0.8rem 0.2rem 0; }
+
+a.tx { color: var(--accent); text-decoration: none; }
+a.tx:hover { text-decoration: underline; }
+
+/* The address strip. Full addresses, never truncated: the whole point of
+   putting them here is copying one or opening it in an explorer, and a
+   shortened address can do neither. */
+.strip.addresses { gap: 2.5rem; padding-top: 0.6rem; padding-bottom: 0.6rem; }
+.stat.wide .value { font-size: 0.8rem; display: flex; align-items: center; gap: 0.5rem; }
+
+.addr { font-family: var(--mono); color: var(--accent); text-decoration: none; }
+.addr:hover { text-decoration: underline; }
+.addr.plain { color: var(--ink); }
+
+/* Copy sits next to the address rather than replacing the link, so the two
+   things you might want to do with an address are both one click. */
+.copy {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--dim);
+  border-radius: 4px;
+  padding: 0.1rem 0.35rem;
+  font: 0.68rem var(--mono);
+  cursor: pointer;
+}
+.copy:hover { color: var(--ink); border-color: var(--dim); }
+.copy.done { color: var(--ok); border-color: var(--ok); }

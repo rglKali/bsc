@@ -8,8 +8,10 @@ Wants=network-online.target
 Type=simple
 User=bsc
 Group=bsc
+# Two files, deliberately: the reviewable configuration, and the one secret that
+# cannot be (§30).
 EnvironmentFile=/etc/bsc/bsc.env
-ExecStart=/opt/bsc/bin/bsc
+ExecStart=/opt/bsc/bin/bsc --config /etc/bsc/config.yaml
 Restart=on-failure
 RestartSec=3
 
