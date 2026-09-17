@@ -10,6 +10,9 @@ import (
 	"github.com/google/uuid"
 )
 
+// One fixed clock for every test in this package: the rules and the engine both
+// take `now` as a parameter, so nothing here needs a real one, and a fixed date
+// is what keeps a backoff assertion from depending on when the suite runs.
 var now = time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 
 // proxy is a wallet that forwards what it receives: the drain candidate.

@@ -27,7 +27,6 @@ import (
 	"strings"
 	"time"
 
-	"bsc/engine"
 	"bsc/flow"
 	"bsc/keys"
 	"bsc/metrics"
@@ -511,7 +510,7 @@ func (s *Sender) advance(f store.Flow, ok bool, reason string) error {
 		// Block zero: nothing landed, so there is no chain position to record.
 		// A settlement reached this way never produces a debit, because no
 		// transfer happened to observe (§42).
-		_, err := engine.Advance(tx, f, 0, ok, now)
+		_, err := flow.Advance(tx, f, 0, ok, now)
 		return err
 	})
 }

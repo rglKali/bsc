@@ -1,6 +1,6 @@
-// Command bsc is the USDT chain gateway: one process that watches finalized BSC
-// blocks, derives and drains deposit wallets, and pays out withdrawals for the
-// apps registered with it. See docs/REWRITE.md for the design.
+// Command bsc is a USDT chain primitive: one process that watches finalized BSC
+// blocks, derives wallets, forwards the ones configured to forward, and pays out
+// withdrawals on request. See docs/ARCHITECTURE.md for the design.
 package main
 
 import (

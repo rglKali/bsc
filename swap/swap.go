@@ -1,5 +1,6 @@
-// Package swap encodes the two PancakeSwap-style router calls bsc needs to turn
-// collected fees back into gas.
+// Package swap encodes the two PancakeSwap-style router calls behind
+// `bsc swap`, the attended command an operator runs to turn tokens sitting on
+// the master into gas (§44). The running service never trades.
 //
 // The calls are hand-encoded rather than generated: two functions do not justify
 // a build-time toolchain dependency, and writing them out keeps the exact

@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"time"
 
-	"bsc/money"
 	"bsc/store"
 
 	"github.com/google/uuid"
@@ -157,7 +156,7 @@ func (s *Server) createWithdrawal(w http.ResponseWriter, r *http.Request) error 
 			return err
 		}
 		want := new(big.Int).Add(committed, total)
-		held := money.OrZero(wallet.Balance)
+		held := orZero(wallet.Balance)
 		if want.Cmp(held) > 0 {
 			return fail(http.StatusUnprocessableEntity, "insufficient_balance",
 				"wallet %q holds %s and already owes %s; %s more cannot be promised",
@@ -414,7 +413,7 @@ func viewWithdrawal(wd store.Withdrawal, ref string) withdrawalView {
 	v := withdrawalView{
 		ID: wd.ID.String(), Wallet: ref,
 		Reason: wd.Reason.String(), Status: wd.Status.String(),
-		To: wd.Destination.Hex(), Amount: money.String(wd.Amount),
+		To: wd.Destination.Hex(), Amount: amountString(wd.Amount),
 		TxHash: hashStr(wd.TxHash), Attempts: wd.Attempts, LastError: wd.Error,
 		CreatedAt: stamp(wd.CreatedAt), UpdatedAt: stamp(wd.UpdatedAt),
 	}

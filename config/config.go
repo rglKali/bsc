@@ -2,13 +2,14 @@
 // environment.
 //
 // There is one config for the whole service, replacing v1's three separate
-// matrices. Anything that can be derived is derived rather than configured:
-// gas amounts come from estimates, the fee collector defaults to the master
-// address, and the starting block defaults to the current finalized head.
+// matrices. Anything that can be derived is derived rather than configured: gas
+// amounts come from estimates, the token and the swap router follow whatever
+// chain the endpoint reports, and the starting block defaults to the current
+// finalized head.
 //
 // **The split between the file and the environment is a security boundary, not
-// a convenience.** `master_secret` is the one setting that can move every app's
-// money, so it belongs in a secrets manager and reaches the process as
+// a convenience.** `master_secret` is the one setting that can move every
+// wallet's money, so it belongs in a secrets manager and reaches the process as
 // BSC_MASTER_SECRET. Everything else is operational — thresholds, intervals,
 // fee policy — and belongs in a file you can review, diff and keep in version
 // control. Putting the two in one file is what forces the whole thing to be a
@@ -119,7 +120,7 @@ func New() *viper.Viper {
 	v.SetDefault("ui_enabled", false) // see Config.UIEnabled
 	v.SetDefault("chain.rpc_url", "") // resolved from the chain the endpoint reports
 	// At ~0.45s blocks the watcher alone needs ~2.2 req/s sustained, and it has
-	// to outrun the chain to ever catch up after an outage — see docs/REWRITE.md §10.
+	// to outrun the chain to ever catch up after an outage — see deploy/README.md.
 	v.SetDefault("chain.rpc_rate_limit", 20)
 	v.SetDefault("chain.token_address", "") // resolved from the chain the endpoint reports
 	v.SetDefault("chain.start_block", 0)
@@ -312,21 +313,18 @@ func (c *Config) ResolveChain(chainID uint64) error {
 		}
 	}
 
-	if c.SwapRouter != "" {
-		return nil
-	}
-	// Addresses verified against the explorer. An unknown chain is a hard error
-	// rather than a silent no-op: quietly not swapping would only be discovered
-	// when the master ran dry.
-	switch chainID {
-	case chain.MainnetChainID:
-		c.SwapRouter = swap.PancakeV2Mainnet.Hex()
-	case chain.TestnetChainID:
-		c.SwapRouter = swap.PancakeV2Testnet.Hex()
-	default:
-		return fmt.Errorf(
-			"no default swap router for chain %d: set swap.router (%s), or swap.enabled=false (%s=false) to run without gas top-ups",
-			chainID, EnvVar("swap.router"), EnvVar("swap.enabled"))
+	// The router is only ever used by `bsc swap`, so an unknown chain is not an
+	// error here: the service runs perfectly well without one, and leaving it
+	// empty is what lets `bsc swap` be the thing that says a router is missing,
+	// at the moment somebody actually asks for a trade. Addresses verified
+	// against the explorer.
+	if c.SwapRouter == "" {
+		switch chainID {
+		case chain.MainnetChainID:
+			c.SwapRouter = swap.PancakeV2Mainnet.Hex()
+		case chain.TestnetChainID:
+			c.SwapRouter = swap.PancakeV2Testnet.Hex()
+		}
 	}
 	return nil
 }

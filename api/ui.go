@@ -7,22 +7,22 @@ import (
 
 	"bsc/buildinfo"
 	"bsc/store"
-	"bsc/ui"
 
 	"github.com/ethereum/go-ethereum/common"
 )
 
 // The dashboard's read model.
 //
-// This is the operator's view, and it is deliberately the opposite of the app
-// contract. §27 keeps wei, block heights and flow states away from apps because
-// an app has no use for them and would come to depend on them. An operator has
-// nothing *but* use for them: "which flow is wedged", "is that wallet short",
-// "how far behind are we" are the only questions worth opening a dashboard for.
+// This is the operator's view, and it is deliberately the opposite of the
+// caller contract. §27 keeps gas, block heights and flow states away from
+// callers because a caller has no use for them and would come to depend on
+// them. An operator has nothing *but* use for them: "which flow is wedged",
+// "is that wallet short", "how far behind are we" are the only questions worth
+// opening a dashboard for.
 //
 // Keeping it at /ui/state rather than under /v1 is what lets both be true at
-// once. The app contract stays cents-and-a-hash, this stays the truth, and
-// api/contract_test.go walks only the former.
+// once. The caller contract stays wallets-and-amounts, this stays the whole
+// truth, and api/contract_test.go walks only the former.
 type uiState struct {
 	Service uiService  `json:"service"`
 	Wallets []uiWallet `json:"wallets"`
@@ -81,7 +81,7 @@ type uiFlow struct {
 // mountUI wires the dashboard and its read model. Both are absent unless the
 // operator turned them on; see config.UIEnabled for why that default matters.
 func (s *Server) mountUI(mux *http.ServeMux) {
-	page, err := ui.Handler()
+	page, err := dashboard()
 	if err != nil {
 		s.log.Error("could not mount the dashboard", "error", err)
 		return

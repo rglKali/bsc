@@ -294,8 +294,8 @@ func TestResolveChainFollowsTheEndpoint(t *testing.T) {
 // TestUnknownChainMustBeNamedInFull: an endpoint we have no defaults for is a
 // startup failure naming exactly what is missing. Guessing would point a signer
 // at one chain's token while the endpoint served another.
-func TestUnknownChainMustBeNamedInFull(t *testing.T) {
-	withEnv(t, "BSC_CHAIN_RPC_URL", "wss://somewhere.example", "BSC_SWAP_ENABLED", "false")
+func TestUnknownChainMustNameItsToken(t *testing.T) {
+	withEnv(t, "BSC_CHAIN_RPC_URL", "wss://somewhere.example")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -304,26 +304,21 @@ func TestUnknownChainMustBeNamedInFull(t *testing.T) {
 		t.Fatalf("err = %v, want it to name chain.token_address", err)
 	}
 
-	// Swapping on, with no router we can resolve: it must say how to proceed
-	// rather than quietly never swapping, which would surface only as a dry
-	// master weeks later.
-	// swap.enabled is set back explicitly: t.Setenv unwinds at the end of the
-	// test, not between withEnv calls inside one.
-	withEnv(t, "BSC_CHAIN_RPC_URL", "wss://somewhere.example", "BSC_SWAP_ENABLED", "true",
+	// The token is the one thing that must be named: watching the wrong address
+	// reports no transfers rather than complaining, which is indistinguishable
+	// from a quiet chain.
+	withEnv(t, "BSC_CHAIN_RPC_URL", "wss://somewhere.example",
 		"BSC_CHAIN_TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955")
 	cfg, _ = Load()
-	err = cfg.ResolveChain(1337)
-	if err == nil || !strings.Contains(err.Error(), "swap.enabled=false") {
-		t.Fatalf("err = %v; it should say how to proceed", err)
+	if err := cfg.ResolveChain(1337); err != nil {
+		t.Fatalf("an unknown chain with a named token was rejected: %v", err)
 	}
 
-	// Naming both is a way forward.
-	withEnv(t, "BSC_CHAIN_RPC_URL", "wss://somewhere.example", "BSC_SWAP_ENABLED", "true",
-		"BSC_CHAIN_TOKEN_ADDRESS", "0x55d398326f99059fF775485246999027B3197955",
-		"BSC_SWAP_ROUTER", "0x10ED43C718714eb63d5aA57B78B54704E256024E")
-	cfg, _ = Load()
-	if err := cfg.ResolveChain(1337); err != nil {
-		t.Fatalf("a fully named unknown chain was rejected: %v", err)
+	// The router is not: only `bsc swap` uses it, and refusing to start the
+	// service over a command it never runs would be the tail wagging the dog.
+	// Leaving it empty is what lets `bsc swap` be the one to say it is missing.
+	if cfg.SwapRouter != "" {
+		t.Fatalf("router = %q on an unknown chain, want it left empty", cfg.SwapRouter)
 	}
 }
 

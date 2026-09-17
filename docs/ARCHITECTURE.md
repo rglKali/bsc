@@ -929,14 +929,48 @@ problem. Removing it is §32 through §40.
     written back to the flow — so every drain's debit would have recorded an
     amount of zero. The engine test passed because it set the field by hand.
     `move` now returns what it moved and `journalAndSend` persists it in the same
-    transaction as the journal, and the assertion lives end-to-end in `app/`,
+    transaction as the journal, and the assertion lives end-to-end in
+    `cli/e2e_test.go`,
     which is the only level at which the gap is visible.
 
+
+47. **Eighteen packages became fourteen.** A package should be a boundary
+    somebody can name. Four were not, and merging them changed no behaviour:
+
+    - `money` (86 lines) had two importers, and `store` used it for exactly one
+      four-line helper. Parsing a decimal string is a *wire* concern, so it went
+      to `api/money.go` and its functions stopped being exported — `store` now
+      carries its own `orZero` and imports nothing.
+    - `ui` (38 lines) existed to hold a `//go:embed` and one handler, and `api`
+      was its only importer while `api/ui.go` already served the state the page
+      renders. The static files moved to `api/static`.
+    - `engine` (311 lines) said it was separate "because two callers need it",
+      which argues for a shared function rather than a package — `flow` has
+      three callers and is not separate for that reason. `flow` already imported
+      `store`, so its no-I/O property was never compiler-enforced; it is a
+      convention that survives the merge exactly as well as it survived before.
+      It is now `flow/engine.go` beside `flow/rules.go`.
+    - `app` (434 lines) was wiring with one importer, `cli`. `app.Run` became
+      `runService`; `Verify`/`VerifyOnChain` stay exported because the e2e suite
+      imports them.
+
+    **`swap` was on the list and stayed.** It has two importers and looks like a
+    `cli` detail — but `e2e/swap_test.go` proves the router calldata against a
+    real router, and it can only do that if the encoding is an importable
+    package. The e2e suite is the only thing that can catch a wrong `Pack*`, so
+    it decides where this code lives. Moving its two router addresses elsewhere
+    was rejected for the same reason the merge was: an address belongs with the
+    code that speaks to it, which is why USDT's live in `usdt` and the router's
+    live in `swap`.
+
+    `keys` was raised too and stays, for the opposite reason: it has four
+    importers and `sender` has one, so folding it in would make `api` and `cli`
+    depend on the signing package and dilute the one claim that directory makes.
 
 ## Verification
 
 Every test runs offline — no chain, no network, no database server. The store is
-a temp file, HTTP is `httptest`, and `app/chainsim_test.go` is a miniature chain
+a temp file, HTTP is `httptest`, and `cli/chainsim_test.go` is a miniature chain
 that actually *applies* transactions: an `approve` sets a real allowance, a
 `transferFrom` checks it and the balance exactly as the token would, moves the
 tokens, and emits the `Transfer` log the watcher then decodes. That is what lets

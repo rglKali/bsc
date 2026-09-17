@@ -1,4 +1,4 @@
-package app
+package cli
 
 import (
 	"bytes"
@@ -12,7 +12,7 @@ import (
 
 	"bsc/api"
 	"bsc/buildinfo"
-	"bsc/engine"
+	"bsc/flow"
 	"bsc/keys"
 	"bsc/sender"
 	"bsc/store"
@@ -32,7 +32,7 @@ type stack struct {
 	wat   *watcher.Watcher
 	mux   *http.ServeMux
 	addrs *watcher.AddrSet
-	cfg   engine.Config
+	cfg   flow.Config
 
 	masterAddr common.Address
 }
@@ -77,7 +77,7 @@ func newStack(t *testing.T) *stack {
 
 	s := &stack{
 		t: t, st: st, sim: sim, snd: snd, wat: wat, mux: mux, addrs: addrs,
-		cfg:        engine.Config{DrainThreshold: ether(1)},
+		cfg:        flow.Config{DrainThreshold: ether(1)},
 		masterAddr: master.Address,
 	}
 	if err := wat.Start(context.Background()); err != nil {

@@ -12,12 +12,6 @@ import (
 	"github.com/google/uuid"
 )
 
-func addr(b byte) common.Address {
-	var a common.Address
-	a[common.AddressLength-1] = b
-	return a
-}
-
 // drive walks a flow to a terminal state, recording the action each state owed.
 // Every step is a value passed to a pure function: no RPC, no store, no clock.
 // That is the whole point of keeping the rules here.

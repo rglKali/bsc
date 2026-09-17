@@ -18,7 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"bsc/engine"
+	"bsc/flow"
 	"bsc/metrics"
 	"bsc/store"
 	"bsc/usdt"
@@ -47,12 +47,8 @@ type Options struct {
 	BackfillBatch  int           // blocks per write transaction while catching up
 	DrainThreshold *big.Int      // don't spend gas moving less than this
 
-	// Gas top-up, evaluated whenever the master balance is polled.
+	// The master, so its balances can be gauged and its own transfers skipped.
 	MasterWallet uuid.UUID
-	SwapEnabled  bool
-	SwapAmount   *big.Int
-	GasFloor     *big.Int
-	SwapCooldown time.Duration
 	Master       common.Address // for the BNB gauge
 	MasterPoll   time.Duration
 	Token        common.Address // the USDT contract; defaults to mainnet
@@ -71,7 +67,7 @@ type Watcher struct {
 	log   *slog.Logger
 
 	token common.Address
-	cfg   engine.Config
+	cfg   flow.Config
 	opts  Options
 
 	cursor       uint64
@@ -130,7 +126,7 @@ func New(st *store.Store, ch Chain, addrs *AddrSet, opts Options) *Watcher {
 		abi:   usdt.NewUsdt(),
 		log:   slog.Default().With("svc", "watcher"),
 		token: opts.Token,
-		cfg: engine.Config{
+		cfg: flow.Config{
 			DrainThreshold: opts.DrainThreshold,
 		},
 		opts: opts,
@@ -211,7 +207,7 @@ func (w *Watcher) Start(ctx context.Context) error {
 	var started int
 	if err := w.store.Update(func(tx *store.Tx) error {
 		var err error
-		started, err = engine.EvaluateAll(tx, w.cfg, now)
+		started, err = flow.EvaluateAll(tx, w.cfg, now)
 		return err
 	}); err != nil {
 		return fmt.Errorf("watcher: startup evaluation: %w", err)

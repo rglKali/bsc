@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"bsc/flow"
-	"bsc/money"
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -288,14 +287,14 @@ func (s *Server) walletView(ref string) (walletView, error) {
 }
 
 func viewWallet(w store.Wallet, committed *big.Int) walletView {
-	balance := money.OrZero(w.Balance)
-	available := new(big.Int).Sub(balance, money.OrZero(committed))
+	balance := orZero(w.Balance)
+	available := new(big.Int).Sub(balance, orZero(committed))
 	if available.Sign() < 0 {
 		available = new(big.Int)
 	}
 	v := walletView{
 		Ref: w.Ref, Address: w.Address.Hex(),
-		Balance: balance.String(), Committed: money.String(committed),
+		Balance: balance.String(), Committed: amountString(committed),
 		Available: available.String(), Paused: w.Paused,
 		CreatedAt: stamp(w.CreatedAt),
 	}

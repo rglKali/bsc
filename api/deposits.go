@@ -3,7 +3,6 @@ package api
 import (
 	"net/http"
 
-	"bsc/money"
 	"bsc/store"
 
 	"github.com/google/uuid"
@@ -136,7 +135,7 @@ func viewDeposits(tx *store.Tx, deposits []store.Deposit) ([]depositView, error)
 			TxHash:    d.TxHash.Hex(),
 			Wallet:    ref,
 			From:      d.From.Hex(),
-			Amount:    money.String(d.Amount),
+			Amount:    amountString(d.Amount),
 			Status:    d.Status.String(),
 			CreatedAt: stamp(d.CreatedAt),
 		}

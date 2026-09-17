@@ -1,6 +1,6 @@
 // Package store is bsc's single datastore: one bbolt file holding every record
 // the service keeps, in three namespaces (state/, data/, log/) plus their
-// indexes. See docs/REWRITE.md §3.
+// indexes. See docs/ARCHITECTURE.md, "The store is the design".
 //
 // Records are hand-packed binary rather than JSON: a 20-byte address is 20
 // bytes, a hash is 32, and a uint256 amount is its native 32-byte big-endian

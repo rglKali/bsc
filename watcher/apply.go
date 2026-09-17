@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"bsc/engine"
+	"bsc/flow"
 	"bsc/metrics"
 	"bsc/store"
 	"bsc/usdt"
@@ -84,7 +84,7 @@ func (w *Watcher) confirm(tx *store.Tx, rc *types.Receipt, block uint64, now tim
 	// The block is passed down because a settled debit is ordered by it: that is
 	// the feed a caller polls, and this is the only place the number is known
 	// (§42).
-	next, err := engine.Advance(tx, f, block, success, now)
+	next, err := flow.Advance(tx, f, block, success, now)
 	if err != nil {
 		return fmt.Errorf("watcher: advance flow %s: %w", f.ID, err)
 	}
@@ -195,7 +195,7 @@ func (w *Watcher) evaluateTouched(tx *store.Tx, touched map[uuid.UUID]struct{}, 
 		if !found {
 			continue
 		}
-		started, err := engine.EvaluateWallet(tx, wallet, w.cfg, now)
+		started, err := flow.EvaluateWallet(tx, wallet, w.cfg, now)
 		if err != nil {
 			return err
 		}
@@ -234,7 +234,7 @@ func (w *Watcher) evaluatePending(tx *store.Tx, now time.Time) error {
 		if !found {
 			continue
 		}
-		started, err := engine.EvaluateWallet(tx, wallet, w.cfg, now)
+		started, err := flow.EvaluateWallet(tx, wallet, w.cfg, now)
 		if err != nil {
 			return err
 		}

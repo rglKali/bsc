@@ -1,17 +1,18 @@
-// Package engine is the transactional glue between the pure rules in flow/ and
-// the records in store/: it advances a flow, settles it when it finishes, and
-// evaluates the declarative work rules to decide what should exist next.
+// The transactional half of this package: everything here takes a store
+// transaction and does all its work inside it, which is the opposite of the
+// rules beside it and the reason the two are worth telling apart by file rather
+// than by import path.
 //
-// It is a separate package because two callers need it. The watcher advances
-// flows when a transaction reaches finality, and the sender advances them when
-// it finds an action unnecessary — a wallet that already holds gas, or whose
-// allowance is already set. Both paths must settle identically, so the logic
-// lives once, here, rather than in either of them.
+// Two callers need it, which is why it is here rather than in either of them.
+// The watcher advances flows when a transaction reaches finality, and the
+// sender advances them when it finds an action unnecessary — a wallet that
+// already holds gas, or whose allowance is already set. Both paths must settle
+// identically.
 //
 // Every function takes a store transaction and does all its work inside it.
 // That is what makes a block atomic: confirmations, balances, deposits, newly
 // started flows and the cursor all commit together or not at all.
-package engine
+package flow
 
 import (
 	"fmt"
@@ -19,7 +20,6 @@ import (
 	"sort"
 	"time"
 
-	"bsc/flow"
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -41,7 +41,7 @@ type Config struct {
 // true both for a confirmation and for an action the sender skipped as
 // unnecessary.
 func Advance(tx *store.Tx, f store.Flow, block uint64, ok bool, now time.Time) (store.Flow, error) {
-	next, err := flow.Next(f, ok)
+	next, err := Next(f, ok)
 	if err != nil {
 		return f, err
 	}
@@ -85,7 +85,7 @@ func settle(tx *store.Tx, f store.Flow, from store.FlowState, confirmed common.H
 	case f.Kind != store.FlowTransfer:
 		return fmt.Errorf("engine: cannot settle unknown flow kind %d", f.Kind)
 	// Which of the two a transfer is comes from whether it names a withdrawal,
-	// which flow.Begin guarantees travels with the amount (§46).
+	// which Begin guarantees travels with the amount (§46).
 	case f.Pays():
 		return settleWithdrawal(tx, f, from, confirmed, block, ok, now)
 	default:
@@ -205,7 +205,7 @@ func backOff(tx *store.Tx, wallet uuid.UUID, now time.Time) error {
 	if !found {
 		return fmt.Errorf("engine: wallet %s vanished", wallet)
 	}
-	delay := flow.RetryDelay(w.FailedAttempts + 1)
+	delay := RetryDelay(w.FailedAttempts + 1)
 	if _, err := tx.BackOff(wallet, now.Add(delay)); err != nil {
 		return fmt.Errorf("engine: back off: %w", err)
 	}
@@ -223,10 +223,10 @@ func EvaluateWallet(tx *store.Tx, w store.Wallet, cfg Config, now time.Time) (bo
 		return false, nil
 	}
 	if w.Proxies() {
-		if !flow.ShouldDrain(w, cfg.DrainThreshold, now) {
+		if !ShouldDrain(w, cfg.DrainThreshold, now) {
 			return false, nil
 		}
-		return true, begin(tx, flow.Params{
+		return true, startFlow(tx, Params{
 			Kind: store.FlowTransfer, Wallet: w.ID,
 			To: w.DrainTo, Active: w.Active, Now: now,
 		})
@@ -236,10 +236,10 @@ func EvaluateWallet(tx *store.Tx, w store.Wallet, cfg Config, now time.Time) (bo
 	if err != nil {
 		return false, err
 	}
-	if !flow.ShouldPay(w, pending != nil, now) {
+	if !ShouldPay(w, pending != nil, now) {
 		return false, nil
 	}
-	return true, begin(tx, flow.Params{
+	return true, startFlow(tx, Params{
 		Kind: store.FlowTransfer, Wallet: w.ID,
 		To: pending.Destination, Amount: pending.Amount,
 		Withdrawal: pending.ID, Active: w.Active, Now: now,
@@ -294,10 +294,10 @@ func oldestPending(tx *store.Tx, wallet uuid.UUID) (*store.Withdrawal, error) {
 	return &pending[0], nil
 }
 
-// begin creates a flow and claims its wallet, the two halves of "this wallet is
+// startFlow creates a flow and claims its wallet, the two halves of "this wallet is
 // now busy" that must never be separated.
-func begin(tx *store.Tx, p flow.Params) error {
-	f, err := flow.Begin(p)
+func startFlow(tx *store.Tx, p Params) error {
+	f, err := Begin(p)
 	if err != nil {
 		return err
 	}

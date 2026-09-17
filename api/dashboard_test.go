@@ -1,4 +1,4 @@
-package ui
+package api
 
 import (
 	"net/http"
@@ -8,11 +8,11 @@ import (
 	"testing"
 )
 
-func serve(t *testing.T, path string) *httptest.ResponseRecorder {
+func serveStatic(t *testing.T, path string) *httptest.ResponseRecorder {
 	t.Helper()
-	h, err := Handler()
+	h, err := dashboard()
 	if err != nil {
-		t.Fatalf("Handler: %v", err)
+		t.Fatalf("dashboard: %v", err)
 	}
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
@@ -20,7 +20,7 @@ func serve(t *testing.T, path string) *httptest.ResponseRecorder {
 }
 
 func TestServesThePage(t *testing.T) {
-	w := serve(t, "/")
+	w := serveStatic(t, "/")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
@@ -33,12 +33,12 @@ func TestServesThePage(t *testing.T) {
 // asset here means the binary serves a broken page rather than failing to
 // build, which is exactly the kind of thing that survives to production.
 func TestEveryAssetThePageReferencesIsEmbedded(t *testing.T) {
-	page := serve(t, "/").Body.String() // FileServer redirects /index.html to /
+	page := serveStatic(t, "/").Body.String() // FileServer redirects /index.html to /
 	for _, asset := range []string{"style.css", "app.js"} {
 		if !strings.Contains(page, asset) {
 			t.Errorf("index.html no longer references %s — update this test or the page", asset)
 		}
-		if w := serve(t, "/"+asset); w.Code != http.StatusOK {
+		if w := serveStatic(t, "/"+asset); w.Code != http.StatusOK {
 			t.Errorf("%s: status %d, want it embedded and served", asset, w.Code)
 		}
 	}
@@ -48,7 +48,7 @@ func TestEveryAssetThePageReferencesIsEmbedded(t *testing.T) {
 // only ever a stale dashboard after an upgrade — and a stale dashboard for a
 // payments service is worse than no dashboard.
 func TestPageIsNeverCached(t *testing.T) {
-	if got := serve(t, "/").Header().Get("Cache-Control"); got != "no-store" {
+	if got := serveStatic(t, "/").Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
 	}
 }
@@ -60,7 +60,7 @@ func TestPageIsNeverCached(t *testing.T) {
 func TestPageLoadsNothingExternal(t *testing.T) {
 	external := regexp.MustCompile(`https?://[^\s"'` + "`" + `)]+`)
 	for _, path := range []string{"/", "/style.css", "/app.js"} {
-		for _, url := range external.FindAllString(serve(t, path).Body.String(), -1) {
+		for _, url := range external.FindAllString(serveStatic(t, path).Body.String(), -1) {
 			if strings.Contains(url, "bscscan.com") {
 				continue
 			}

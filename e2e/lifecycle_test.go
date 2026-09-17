@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"bsc/app"
+	"bsc/cli"
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -343,7 +343,7 @@ func TestLifecycle(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		withChain, err := app.VerifyOnChain(ctx, path, h.rpcURL, 20, h.token)
+		withChain, err := cli.VerifyOnChain(ctx, path, h.rpcURL, 20, h.token)
 		if err != nil {
 			t.Fatalf("verify --rpc: %v", err)
 		}

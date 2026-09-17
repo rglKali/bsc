@@ -15,7 +15,6 @@ import (
 	"os/signal"
 	"syscall"
 
-	"bsc/app"
 	"bsc/buildinfo"
 	"bsc/config"
 	"bsc/store"
@@ -76,7 +75,7 @@ func Root(code *int) *cobra.Command {
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
-			return app.Run(ctx, cfg)
+			return runService(ctx, cfg)
 		},
 	}
 
@@ -145,9 +144,9 @@ func inspectCmd(v *viper.Viper, code *int) *cobra.Command {
 				if cerr != nil {
 					return fmt.Errorf("config: %w", cerr)
 				}
-				rep, err = app.VerifyOnChain(cmd.Context(), args[0], cfg.RPCURL, cfg.RPCRateLimit, cfg.Token)
+				rep, err = VerifyOnChain(cmd.Context(), args[0], cfg.RPCURL, cfg.RPCRateLimit, cfg.Token)
 			} else {
-				rep, err = app.Verify(args[0])
+				rep, err = Verify(args[0])
 			}
 			if err != nil {
 				return err

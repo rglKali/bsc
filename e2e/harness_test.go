@@ -26,8 +26,8 @@ import (
 	"time"
 
 	"bsc/api"
-	"bsc/app"
 	"bsc/chain"
+	"bsc/cli"
 	"bsc/keys"
 	"bsc/sender"
 	"bsc/store"
@@ -389,7 +389,7 @@ func (h *harness) audit() (store.Report, error) {
 	if err := f.Close(); err != nil {
 		return store.Report{}, err
 	}
-	return app.Verify(path)
+	return cli.Verify(path)
 }
 
 // dump prints the live flows, which is almost always the answer to "why is it stuck".

@@ -3,9 +3,9 @@
 //
 // Derivation is flat: a wallet's private key is HMAC-SHA256(master, id) where
 // id is the 16-byte UUID the store assigns it. There is no hierarchy in the key
-// material — the app/deposit-wallet relationship is metadata the store holds,
-// not structure baked into keys — which keeps every wallet independent of every
-// other and means a leaked child key reveals nothing about its siblings.
+// material — a wallet's drain_to is metadata the store holds, not structure
+// baked into keys — which keeps every wallet independent of every other and
+// means a leaked child key reveals nothing about its siblings.
 //
 // HMAC-SHA256 as a KDF and ECDSA signing are unrelated primitives over the same
 // secret, and HMAC's PRF security is what makes deriving keys this way sound.

@@ -24,7 +24,6 @@ import (
 	"bsc/keys"
 	"math/big"
 
-	"bsc/money"
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -212,7 +211,7 @@ func (s *Server) wallet(tx *store.Tx, r *http.Request) (store.Wallet, error) {
 // caller that wants dollars does that conversion in its own books where it
 // knows the exchange rate it means (§36).
 func amount(field, s string) (*big.Int, error) {
-	v, err := money.ParsePositive(s)
+	v, err := parsePositiveAmount(s)
 	if err != nil {
 		return nil, fail(http.StatusBadRequest, "bad_amount",
 			"%s must be a positive whole number of base units, as a decimal string (got %q)", field, s)

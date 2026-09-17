@@ -1,5 +1,13 @@
-// Package ui serves the optional local dashboard: a plain HTML/CSS/JS page for
-// watching the service work and driving it by hand.
+package api
+
+import (
+	"embed"
+	"io/fs"
+	"net/http"
+)
+
+// The dashboard's static files: a plain HTML/CSS/JS page for watching the
+// service work and driving it by hand.
 //
 // It is disabled by default and, when on, exists only on the one listener —
 // which is loopback-only and unauthenticated by design. It is a sandbox and an
@@ -10,20 +18,13 @@
 // service is one binary with one file on disk, and a dashboard that needed npm
 // to change would not survive contact with that. Everything here is embedded,
 // so there is still exactly one artefact to ship.
-package ui
-
-import (
-	"embed"
-	"io/fs"
-	"net/http"
-)
 
 //go:embed static
 var static embed.FS
 
-// Handler serves the dashboard's static files. Mount it under a prefix with
+// dashboard serves the static files. Mount it under a prefix with
 // http.StripPrefix.
-func Handler() (http.Handler, error) {
+func dashboard() (http.Handler, error) {
 	sub, err := fs.Sub(static, "static")
 	if err != nil {
 		return nil, err

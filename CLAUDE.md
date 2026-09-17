@@ -30,12 +30,12 @@ Single test / package:
 
 ```sh
 go test ./store/ -run TestVerify -v
-go test ./app/ -run TestFullMoneyLifecycle -v   # the end-to-end money path
+go test ./cli/ -run TestFullMoneyLifecycle -v   # the end-to-end money path
 ```
 
 **Every test runs offline.** There is no build tag, no skipped suite, no
 `TEST_DATABASE_URL`, and nothing to start first: the store is a temp file, the
-chain is a simulator (`app/chainsim_test.go`), and HTTP is `httptest`. Keep it
+chain is a simulator (`cli/chainsim_test.go`), and HTTP is `httptest`. Keep it
 that way — a test that needs infrastructure will not get run.
 
 ## What this service is
@@ -71,20 +71,18 @@ where, read §33 — that is the decision being reopened.
 | Package | Role |
 | --- | --- |
 | `store/` | the only datastore: one bbolt file, packed-binary records, hand-rolled indexes |
-| `money/` | one unit — the token's base units — and the parsing that guards it |
 | `keys/` | HMAC key derivation from the master secret |
 | `chain/` | the single RPC client (one rate-limit budget for everything) |
-| `flow/` | pure pipeline rules: state machines and the work predicates. **No I/O** |
-| `engine/` | transactional glue: advance a flow, settle it, evaluate the work rules |
+| `flow/` | the pipeline. `flow.go`/`rules.go` are pure — state machines and work predicates, no I/O; `engine.go` is the transactional half that advances and settles them inside a store transaction |
 | `watcher/` | follows finalized blocks; one write transaction per block |
 | `sender/` | the only code that touches private keys: signs, journals, broadcasts |
 | `swap/` | router calldata, used only by the `bsc swap` command |
 | `usdt/` | generated token bindings (`task abi`) |
-| `api/` | the HTTP surface |
+| `api/` | the HTTP surface, wire amounts, and the embedded dashboard (off by default, §29) |
 | `metrics/` | the one `bsc_*` namespace, served from the same listener |
 | `buildinfo/` | the version, stamped at link time; no dependencies |
-| `ui/` | the optional dashboard, embedded and off by default (§29) |
-| `config/`, `cli/`, `app/` | configuration, the cobra command tree, composition |
+| `config/` | one configuration, from YAML and the environment |
+| `cli/` | the cobra command tree, and the wiring that runs the service (`app.go`) |
 
 ### Invariants you must not break
 

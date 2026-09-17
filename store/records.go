@@ -4,8 +4,6 @@ import (
 	"math/big"
 	"time"
 
-	"bsc/money"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/google/uuid"
 )
@@ -587,4 +585,9 @@ func decodeWithdrawal(b []byte) (Withdrawal, error) {
 }
 
 // orZero makes a nil amount usable without nil-checking money everywhere.
-func orZero(v *big.Int) *big.Int { return money.OrZero(v) }
+func orZero(v *big.Int) *big.Int {
+	if v == nil {
+		return new(big.Int)
+	}
+	return v
+}

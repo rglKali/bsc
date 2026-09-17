@@ -1,11 +1,13 @@
-// Package app wires bsc's parts together and runs them.
+package cli
+
+// Wiring: this file assembles bsc's parts and runs them, and is the only place
+// that knows how they fit together.
 //
 // One process, one store, four goroutine groups: the watcher folding finalized
 // blocks into the store, the sender signing and broadcasting, the HTTP API, and
 // a snapshotter taking consistent backups. They never call each other — work is
 // handed over as records, and the only direct coupling is a nudge from the
 // watcher to the sender so it need not poll.
-package app
 
 import (
 	"context"
@@ -33,7 +35,7 @@ import (
 // Run starts everything and blocks until ctx is cancelled. The configuration is
 // passed in rather than loaded here, so the command line owns how it is
 // assembled and this package owns only what to do with it.
-func Run(ctx context.Context, cfg config.Config) error {
+func runService(ctx context.Context, cfg config.Config) error {
 	log := slog.Default()
 
 	// The master secret is parsed before anything else opens, so a bad secret

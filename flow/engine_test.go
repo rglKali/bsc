@@ -1,4 +1,4 @@
-package engine
+package flow
 
 import (
 	"math/big"
@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"bsc/flow"
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -26,8 +25,6 @@ func hash(b byte) common.Hash {
 }
 
 func wei(v int64) *big.Int { return big.NewInt(v) }
-
-var now = time.Now().UTC()
 
 var cfg = Config{DrainThreshold: wei(100)}
 
@@ -136,11 +133,11 @@ func (f *fixture) newWithdrawal(amount int64, createdAt time.Time) store.Withdra
 }
 
 // start begins a flow and claims its wallet, then drives it to the state given.
-func (f *fixture) start(p flow.Params, state store.FlowState) store.Flow {
+func (f *fixture) start(p Params, state store.FlowState) store.Flow {
 	f.t.Helper()
 	var out store.Flow
 	f.update(func(tx *store.Tx) error {
-		fl, err := flow.Begin(p)
+		fl, err := Begin(p)
 		if err != nil {
 			return err
 		}
@@ -190,7 +187,7 @@ func TestDrainRecordsADebitAndLinksItsCredits(t *testing.T) {
 	f.credit(f.proxy, 10, 0, 500)
 	f.credit(f.proxy, 10, 1, 300)
 
-	fl := f.start(flow.Params{
+	fl := f.start(Params{
 		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: true, Now: now,
 	}, store.StateMoving)
 	fl.Amount = wei(800) // resolved when the sweep was signed
@@ -244,7 +241,7 @@ func TestDrainRecordsADebitAndLinksItsCredits(t *testing.T) {
 func TestFailedDrainBacksTheWalletOff(t *testing.T) {
 	f := newFixture(t)
 	f.credit(f.proxy, 10, 0, 500)
-	fl := f.start(flow.Params{
+	fl := f.start(Params{
 		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: true, Now: now,
 	}, store.StateMoving)
 	f.advance(fl, false)
@@ -281,7 +278,7 @@ func TestConfirmedWithdrawalIsTerminalAndStopsBeingCommitted(t *testing.T) {
 	f.credit(f.hot, 10, 0, 1_000)
 	wd := f.newWithdrawal(400, now)
 
-	fl := f.start(flow.Params{
+	fl := f.start(Params{
 		Kind: store.FlowTransfer, Wallet: f.hot.ID, To: wd.Destination,
 		Amount: wd.Amount, Withdrawal: wd.ID, Active: true, Now: now,
 	}, store.StateMoving)
@@ -316,7 +313,7 @@ func TestRevertedPayoutStaysPendingAndKeepsItsCommitment(t *testing.T) {
 	f.credit(f.hot, 10, 0, 1_000)
 	wd := f.newWithdrawal(400, now)
 
-	fl := f.start(flow.Params{
+	fl := f.start(Params{
 		Kind: store.FlowTransfer, Wallet: f.hot.ID, To: wd.Destination,
 		Amount: wd.Amount, Withdrawal: wd.ID, Active: true, Now: now,
 	}, store.StateMoving)
@@ -354,7 +351,7 @@ func TestWithdrawalThatNeverPaidStaysPending(t *testing.T) {
 	f.credit(f.hot, 10, 0, 1_000)
 	wd := f.newWithdrawal(400, now)
 
-	fl := f.start(flow.Params{
+	fl := f.start(Params{
 		Kind: store.FlowTransfer, Wallet: f.hot.ID, To: wd.Destination,
 		Amount: wd.Amount, Withdrawal: wd.ID, Active: false, Now: now,
 	}, store.StateApproving)
@@ -451,7 +448,7 @@ func TestEvaluateNeverPaysFromAProxyWallet(t *testing.T) {
 func TestEvaluateStartsNothingWhileTheWalletIsBusy(t *testing.T) {
 	f := newFixture(t)
 	f.credit(f.proxy, 10, 0, 500)
-	f.start(flow.Params{
+	f.start(Params{
 		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: true, Now: now,
 	}, store.StateMoving)
 
@@ -511,7 +508,7 @@ func TestEvaluateAllConvergesAtStartup(t *testing.T) {
 
 func TestAdvanceRefusesATerminalFlow(t *testing.T) {
 	f := newFixture(t)
-	fl := f.start(flow.Params{
+	fl := f.start(Params{
 		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: true, Now: now,
 	}, store.StateMoving)
 	fl.State = store.StateDone
@@ -533,7 +530,7 @@ func TestApprovingMarksTheWalletActive(t *testing.T) {
 		_, err := tx.SetActive(f.proxy.ID, false)
 		return err
 	})
-	fl := f.start(flow.Params{
+	fl := f.start(Params{
 		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: false, Now: now,
 	}, store.StateApproving)
 	f.advance(fl, true)
@@ -547,7 +544,7 @@ func TestApprovingMarksTheWalletActive(t *testing.T) {
 // skipped — moved nothing, so there is nothing to observe and no debit.
 func TestSkippedDrainRecordsNoDebit(t *testing.T) {
 	f := newFixture(t)
-	fl := f.start(flow.Params{
+	fl := f.start(Params{
 		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: true, Now: now,
 	}, store.StateMoving)
 	fl.Tx = common.Hash{} // nothing was broadcast
@@ -573,7 +570,7 @@ func TestSettledFeedCarriesBothKinds(t *testing.T) {
 	f := newFixture(t)
 	f.credit(f.hot, 10, 0, 1_000)
 	wd := f.newWithdrawal(400, now)
-	fl := f.start(flow.Params{
+	fl := f.start(Params{
 		Kind: store.FlowTransfer, Wallet: f.hot.ID, To: wd.Destination,
 		Amount: wd.Amount, Withdrawal: wd.ID, Active: true, Now: now,
 	}, store.StateMoving)

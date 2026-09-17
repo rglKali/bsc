@@ -1,4 +1,4 @@
-package money
+package api
 
 import (
 	"math/big"
@@ -17,12 +17,12 @@ func TestParseAcceptsWholeBaseUnits(t *testing.T) {
 		strings.Repeat("9", 78): strings.Repeat("9", 78), // a full uint256 width
 	}
 	for in, want := range cases {
-		got, err := Parse(in)
+		got, err := parseAmount(in)
 		if err != nil {
-			t.Fatalf("Parse(%q) = %v", in, err)
+			t.Fatalf("parseAmount(%q) = %v", in, err)
 		}
 		if got.String() != want {
-			t.Fatalf("Parse(%q) = %s, want %s", in, got, want)
+			t.Fatalf("parseAmount(%q) = %s, want %s", in, got, want)
 		}
 	}
 }
@@ -34,40 +34,40 @@ func TestParseRefusesAnythingButDigits(t *testing.T) {
 		"", "   ", "1.5", "0.01", "-5", "+5", "1e18", "0x10", "1_000",
 		"five", "1,000", strings.Repeat("9", 79),
 	} {
-		if _, err := Parse(in); err == nil {
-			t.Fatalf("Parse(%q) accepted", in)
+		if _, err := parseAmount(in); err == nil {
+			t.Fatalf("parseAmount(%q) accepted", in)
 		}
 	}
 }
 
 func TestParsePositiveRefusesZero(t *testing.T) {
-	if _, err := ParsePositive("0"); err == nil {
-		t.Fatal("ParsePositive(0) accepted")
+	if _, err := parsePositiveAmount("0"); err == nil {
+		t.Fatal("parsePositiveAmount(0) accepted")
 	}
-	got, err := ParsePositive("1")
+	got, err := parsePositiveAmount("1")
 	if err != nil || got.Sign() != 1 {
-		t.Fatalf("ParsePositive(1) = %v, %v", got, err)
+		t.Fatalf("parsePositiveAmount(1) = %v, %v", got, err)
 	}
 }
 
 // Every error names the field's contract, because a caller reading it is about
 // to change what it sends.
 func TestParseErrorsAreExplicable(t *testing.T) {
-	_, err := Parse("1.5")
+	_, err := parseAmount("1.5")
 	if err == nil || !strings.Contains(err.Error(), "base units") {
 		t.Fatalf("err = %v, want it to say what a valid amount is", err)
 	}
 }
 
 func TestStringAndOrZeroHandleNil(t *testing.T) {
-	if got := String(nil); got != "0" {
-		t.Fatalf("String(nil) = %q, want \"0\"", got)
+	if got := amountString(nil); got != "0" {
+		t.Fatalf("amountString(nil) = %q, want \"0\"", got)
 	}
-	if got := OrZero(nil); got == nil || got.Sign() != 0 {
-		t.Fatalf("OrZero(nil) = %v", got)
+	if got := orZero(nil); got == nil || got.Sign() != 0 {
+		t.Fatalf("orZero(nil) = %v", got)
 	}
 	v := big.NewInt(7)
-	if got := String(v); got != "7" {
-		t.Fatalf("String(7) = %q", got)
+	if got := amountString(v); got != "7" {
+		t.Fatalf("amountString(7) = %q", got)
 	}
 }
