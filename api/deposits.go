@@ -3,90 +3,106 @@ package api
 import (
 	"net/http"
 
+	"bsc/money"
 	"bsc/store"
+
+	"github.com/google/uuid"
 )
 
-// depositView is one arrival, as a payments provider would describe it: your
-// handle, an amount, whether you can spend it, and a hash to look up if you ever
-// need to prove it happened.
+// depositView is one recorded incoming transfer.
 //
-// What is deliberately absent: the block, the log index, the wei amount and the
-// hash of the drain that swept it. Those are how the money moved, not what
-// happened to the app's balance, and an app that never sees them cannot come to
-// depend on them (§27).
+// `id` is the feed cursor: opaque but ordered, so two ids compare in the order
+// the chain produced them. Pass the last one back as `since`; never parse one.
+//
+// `amount` is the chain's own figure. There is no second unit beside it and no
+// rounding applied to it, so it is exactly what a block explorer shows (§36).
 type depositView struct {
-	ID          string `json:"id"` // opaque, ordered; also the pagination cursor
-	TxHash      string `json:"tx_hash"`
-	Ref         string `json:"ref"`
-	From        string `json:"from"`
-	AmountCents string `json:"amount_cents"`
-	Status      string `json:"status"`
-	CreatedAt   string `json:"created_at"`
+	ID     string `json:"id"`
+	TxHash string `json:"tx_hash"`
+	Wallet string `json:"wallet"` // the ref the money landed on
+	From   string `json:"from"`
+	Amount string `json:"amount"`
+	Status string `json:"status"`
+
+	// SweptBy is the debit that carried this credit onward, present once it has
+	// been forwarded. Following it gives the transfer, the destination and the
+	// other credits that left in the same movement (§42).
+	SweptBy   string `json:"swept_by,omitempty"`
+	SweptTx   string `json:"swept_tx,omitempty"`
+	CreatedAt string `json:"created_at"`
 }
 
-// listDeposits serves the one cursor in the system.
+// listDeposits reads the whole feed. Deposits are unsolicited — nobody can know
+// one is coming — so the caller asks "what is new since I last looked".
 //
-// Deposits are unsolicited — an app cannot know one is coming — so it needs
-// "what is new since I last looked". Every deposit has a unique id by
-// construction, and that id doubles as the cursor: pass the last one back as
-// ?since. It is opaque and ordered — compare it, pass it back, don't parse it.
-//
-// ?status=pending instead returns what is not yet spendable.
+// The feed is global. Under the old design each app read its own slice, which
+// was a tenancy boundary; there is one caller now and it wants every deposit
+// bsc has seen, filtered by wallet on its own side if at all (§37).
 func (s *Server) listDeposits(w http.ResponseWriter, r *http.Request) error {
 	limit, err := limitParam(r, 100, 1000)
 	if err != nil {
 		return err
 	}
-	q := r.URL.Query()
-	if q.Get("status") == "pending" {
-		return s.listOpenDeposits(w, r, limit)
-	}
-	if s := q.Get("status"); s != "" {
-		return fail(http.StatusBadRequest, "bad_status", "the only supported status filter is pending")
-	}
-
-	since, err := store.ParseCursor(q.Get("since"))
+	since, err := store.ParseCursor(r.URL.Query().Get("since"))
 	if err != nil {
 		return fail(http.StatusBadRequest, "bad_cursor", "%v", err)
 	}
 
-	var (
-		out    []depositView
-		cursor store.Cursor
-	)
+	out := []depositView{}
+	var next store.Cursor
 	if err := s.store.View(func(tx *store.Tx) error {
-		a, err := s.app(tx, r)
+		deposits, cursor, err := tx.DepositsSince(since, limit)
 		if err != nil {
 			return err
 		}
-		list, next, err := tx.DepositsSince(a.Slug, since, limit)
-		if err != nil {
-			return err
-		}
-		cursor = next
-		out, err = viewDeposits(tx, list)
+		next = cursor
+		out, err = viewDeposits(tx, deposits)
 		return err
 	}); err != nil {
 		return err
 	}
-	// The cursor comes back unchanged when nothing is new, so an app that keeps
-	// passing it never loses its place.
-	writeJSON(w, http.StatusOK, map[string]any{"deposits": out, "cursor": cursor.String()})
+	writeJSON(w, http.StatusOK, map[string]any{"deposits": out, "cursor": next.String()})
 	return nil
 }
 
-func (s *Server) listOpenDeposits(w http.ResponseWriter, r *http.Request, limit int) error {
-	var out []depositView
+// listWalletDeposits is one wallet's history, oldest first.
+func (s *Server) listWalletDeposits(w http.ResponseWriter, r *http.Request) error {
+	limit, err := limitParam(r, 100, 1000)
+	if err != nil {
+		return err
+	}
+	status := r.URL.Query().Get("status")
+	if status != "" && status != "received" && status != "forwarded" {
+		return fail(http.StatusBadRequest, "bad_status", "status must be received, forwarded, or omitted")
+	}
+
+	out := []depositView{}
 	if err := s.store.View(func(tx *store.Tx) error {
-		a, err := s.app(tx, r)
+		wallet, err := s.wallet(tx, r)
 		if err != nil {
 			return err
 		}
-		list, err := tx.OpenDeposits(a.Slug, limit)
+		var deposits []store.Deposit
+		if status == "received" && wallet.Proxies() {
+			// The open index is exactly this set on a forwarding wallet, so ask
+			// it rather than filtering the whole history.
+			deposits, err = tx.OpenDeposits(wallet.ID, limit)
+		} else {
+			deposits, err = tx.WalletDeposits(wallet.ID, limit)
+		}
 		if err != nil {
 			return err
 		}
-		out, err = viewDeposits(tx, list)
+		if status != "" {
+			kept := deposits[:0]
+			for _, d := range deposits {
+				if d.Status.String() == status {
+					kept = append(kept, d)
+				}
+			}
+			deposits = kept
+		}
+		out, err = viewDeposits(tx, deposits)
 		return err
 	}); err != nil {
 		return err
@@ -95,13 +111,16 @@ func (s *Server) listOpenDeposits(w http.ResponseWriter, r *http.Request, limit 
 	return nil
 }
 
-// viewDeposits renders deposits, resolving each wallet's ref so an app sees its
-// own handle rather than an address it never chose.
-func viewDeposits(tx *store.Tx, list []store.Deposit) ([]depositView, error) {
-	out := make([]depositView, 0, len(list))
-	refs := make(map[string]string, len(list))
-	for _, d := range list {
-		ref, ok := refs[d.Wallet.String()]
+// viewDeposits renders records, resolving each one's wallet to the ref its
+// caller knows it by and each debit link to that debit's transfer. Both are
+// cached per page, so a page of credits swept by one drain costs two lookups
+// rather than two per row.
+func viewDeposits(tx *store.Tx, deposits []store.Deposit) ([]depositView, error) {
+	refs := map[uuid.UUID]string{}
+	sweeps := map[uuid.UUID]string{}
+	out := make([]depositView, 0, len(deposits))
+	for _, d := range deposits {
+		ref, ok := refs[d.Wallet]
 		if !ok {
 			w, found, err := tx.Wallet(d.Wallet)
 			if err != nil {
@@ -110,13 +129,33 @@ func viewDeposits(tx *store.Tx, list []store.Deposit) ([]depositView, error) {
 			if found {
 				ref = w.Ref
 			}
-			refs[d.Wallet.String()] = ref
+			refs[d.Wallet] = ref
 		}
-		out = append(out, depositView{
-			ID: d.Cursor().String(), TxHash: hashStr(d.TxHash), Ref: ref,
-			From: d.From.Hex(), AmountCents: d.Cents.String(),
-			Status: d.Status.String(), CreatedAt: stamp(d.CreatedAt),
-		})
+		view := depositView{
+			ID:        d.Cursor().String(),
+			TxHash:    d.TxHash.Hex(),
+			Wallet:    ref,
+			From:      d.From.Hex(),
+			Amount:    money.String(d.Amount),
+			Status:    d.Status.String(),
+			CreatedAt: stamp(d.CreatedAt),
+		}
+		if d.SweptBy != uuid.Nil {
+			view.SweptBy = d.SweptBy.String()
+			hash, ok := sweeps[d.SweptBy]
+			if !ok {
+				wd, found, err := tx.Withdrawal(d.SweptBy)
+				if err != nil {
+					return nil, err
+				}
+				if found {
+					hash = wd.TxHash.Hex()
+				}
+				sweeps[d.SweptBy] = hash
+			}
+			view.SweptTx = hash
+		}
+		out = append(out, view)
 	}
 	return out, nil
 }

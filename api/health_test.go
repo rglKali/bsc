@@ -5,11 +5,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
-
-	"bsc/store"
-
-	"github.com/google/uuid"
 )
 
 func healthOf(t *testing.T, f *fixture) (int, healthView) {
@@ -53,59 +48,34 @@ func TestHealthIsDegradedWhileTooFarBehind(t *testing.T) {
 	}
 }
 
-// A master below the gas floor is the service's *normal* self-healing case: the
-// top-up sells collected fees back into gas without being asked. Reporting it
-// would cry wolf on something that fixes itself every day.
-func TestLowMasterAloneIsNotDegraded(t *testing.T) {
+// A master below the gas floor used to be self-healing: the automatic top-up
+// sold collected fees back into gas, so reporting it would have cried wolf.
+// Nothing refills it automatically any more, so being low *is* the finding —
+// it is the signal to go and run `bsc swap` (§38).
+func TestLowMasterIsDegraded(t *testing.T) {
 	f := newFixture(t)
 	f.srv.opts.Health = Health{
-		MasterGas:  func() *big.Int { return big.NewInt(1) }, // far below the floor
-		Floor:      big.NewInt(50_000_000_000_000_000),       // 0.05
-		SwapAmount: big.NewInt(10),                           // and it can afford to swap
+		MasterGas: func() *big.Int { return big.NewInt(1) }, // far below the floor
+		Floor:     big.NewInt(50_000_000_000_000_000),       // 0.05
 	}
-	// Give the master the tokens a top-up would sell.
-	f.creditMaster(t, big.NewInt(100))
-
-	if code, view := healthOf(t, f); code != http.StatusOK || view.Status != "ok" {
-		t.Fatalf("status %d %+v — a low master that can refill itself is not a finding", code, view)
-	}
-}
-
-// Low *and* unable to refill is the combination nothing self-corrects, and the
-// one an operator has to be told about.
-func TestLowMasterWithNothingToSellIsDegraded(t *testing.T) {
-	f := newFixture(t)
-	f.srv.opts.Health = Health{
-		MasterGas:  func() *big.Int { return big.NewInt(1) },
-		Floor:      big.NewInt(50_000_000_000_000_000),
-		SwapAmount: big.NewInt(10),
-	}
-	f.creditMaster(t, big.NewInt(9)) // one short of a swap
 
 	code, view := healthOf(t, f)
 	if code != http.StatusServiceUnavailable || view.Status != "degraded" {
 		t.Fatalf("status %d %+v", code, view)
 	}
-	if !strings.Contains(strings.Join(view.Reasons, " "), "does not fix itself") {
+	if !strings.Contains(strings.Join(view.Reasons, " "), "gas floor") {
 		t.Fatalf("reasons = %v", view.Reasons)
 	}
 }
 
-// Swapping off turns every low master into a human's problem, because the thing
-// that would have refilled it is not running.
-func TestLowMasterIsDegradedWhenSwappingIsOff(t *testing.T) {
+func TestMasterAboveTheFloorIsQuiet(t *testing.T) {
 	f := newFixture(t)
 	f.srv.opts.Health = Health{
-		MasterGas:  func() *big.Int { return big.NewInt(1) },
-		Floor:      big.NewInt(50_000_000_000_000_000),
-		SwapAmount: nil, // disabled
+		MasterGas: func() *big.Int { return big.NewInt(60_000_000_000_000_000) },
+		Floor:     big.NewInt(50_000_000_000_000_000),
 	}
-	code, view := healthOf(t, f)
-	if code != http.StatusServiceUnavailable {
+	if code, view := healthOf(t, f); code != http.StatusOK || view.Status != "ok" {
 		t.Fatalf("status %d %+v", code, view)
-	}
-	if !strings.Contains(strings.Join(view.Reasons, " "), "disabled") {
-		t.Fatalf("reasons = %v", view.Reasons)
 	}
 }
 
@@ -115,9 +85,8 @@ func TestLowMasterIsDegradedWhenSwappingIsOff(t *testing.T) {
 func TestUnobservedGasIsNotAFinding(t *testing.T) {
 	f := newFixture(t)
 	f.srv.opts.Health = Health{
-		MasterGas:  func() *big.Int { return nil },
-		Floor:      big.NewInt(50_000_000_000_000_000),
-		SwapAmount: big.NewInt(10),
+		MasterGas: func() *big.Int { return nil },
+		Floor:     big.NewInt(50_000_000_000_000_000),
 	}
 	if code, _ := healthOf(t, f); code != http.StatusOK {
 		t.Fatalf("status %d, want an unobserved balance to be silent", code)
@@ -130,29 +99,5 @@ func TestHealthWithoutAGasSourceIsQuiet(t *testing.T) {
 	f := newFixture(t)
 	if code, view := healthOf(t, f); code != http.StatusOK || len(view.Reasons) != 0 {
 		t.Fatalf("status %d %+v", code, view)
-	}
-}
-
-// creditMaster gives the master wallet a token balance, which is what a gas
-// top-up would sell. The master is recorded like any other wallet precisely so
-// its collected fees are visible this way.
-func (f *fixture) creditMaster(t *testing.T, amount *big.Int) {
-	t.Helper()
-	master, err := f.srv.ring.Master()
-	if err != nil {
-		t.Fatalf("master key: %v", err)
-	}
-	// Mirrors app.ensureMasterWallet: the master is KindMaster and belongs to no
-	// app, which is also why it needs no slug.
-	if err := f.st.Update(func(tx *store.Tx) error {
-		return tx.PutWallet(store.Wallet{
-			ID:        uuid.NewSHA1(uuid.NameSpaceOID, master.Address.Bytes()),
-			Kind:      store.KindMaster,
-			Address:   master.Address,
-			Balance:   amount,
-			CreatedAt: time.Now().UTC(),
-		})
-	}); err != nil {
-		t.Fatalf("credit master: %v", err)
 	}
 }

@@ -218,7 +218,7 @@
     {
       "type": "timeseries",
       "title": "Deposits",
-      "description": "Ignored transfers are credited to the balance but not recorded, so the two differ by design.",
+      "description": "Every transfer to a managed wallet is recorded, with no threshold and no minimum (\u00a736). A rate of zero here while transfers are seen means the watcher is matching nothing.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -234,11 +234,6 @@
           "expr": "rate(bsc_deposits_recorded_total[5m])",
           "legendFormat": "recorded",
           "refId": "A"
-        },
-        {
-          "expr": "rate(bsc_deposits_ignored_total[5m])",
-          "legendFormat": "ignored (below minimum)",
-          "refId": "B"
         }
       ],
       "fieldConfig": {
@@ -486,7 +481,7 @@
     {
       "type": "timeseries",
       "title": "Problems",
-      "description": "Any balance underflow is a bug in our own accounting. Insufficient balance means the materialised balance drifted from the chain.",
+      "description": "Any balance underflow is a bug in our own accounting. Insufficient balance means our record of custody drifted from what the chain holds.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -499,18 +494,13 @@
       },
       "targets": [
         {
-          "expr": "rate(bsc_solvency_shortfalls_total[5m])",
-          "legendFormat": "solvency shortfalls",
-          "refId": "D"
-        },
-        {
           "expr": "rate(bsc_balance_underflows_total[5m])",
           "legendFormat": "balance underflows",
           "refId": "A"
         },
         {
-          "expr": "sum by (app) (rate(bsc_insufficient_balance_total[5m]))",
-          "legendFormat": "insufficient balance {{app}}",
+          "expr": "sum by (ref) (rate(bsc_insufficient_balance_total[5m]))",
+          "legendFormat": "insufficient balance {{ref}}",
           "refId": "B"
         },
         {

@@ -1,15 +1,22 @@
 # Roadmap — possible extensions
 
-**Status: built.** Nothing here is required; the service runs without any of it.
-Roughly ordered by value, none committed.
+**The service is built and none of this is required to run it.** Roughly ordered
+by value, nothing committed.
+
+## The service above this one
+
+- [ ] **A ledger service.** This is the big one, and it is the reason §33 removed
+  the ledger from bsc rather than improving it. Apps, users, referral trees,
+  balances, fees and statements all belong to something that owns those concepts.
+  bsc's job in that world is unchanged: derive wallets, report deposits, execute
+  withdrawals. Keep the boundary at "who owes whom" — the moment bsc needs to
+  answer that, it is a payments provider again.
 
 ## Observability
 
-- [ ] **Alerting on a master the top-up cannot save.** Gas top-ups already defend
-  `bsc_master_bnb_wei`, so a bare low-balance rule would mostly fire on a
-  condition that fixes itself. What is worth alerting on is the residue: the
-  balance low *and* staying low, which means there were no fees to sell, the swap
-  kept reverting, or `swap.enabled=false`. Belongs in Grafana, not the service.
+- [ ] **Alerting on the master.** `bsc_master_bnb_wei` below `gas.floor_wei` is
+  now an unambiguous page: nothing refills it automatically (§38, §44). A
+  `for: 15m` guard is enough, since the balance only ever falls.
 - [ ] **Stuck-transaction alert.** Alert on `bsc_in_flight_age_seconds` rather
   than on `bsc_transactions_in_flight`, which is 0 or 1 by design.
 - [ ] Tracing across the deposit → drain → settlement path.
@@ -18,13 +25,24 @@ Roughly ordered by value, none committed.
 
 - [ ] **Cancelling a withdrawal.** A withdrawal has no failure state (§28): a
   payout that reverts is retried forever, so one to a destination that can never
-  receive holds its reservation indefinitely and only an operator editing the
+  receive holds its commitment indefinitely and only an operator editing the
   record frees it. A cancel is the obvious remedy and is unbuilt on purpose —
-  releasing a reservation for a payout that might still land is the one way this
+  releasing a commitment for a payout that might still land is the one way this
   design could pay twice. It needs a signed-and-broadcast check that is certain,
   not merely probable, which in practice means "no journal entry and no in-flight
-  tx for this withdrawal" evaluated inside the same write transaction that
-  releases.
+  tx for this withdrawal" evaluated inside the same write transaction.
+
+## Topology
+
+- [ ] **Sweeping a whole subtree on demand.** `drain_to` forwards on a threshold;
+  there is no way to say "move everything now, whatever it is worth". Useful
+  before a migration or a wind-down. It is a flow like any other, but it needs a
+  deliberate way to bypass `money.drain_threshold_wei` without making the
+  threshold meaningless.
+- [ ] **Per-wallet drain thresholds.** One global number is blunt when wallets
+  differ by orders of magnitude. The field would sit beside `drain_to` and
+  default to the config value; the rule already reads a threshold per wallet, so
+  this is a record change and nothing else.
 
 ## Throughput
 
@@ -33,60 +51,49 @@ Roughly ordered by value, none committed.
   current block times. If that ever binds, the path is a persisted nonce counter
   plus concurrent in-flight transactions plus nonce-ordered gap recovery, all
   confined to `sender/`, since every flow is already a state machine that does
-  not care how many others are running. The counter would have to resync
-  whenever the operator signs by hand.
+  not care how many others are running. The counter would have to resync whenever
+  `bsc swap` signs by hand.
 
 ## Delivery
 
-- [ ] **Streamed pull (SSE).** Real-time without the delivery state that
-  webhooks would impose: the app dials us, and reconnecting carries its cursor,
-  so at-least-once and replay still fall out of the deposit log. It is a small
-  addition on the same substrate, worth doing the day a poll interval is
-  genuinely too slow. See `ARCHITECTURE.md` decision 16.
+- [ ] **Streamed pull (SSE).** Real-time without the delivery state that webhooks
+  would impose: the caller dials us, and reconnecting carries its cursor, so
+  at-least-once and replay still fall out of the deposit log. It is a small
+  addition on the same substrate, worth doing the day a poll interval is genuinely
+  too slow. See `ARCHITECTURE.md` decision 16.
 
 ## Features
 
-- [ ] **Percentage fees.** `FeePolicy` already carries `bps` and `max_fee_cents`,
-  refused while non-zero. Implementing them is a change to `FeePolicy.Quote` and
-  nothing else — no migration, because both fields already exist on disk. Keep
-  the result a whole number of cents: a fractional fee would put a fraction into
-  the ledger and cost it the exactness everything else depends on.
-
-- [ ] **Give `FeePolicy` its own version byte.** It is encoded *inside* `App` and
-  `Withdrawal` rather than as a record of its own, so the usual "append a field,
-  bump the constant" does not work for it: appending shifts every byte after it
-  in the parent. Percentage fees do not need this, but any *new* fee field does,
-  and it is a few lines before first deploy against a migration afterwards.
-
-- [ ] **Decide what the house dust is ultimately for** (see §25). It accrues and
-  is swept as income today, which is standard and is stated in the integrator
-  contract. Because the excess is *derived* (`custody − ledger`) rather than
-  stored, redirecting some of it later needs no migration — which is exactly why
-  the question can stay open.
 - [ ] **Multi-token support.** USDT only today. The token is configurable but
   singular; per-token balances would touch the wallet record and every amount in
-  the API.
-- [ ] Per-app withdrawal rate limits, if `min_cents` proves too blunt a brake.
+  the API. Cheaper than it was — there is no ledger to denominate any more.
+- [ ] **Deposit-address expiry or rotation.** Addresses are permanent per ref
+  (§17). A caller with a very large, mostly-dormant address book pays for that in
+  the watcher's match set — measured, that is ~5 MB of heap and ~40 ms of startup
+  at 100k addresses, and the per-block cost does not move at all, since matching
+  is local and the rules only visit wallets a block touched. Nothing has needed
+  it yet, and at these numbers nothing will for a long while.
+- [ ] Per-wallet withdrawal rate limits.
 
 ## Housekeeping
 
-- [ ] **Pending-balance counter.** `…/balance` sums an app's open deposit records
-  on each read. That is proportional to what is awaiting a drain rather than to
-  how many addresses exist, so it is already much better bounded than it was; a
-  counter would fix it outright at the cost of more state for the audit to verify.
-
-- [ ] **Credit a deposit before its drain lands.** Today a deposit is spendable
-  only once swept into the hot wallet, because a payout is drawn from there. An
-  app could be credited at detection if the withdrawal path were willing to pull
-  funds forward — demand-draining the addresses it needs before paying. Better
-  for apps, strictly more machinery, and not needed while drains are fast.
+- [ ] **A committed-total counter.** `available` sums a wallet's open withdrawals
+  on each read. That is proportional to what is in flight rather than to history,
+  so it is well bounded already; a counter would fix it outright at the cost of
+  more state for the audit to verify — which is exactly the trade §39 declined.
 - [ ] Off-box snapshot shipping, with encryption at that boundary.
 
 ## Explicitly not doing
 
-- **Draining the master.** You hold `BSC_MASTER_SECRET` and can move collected fees
-  out at any time; building it in adds risk for no gain. (Swapping USDT→BNB was
-  in this list and is now **built** — see decisions 19 and 20.)
-- **An admin API or UI.** With slug addressing the app API is already the
-  operator's read surface, and no write-side operator action survived scrutiny.
+- **A ledger, a fee, or a house sweep.** All three existed and all three were
+  removed (§33). If one comes back, it belongs in the service above this one.
+- **Automatic trading.** `bsc swap` is attended on purpose (§38, §44): it is the
+  only operation whose outcome is a price rather than a yes or no, and an
+  automatic one is predictable in timing and size to anyone watching the
+  mempool.
+- **Draining the master.** You hold `BSC_MASTER_SECRET` and can move funds out at
+  any time; building it in adds risk for no gain.
+- **An admin API.** With ref addressing the caller API is already the operator's
+  read surface, and no write-side operator action survived scrutiny that is not
+  already a CLI command.
 - **Webhooks or a broker.** See `ARCHITECTURE.md` decision 16.

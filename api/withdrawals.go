@@ -1,269 +1,353 @@
 package api
 
 import (
-	"errors"
+	"math/big"
 	"net/http"
 	"time"
 
+	"bsc/money"
 	"bsc/store"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/google/uuid"
 )
 
-type quoteBody struct {
-	AmountCents string `json:"amount_cents"`
-	DeductFee   bool   `json:"deduct_fee"`
-}
-
-type quoteView struct {
-	AmountCents string `json:"amount_cents"`
-	FeeCents    string `json:"fee_cents"`
-	PayoutCents string `json:"payout_cents"`
-	DebitCents  string `json:"debit_cents"`
-}
-
 type withdrawalBody struct {
-	Destination    string `json:"destination"`
-	AmountCents    string `json:"amount_cents"`
-	DeductFee      bool   `json:"deduct_fee"`
+	To     string `json:"to"`
+	Amount string `json:"amount"`
+
+	// Fee is an extra amount debited from the same wallet to the one that pays
+	// for gas, asked for in the same call. bsc does not decide what a fee is or
+	// how it is computed — the caller has already done that and is telling us a
+	// number. All bsc adds is that the two are accepted together and that it
+	// knows where to send it (§43).
+	Fee string `json:"fee,omitempty"`
+
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
+// createdView is what a create returns: the payout, and the fee if one was
+// asked for. They are two records because they are two transfers — nothing can
+// make two ERC-20 transfers atomic without a contract — so the response names
+// both rather than pretending they are one thing (§43).
+type createdView struct {
+	Payout withdrawalView  `json:"payout"`
+	Fee    *withdrawalView `json:"fee,omitempty"`
+}
+
 // withdrawalView is one payout. `status` is `pending` until the transfer is
-// final, then `debited`; there is no failure state, because a request that
+// final, then `confirmed`; there is no failure state, because a request that
 // cannot be honoured was refused at creation and anything that goes wrong
 // afterwards is retried rather than handed back (§28).
 //
-// LastError and Attempts are therefore diagnostics, not a verdict. They exist
-// because the app API is also the operator's read surface (§13): a payout that
-// keeps reverting must be visible to a human without inventing a terminal state
-// the app would have to compensate for.
+// LastError and Attempts are therefore diagnostics, not a verdict. A payout
+// whose attempts climb into double digits is something a human must look at.
 type withdrawalView struct {
-	ID          string `json:"id"`
-	Status      string `json:"status"`
-	Destination string `json:"destination"`
-	AmountCents string `json:"amount_cents"`
-	FeeCents    string `json:"fee_cents"`
-	PayoutCents string `json:"payout_cents"`
-	DeductFee   bool   `json:"deduct_fee"`
-	TxHash      string `json:"tx_hash"`
-	Attempts    uint32 `json:"attempts"`
-	LastError   string `json:"last_error,omitempty"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
+	ID     string `json:"id"`
+	Wallet string `json:"wallet"`
+	// Reason is why the money left: `payout` for one a caller asked for, `fee`
+	// for the charge that accompanied it, `drain` for one bsc made on its own.
+	// A drain is never pending — it is recorded once it has already happened.
+	Reason string `json:"reason"`
+	// PartOf links a fee back to its payout.
+	PartOf string `json:"part_of,omitempty"`
+	Status string `json:"status"`
+	To     string `json:"to"`
+	Amount string `json:"amount"`
+	TxHash string `json:"tx_hash,omitempty"`
+	// Cursor is this debit's position in the settled feed, present once it has
+	// settled. Pass the last one back as `since`.
+	Cursor    string `json:"cursor,omitempty"`
+	Attempts  uint32 `json:"attempts"`
+	LastError string `json:"last_error,omitempty"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
-// quoteWithdrawal prices a withdrawal without touching anything, so an app can
-// show a user the fee before committing to it.
-func (s *Server) quoteWithdrawal(w http.ResponseWriter, r *http.Request) error {
-	var body quoteBody
-	if err := decode(r, &body); err != nil {
-		return err
-	}
-	value, err := cents("amount_cents", body.AmountCents)
-	if err != nil {
-		return err
-	}
-
-	var q store.Quote
-	if err := s.store.View(func(tx *store.Tx) error {
-		a, err := s.app(tx, r)
-		if err != nil {
-			return err
-		}
-		q, err = a.Fee.Quote(value, body.DeductFee)
-		return quoteError(err)
-	}); err != nil {
-		return err
-	}
-	writeJSON(w, http.StatusOK, quoteView{
-		AmountCents: q.Amount.String(), FeeCents: q.Fee.String(),
-		PayoutCents: q.Payout.String(), DebitCents: q.Debit.String(),
-	})
-	return nil
-}
-
-// createWithdrawal accepts a payout, reserves the money behind it, and leaves
-// the rest to the work rules — the flow starts on the next evaluation rather
-// than being enqueued here.
+// createWithdrawal accepts a payout from one wallet and leaves the rest to the
+// work rules — the flow starts on the next evaluation rather than being
+// enqueued here.
 //
-// One reservation covers payout and fee together. They used to be held apart
-// because they left at different moments; now the fee never leaves at all — it
-// is collected by staying in the wallet uncredited — so both are released by the
-// same event and one figure is the whole commitment (§24).
+// The overdraft guard is what replaced the reservation ledger, and it is a
+// comparison rather than a balance of its own: what this wallet already owes on
+// pending withdrawals, plus what is being asked for now, against what the chain
+// says it holds. Both sides are records that already exist, so there is nothing
+// to keep in step and nothing to recompute (§39).
 func (s *Server) createWithdrawal(w http.ResponseWriter, r *http.Request) error {
 	var body withdrawalBody
 	if err := decode(r, &body); err != nil {
 		return err
 	}
-	if !common.IsHexAddress(body.Destination) {
-		return fail(http.StatusBadRequest, "bad_destination", "destination must be a hex address")
-	}
-	// The zero address passes IsHexAddress and is the one destination a valid
-	// address can be while still being unpayable: the token reverts on it, so
-	// the payout could never land however many times it was retried. A
-	// withdrawal has no failure state (§28), which means anything permanently
-	// unpayable has to be caught here — before it becomes a record holding a
-	// reservation forever — rather than settled into one afterwards. It costs
-	// no RPC call, so there is no reason not to.
-	if common.HexToAddress(body.Destination) == (common.Address{}) {
-		return fail(http.StatusBadRequest, "bad_destination",
-			"destination is the zero address, which cannot receive tokens")
-	}
-	value, err := cents("amount_cents", body.AmountCents)
+	dest, err := address("to", body.To)
 	if err != nil {
 		return err
+	}
+	value, err := amount("amount", body.Amount)
+	if err != nil {
+		return err
+	}
+	var fee *big.Int
+	if body.Fee != "" {
+		if fee, err = amount("fee", body.Fee); err != nil {
+			return err
+		}
 	}
 	if len(body.IdempotencyKey) > 128 {
 		return fail(http.StatusBadRequest, "bad_idempotency_key", "idempotency_key must be at most 128 characters")
 	}
-
-	// The ledger is only current once the watcher reaches the head: a drain that
-	// settled in an unprocessed block has not been credited yet. Reserving
-	// against a stale ledger would refuse money the app really has, and the
-	// honest answer while catching up is "not yet" rather than a wrong number.
+	// Balances are only current at the head, and accepting a payout against a
+	// stale one could overdraw the wallet. Reads keep working throughout; only
+	// spending is held back (§21).
 	if behind := s.sync.Behind(); behind > s.opts.MaxLagBlocks {
 		return fail(http.StatusServiceUnavailable, "syncing",
 			"chain sync is %d blocks behind; withdrawals are paused until it catches up", behind)
 	}
+	// Where a fee goes is not a policy decision, so it is not configurable: it
+	// goes to the wallet that pays for every transfer bsc makes. That is also
+	// what refills the gas the service spends and earns nothing back (§38).
+	master, err := s.ring.Master()
+	if err != nil {
+		return err
+	}
 
-	destination := common.HexToAddress(body.Destination)
-	var (
-		wd     store.Withdrawal
-		replay bool
-	)
+	var out createdView
 	if err := s.store.Update(func(tx *store.Tx) error {
-		a, err := s.app(tx, r)
+		wallet, err := s.wallet(tx, r)
 		if err != nil {
 			return err
 		}
-		if a.Paused {
-			return fail(http.StatusForbidden, "app_paused", "app %q has payouts paused", a.Slug)
+		// A forwarding wallet's balance is on its way somewhere else. Paying out
+		// of it would race the drain for the same funds, which is why the two
+		// configurations are mutually exclusive rather than merely unusual (§32).
+		if wallet.Proxies() {
+			return fail(http.StatusUnprocessableEntity, "wallet_forwards",
+				"wallet %q forwards to %s; it cannot pay out. Clear drain_to first",
+				wallet.Ref, wallet.DrainTo.Hex())
+		}
+		if wallet.Paused {
+			return fail(http.StatusForbidden, "paused", "wallet %q has payouts paused", wallet.Ref)
 		}
 
 		if body.IdempotencyKey != "" {
-			prior, ok, err := tx.WithdrawalByKey(a.Slug, body.IdempotencyKey)
+			existing, ok, err := tx.WithdrawalByKey(body.IdempotencyKey)
 			if err != nil {
 				return err
 			}
 			if ok {
-				// A retry after a timeout replays the original rather than
-				// paying twice — the dedup v1 got for free from the broker.
-				if prior.Destination != destination || prior.Amount != value || prior.DeductFee != body.DeductFee {
+				// A retry after a timeout replays the original. The same key
+				// with different parameters is a conflict, not a second payout.
+				if existing.Destination != dest || existing.Amount.Cmp(value) != 0 || existing.Wallet != wallet.ID {
 					return fail(http.StatusConflict, "idempotency_conflict",
-						"idempotency_key %q was already used with different parameters", body.IdempotencyKey)
+						"idempotency_key %q was used with different parameters", body.IdempotencyKey)
 				}
-				wd, replay = prior, true
-				return nil
+				out, err = replay(tx, existing, wallet.Ref)
+				return err
 			}
 		}
 
-		q, err := a.Fee.Quote(value, body.DeductFee)
-		if err != nil {
-			return quoteError(err)
+		// Payout and fee are checked together, so a wallet can never end up
+		// having accepted one and refused the other. That joint acceptance is
+		// the whole of what bsc adds over two separate calls — it cannot make
+		// the two transfers land together (§43).
+		total := new(big.Int).Set(value)
+		if fee != nil {
+			total.Add(total, fee)
 		}
+		committed, err := tx.Committed(wallet.ID)
+		if err != nil {
+			return err
+		}
+		want := new(big.Int).Add(committed, total)
+		held := money.OrZero(wallet.Balance)
+		if want.Cmp(held) > 0 {
+			return fail(http.StatusUnprocessableEntity, "insufficient_balance",
+				"wallet %q holds %s and already owes %s; %s more cannot be promised",
+				wallet.Ref, held, committed, total)
+		}
+
 		now := time.Now().UTC()
-		wd = store.Withdrawal{
-			ID: uuid.New(), App: a.Slug, Destination: destination,
-			Amount: q.Amount, Fee: q.Fee, Payout: q.Payout, Debit: q.Debit,
-			DeductFee: body.DeductFee, Status: store.WithdrawalPending,
-			IdempotencyKey: body.IdempotencyKey, FeeSnapshot: a.Fee,
+		payout := store.Withdrawal{
+			ID: uuid.New(), Wallet: wallet.ID, Reason: store.ReasonPayout,
+			Destination: dest, Amount: value,
+			Status: store.WithdrawalPending, IdempotencyKey: body.IdempotencyKey,
 			CreatedAt: now, UpdatedAt: now,
 		}
-		if _, err := tx.ReserveLedger(a.Slug, q.Debit); err != nil {
-			return reserveError(err)
+		if err := tx.PutWithdrawal(payout); err != nil {
+			return err
 		}
-		return tx.PutWithdrawal(wd)
+		out = createdView{Payout: viewWithdrawal(payout, wallet.Ref)}
+
+		if fee == nil {
+			return nil
+		}
+		charge := store.Withdrawal{
+			ID: uuid.New(), Wallet: wallet.ID, Reason: store.ReasonFee,
+			PartOf: payout.ID, Destination: master.Address, Amount: fee,
+			// A moment later, so oldest-first runs the payout before its fee.
+			// Nothing depends on that order; it is simply the one that reads
+			// right if somebody is watching.
+			Status: store.WithdrawalPending, CreatedAt: now.Add(time.Millisecond),
+			UpdatedAt: now,
+		}
+		if err := tx.PutWithdrawal(charge); err != nil {
+			return err
+		}
+		view := viewWithdrawal(charge, wallet.Ref)
+		out.Fee = &view
+		return nil
 	}); err != nil {
 		return err
 	}
-
-	if !replay {
-		s.opts.Notify()
-		s.log.Info("withdrawal accepted",
-			"app", wd.App, "id", wd.ID, "payout_cents", wd.Payout, "fee_cents", wd.Fee,
-			"to", wd.Destination.Hex())
-	}
-	status := http.StatusCreated
-	if replay {
-		status = http.StatusOK
-	}
-	writeJSON(w, status, viewWithdrawal(wd))
+	s.opts.Notify()
+	writeJSON(w, http.StatusCreated, out)
 	return nil
+}
+
+// replay rebuilds the response for an idempotent retry, finding the fee that
+// was created alongside the payout. The fee has no key of its own — one request
+// is one key — so it is found by the link back to its payout.
+func replay(tx *store.Tx, payout store.Withdrawal, ref string) (createdView, error) {
+	out := createdView{Payout: viewWithdrawal(payout, ref)}
+	siblings, err := tx.WalletWithdrawals(payout.Wallet, 0)
+	if err != nil {
+		return out, err
+	}
+	for _, wd := range siblings {
+		if wd.PartOf == payout.ID {
+			view := viewWithdrawal(wd, ref)
+			out.Fee = &view
+			break
+		}
+	}
+	return out, nil
 }
 
 func (s *Server) getWithdrawal(w http.ResponseWriter, r *http.Request) error {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		return fail(http.StatusBadRequest, "bad_id", "withdrawal id must be a UUID")
+		return fail(http.StatusBadRequest, "bad_id", "withdrawal id must be a uuid")
 	}
-	var wd store.Withdrawal
+	var out withdrawalView
 	if err := s.store.View(func(tx *store.Tx) error {
-		a, err := s.app(tx, r)
+		wd, ok, err := tx.Withdrawal(id)
 		if err != nil {
 			return err
 		}
-		got, ok, err := tx.Withdrawal(id)
+		if !ok {
+			return fail(http.StatusNotFound, "unknown_withdrawal", "no withdrawal %s", id)
+		}
+		ref, err := refOf(tx, wd.Wallet)
 		if err != nil {
 			return err
 		}
-		// Scoped to the app in the path, so one app cannot read another's
-		// withdrawal by guessing an id.
-		if !ok || got.App != a.Slug {
-			return errNotFound
-		}
-		wd = got
+		out = viewWithdrawal(wd, ref)
 		return nil
 	}); err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, viewWithdrawal(wd))
+	writeJSON(w, http.StatusOK, out)
 	return nil
 }
 
-// listWithdrawals serves the outstanding set by default. Withdrawals need no
-// cursor: the app minted the ids and only wants to know which of its own have
-// not settled yet.
+// listWithdrawals is the settled-debit feed: everything that has left a managed
+// wallet, in the order the chain settled it.
+//
+// It is the mirror of the deposit feed, and reads the same way — `since` a
+// cursor, opaque and ordered. Pending payouts are deliberately absent: this is a
+// record of what happened, and a promise has not happened yet. A caller tracking
+// one it asked for holds the id and reads it directly; a caller watching for
+// completions walks this feed.
+//
+// Drains and fees are included by default. They are real movements between real
+// addresses, and a caller reconciling a wallet needs them — leaving them out
+// would put back the special case that treating every movement as a debit
+// removed (§42). `?reason=payout` narrows it.
 func (s *Server) listWithdrawals(w http.ResponseWriter, r *http.Request) error {
-	status := r.URL.Query().Get("status")
-	if status == "" {
-		status = "pending"
-	}
 	limit, err := limitParam(r, 100, 1000)
 	if err != nil {
 		return err
 	}
+	reason, err := reasonParam(r)
+	if err != nil {
+		return err
+	}
+	since, err := store.ParseSettled(r.URL.Query().Get("since"))
+	if err != nil {
+		return fail(http.StatusBadRequest, "bad_cursor", "%v", err)
+	}
 
-	var out []withdrawalView
+	out := []withdrawalView{}
+	var next store.Settled
 	if err := s.store.View(func(tx *store.Tx) error {
-		a, err := s.app(tx, r)
+		records, cursor, err := tx.SettledSince(since, limit)
 		if err != nil {
 			return err
 		}
-		var list []store.Withdrawal
-		switch status {
-		case "pending":
-			list, err = tx.OpenWithdrawals(a.Slug)
-		case "debited", "all":
-			list, err = tx.Withdrawals(a.Slug, 0)
-		default:
-			return fail(http.StatusBadRequest, "bad_status", "status must be pending, debited or all")
+		next = cursor
+		out, err = viewWithdrawals(tx, filterReason(records, reason), 0)
+		return err
+	}); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"withdrawals": out, "cursor": next.String()})
+	return nil
+}
+
+// reasonParam reads the reason filter. Everything by default: the feed is what
+// left, whoever decided it should.
+func reasonParam(r *http.Request) (string, error) {
+	switch got := r.URL.Query().Get("reason"); got {
+	case "", "all":
+		return "all", nil
+	case "payout", "fee", "drain":
+		return got, nil
+	default:
+		return "", fail(http.StatusBadRequest, "bad_reason", "reason must be payout, fee, drain or all")
+	}
+}
+
+func filterReason(records []store.Withdrawal, reason string) []store.Withdrawal {
+	if reason == "all" {
+		return records
+	}
+	kept := records[:0]
+	for _, wd := range records {
+		if wd.Reason.String() == reason {
+			kept = append(kept, wd)
+		}
+	}
+	return kept
+}
+
+func (s *Server) listWalletWithdrawals(w http.ResponseWriter, r *http.Request) error {
+	limit, err := limitParam(r, 100, 1000)
+	if err != nil {
+		return err
+	}
+	status, err := statusParam(r)
+	if err != nil {
+		return err
+	}
+	reason, err := reasonParam(r)
+	if err != nil {
+		return err
+	}
+	out := []withdrawalView{}
+	if err := s.store.View(func(tx *store.Tx) error {
+		wallet, err := s.wallet(tx, r)
+		if err != nil {
+			return err
+		}
+		var records []store.Withdrawal
+		if status == "pending" {
+			records, err = tx.WalletOpenWithdrawals(wallet.ID)
+		} else {
+			records, err = tx.WalletWithdrawals(wallet.ID, limit)
 		}
 		if err != nil {
 			return err
 		}
-		out = make([]withdrawalView, 0, len(list))
-		for _, wd := range list {
-			if status == "debited" && wd.Status != store.WithdrawalDebited {
-				continue
-			}
-			out = append(out, viewWithdrawal(wd))
-			if len(out) >= limit {
-				break
-			}
-		}
-		return nil
+		out, err = viewWithdrawals(tx, filterReason(filterStatus(records, status), reason), limit)
+		return err
 	}); err != nil {
 		return err
 	}
@@ -271,36 +355,74 @@ func (s *Server) listWithdrawals(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func viewWithdrawal(wd store.Withdrawal) withdrawalView {
-	return withdrawalView{
-		ID: wd.ID.String(), Status: wd.Status.String(), Destination: wd.Destination.Hex(),
-		AmountCents: wd.Amount.String(), FeeCents: wd.Fee.String(),
-		PayoutCents: wd.Payout.String(), DeductFee: wd.DeductFee,
+// statusParam reads the status filter for a single wallet's history. Pending is
+// the default: the settled ones are on the feed, so what is worth asking a
+// wallet directly is what it still owes.
+func statusParam(r *http.Request) (string, error) {
+	switch got := r.URL.Query().Get("status"); got {
+	case "":
+		return "pending", nil
+	case "pending", "confirmed", "all":
+		return got, nil
+	default:
+		return "", fail(http.StatusBadRequest, "bad_status", "status must be pending, confirmed or all")
+	}
+}
+
+func filterStatus(records []store.Withdrawal, status string) []store.Withdrawal {
+	if status == "all" {
+		return records
+	}
+	kept := records[:0]
+	for _, wd := range records {
+		if wd.Status.String() == status {
+			kept = append(kept, wd)
+		}
+	}
+	return kept
+}
+
+func viewWithdrawals(tx *store.Tx, records []store.Withdrawal, limit int) ([]withdrawalView, error) {
+	refs := map[string]string{}
+	out := make([]withdrawalView, 0, len(records))
+	for _, wd := range records {
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+		ref, ok := refs[string(wd.Wallet[:])]
+		if !ok {
+			var err error
+			if ref, err = refOf(tx, wd.Wallet); err != nil {
+				return nil, err
+			}
+			refs[string(wd.Wallet[:])] = ref
+		}
+		out = append(out, viewWithdrawal(wd, ref))
+	}
+	return out, nil
+}
+
+func refOf(tx *store.Tx, id uuid.UUID) (string, error) {
+	w, ok, err := tx.Wallet(id)
+	if err != nil || !ok {
+		return "", err
+	}
+	return w.Ref, nil
+}
+
+func viewWithdrawal(wd store.Withdrawal, ref string) withdrawalView {
+	v := withdrawalView{
+		ID: wd.ID.String(), Wallet: ref,
+		Reason: wd.Reason.String(), Status: wd.Status.String(),
+		To: wd.Destination.Hex(), Amount: money.String(wd.Amount),
 		TxHash: hashStr(wd.TxHash), Attempts: wd.Attempts, LastError: wd.Error,
 		CreatedAt: stamp(wd.CreatedAt), UpdatedAt: stamp(wd.UpdatedAt),
 	}
-}
-
-// quoteError maps a pricing refusal to a status the caller can act on.
-func quoteError(err error) error {
-	switch {
-	case err == nil:
-		return nil
-	case errors.Is(err, store.ErrBelowMinimum):
-		return fail(http.StatusUnprocessableEntity, "below_minimum", "%v", err)
-	case errors.Is(err, store.ErrFeeExceedsAmount):
-		return fail(http.StatusUnprocessableEntity, "fee_exceeds_amount", "%v", err)
-	case errors.Is(err, store.ErrUnsupportedPolicy):
-		return fail(http.StatusConflict, "unsupported_fee_policy", "%v", err)
+	if wd.PartOf != uuid.Nil {
+		v.PartOf = wd.PartOf.String()
 	}
-	return fail(http.StatusBadRequest, "bad_amount", "%v", err)
-}
-
-// reserveError turns an overdraft into a refusal rather than a transfer that
-// reverts on-chain after the gas is spent.
-func reserveError(err error) error {
-	if errors.Is(err, store.ErrInsufficient) {
-		return fail(http.StatusUnprocessableEntity, "insufficient_balance", "%v", err)
+	if wd.Status.IsTerminal() {
+		v.Cursor = wd.Settled().String()
 	}
-	return err
+	return v
 }

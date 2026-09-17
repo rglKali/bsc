@@ -16,7 +16,7 @@ watcher to the sender so it need not poll.
                     │      │                      │                │
                     │      ▼                      ▼                │
                     │  ┌──────────────────────────────────────┐    │
-  apps (HTTP) ─────▶│  │  bbolt: state/ · data/ · log/        │    │
+  caller (HTTP) ───▶│  │  bbolt: state/ · data/ · log/        │    │
                     │  └──────────────────────────────────────┘    │
                     │      ▲                      ▲                │
                     │     api                 snapshotter          │
@@ -30,30 +30,81 @@ watcher to the sender so it need not poll.
 | api | the HTTP surface plus `/metrics`, `/healthz` and — when enabled — `/ui/` | requests |
 | snapshotter | periodic consistent backups | interval |
 
+## What this service is, and is not
+
+bsc is a **low-level primitive**. It derives wallets, observes what lands on
+them, forwards the ones configured to forward, and executes payouts on request.
+
+It is deliberately *not* a payments provider. It keeps no ledger, charges no fee,
+and has no notion of an app, a user or an account. It knows what the chain says
+about addresses it derived, and nothing else. A service that needs to know whose
+money is where keeps those books above bsc, which is the shape that lets this one
+stay small and auditable (§33).
+
+That is a reversal. v2.0 grew an internal cents ledger, a fee policy, a house
+sweep and an automatic gas top-up, and each was individually reasonable — but
+together they made bsc a full service with a chain underneath rather than a
+chain primitive. §32 through §40 record the retreat.
+
 ## The store is the design
 
 Everything is one bbolt file in three namespaces:
 
 ```
 state/   cursor · flows · in-flight tx index · send journal        self-pruning
-data/    apps (with their ledgers) · wallets · their indexes       catastrophic to lose
-log/     deposits · withdrawals — the ledger's entries             kept forever
+data/    wallets · their indexes · the token identity              catastrophic to lose
+log/     deposits · withdrawals                                    kept forever
 ```
 
 Records are hand-packed binary — a 20-byte address is 20 bytes, an amount is its
 native 32-byte big-endian form — each with a leading version byte, so a new field
-is an append rather than a migration. Sorted keys do real work: the deposit
+will be an append rather than a migration. Nothing has been deployed, so nothing
+yet reads a version other than 1; the byte is there because it is the one thing
+that cannot be added cheaply later, since giving existing records a version is
+itself the migration it exists to avoid. Every enum is densely numbered and no
+value is reserved: there is no data from a previous shape to avoid colliding
+with (§45). Sorted keys do real work: the deposit
 cursor *is* `<block><logindex>`, the send journal is nonce-ordered per signer,
 and deposit dedup is a property of the key rather than a constraint to check.
 
+Every composite key is built from **fixed-width** parts (a 16-byte wallet id, a
+12-byte cursor), so they concatenate unambiguously with no separator. The
+`<slug>\0<rest>` scoping the app model needed is gone along with the apps (§32).
+
 Having one store is what makes a finalized block atomic. Applying one commits, in
-a single transaction: confirmations for transactions that landed, balance credits
-and debits, deposit records, any new work the rules imply, and the cursor. There
-is no second system to keep in step, so there is nothing to reconcile afterwards
-and no dedup window to tune.
+a single transaction: confirmations for transactions that landed, balance changes,
+deposit records, any new work the rules imply, and the cursor. There is no second
+system to keep in step, so there is nothing to reconcile afterwards and no dedup
+window to tune.
 
 The cost is hand-rolled secondary indexes, maintained inside the same transaction
 as the record they index. `bsc inspect` exists to catch exactly that class of bug.
+
+### How big it gets
+
+Measured, with 100k managed wallets in a real store:
+
+| | |
+| --- | --- |
+| the watched-address set | **5.3 MB** of heap (`map[Address]uuid`, ~40 B/entry) |
+| resident after loading it | ~40 MB, the rest being bbolt's mmap made resident by the scan — file-backed and evictable, not memory we hold |
+| the database file | 68 MB — a 150-byte wallet record, plus its two lookup indexes and bbolt's ~50% leaf fill on random-order inserts |
+| startup | `AddrSet.Load` 14 ms, `EvaluateAll` 27 ms |
+| per block | **unchanged by wallet count** |
+
+That last row is the one that matters. `eth_getBlockReceipts` returns a whole
+block and every log is tested against the in-memory set, so the RPC side never
+learns how many addresses we watch — there is no filter to hand 100k addresses
+to. The rules then visit only the wallets a block touched
+(`watcher/apply.go`, `evaluateTouched`) and the wallets with an open withdrawal,
+so per-block cost is proportional to activity.
+
+The map grows in powers of two, so its cost is a step function rather than a
+line: 100k sits in a 131,072-slot table, ~115k tips it to the next and roughly
+10 MB, where it stays until ~230k. A million addresses measures 84 MB.
+
+What actually grows without bound is `log/`, which is kept forever: a deposit is
+138 bytes plus about as much index again.
 
 ## Pipelines: sequential execution, persisted waiting
 
@@ -61,26 +112,21 @@ Every piece of chain work is a **flow**: a persisted state machine.
 
 | Flow | States (skipping to the last if the wallet is already active) |
 | --- | --- |
-| `drain` | `funding` → `approving` → `sweeping` → `done` \| `failed` |
-| `withdrawal` | `funding` → `approving` → `paying` → `done` \| `failed` |
-| `house_sweep` | `funding` → `approving` → `sweeping_house` → `done` \| `failed` |
-| `gas_topup` | `approving_router` → `swapping` → `done` \| `failed` |
+| `transfer` | `funding` → `approving` → `moving` → `done` \| `failed` |
 | `prewarm` | `funding` → `approving` → `done` |
 
-These are **internal** and no app ever sees one (§27). The overlap with the
-app-facing vocabulary is accidental and worth keeping straight: a flow's `failed`
-is one attempt giving up, which for a withdrawal means a backoff and a retry, not
-a verdict — a *withdrawal* has no failed status at all (§28).
+A transfer is a drain or a payout depending on one thing: whether it carries an
+amount and the withdrawal id that goes with it. Set, and it pays that withdrawal
+exactly; unset, and it sweeps whatever the wallet holds. They were two kinds
+running byte-identical state machines until §46.
+
+These are **internal** and no caller ever sees one. The overlap with the
+caller-facing vocabulary is accidental and worth keeping straight: a flow's
+`failed` is one attempt giving up, which for a withdrawal means a backoff and a
+retry, not a verdict — a *withdrawal* has no failed status at all (§28).
 
 Activation is not a separate flow — funding and approving are simply the prefix
 of whatever needed an inactive wallet.
-
-`sweeping` and `sweeping_house` are distinct states for the same reason the
-wallets are distinct. `sweeping` moves a deposit wallet's *whole* balance, which
-is only ever correct there: everything on a deposit address is owed to the app.
-`sweeping_house` draws on the top-level wallet, which holds the app's money
-alongside the house's, so it moves a computed difference — `balanceOf` less the
-ledger, resolved at signing time — and never the balance (§25).
 
 A flow's **state is the instruction**. `funding` means "the funding transfer still
 needs to go out", and the record carries everything that transfer needs, so
@@ -96,86 +142,64 @@ Rather than "a deposit creates a drain job", the service states what should exis
 and converges on it. The rules are evaluated inside the block transaction, right
 after any flow terminates, and once at startup:
 
-> a **deposit** wallet with `balance ≥ money.drain_threshold_wei`, no live flow, and past its retry deadline is owed a **drain**
-> an app with a pending withdrawal, an idle top-level, and past its retry deadline is owed a **withdrawal**
-> an app whose wallet holds more than its ledger, by at least `money.house_sweep_min_cents`, is owed a **house sweep**
+> a wallet with a **`drain_to`**, a balance at or above `money.drain_threshold_wei`,
+> no live flow, and past its retry deadline is owed a **drain**
+>
+> a wallet **without** a `drain_to`, with a pending withdrawal, no live flow, not
+> paused, and past its retry deadline is owed a **withdrawal**
 
-Two deposits in one block are credited before the check runs, so the wallet is
+Those two are mutually exclusive by construction, which is the point of putting
+the topology on the wallet: there is no ordering to get right between them and no
+layer above them to arbitrate (§32).
+
+Two deposits in one block are applied before the check runs, so the wallet is
 evaluated once with the summed balance and exactly one drain starts. A deposit
 landing *during* a drain finds the wallet busy and starts nothing — and the
 evaluation after that drain terminates sees the leftover and drains it, so funds
-cannot be stranded by arriving between the balance read and the signature. A
-deposit landing during *activation* needs nothing at all, because the sweep reads
-`balanceOf` when it signs.
+cannot be stranded by arriving between the balance read and the signature.
 
 Since the rules read current state rather than react to events, the startup pass
 converges whatever was missed while the process was down.
 
-## Money accounting
+## Money
 
-An app owns one top-level hot wallet; its deposit addresses drain into it. Two
-quantities live side by side, in two units, and confusing them is the bug this
-part of the design exists to prevent:
+There is one quantity and one unit: **custody**, in the token's own base units.
 
 ```
-ledger  (cents)   what the app is owed     ← credited deposits − settled withdrawals
-custody (wei)     what the wallet holds    ← every transfer the watcher observed
-                  custody − ledger = the house's
+custody   what the address holds, accumulated from every Transfer observed
+committed what pending withdrawals have promised out of it
+available custody − committed
 ```
 
-The chain can say how much a wallet holds. It can never say whose it is: one hot
-wallet carries the app's money, the fees we have charged and sub-cent dust in a
-single number. So the app-facing balance is a **ledger**, and the wallet balance
-means custody and nothing else (§22).
+The chain can say how much a wallet holds. It cannot say whose it is — and bsc no
+longer pretends to know, because nobody ever told it. `available` is not a
+statement about ownership; it is the most a new payout may ask for without
+overdrawing the address.
 
-- `available` = ledger − reserved — what the app may spend now
-- `reserved` — held by pending withdrawals, payout and fee together
-- `pending` — recorded deposits whose drain has not landed: real, not yet
-  spendable, and counted from the deposit records rather than from what the
-  deposit wallets hold, because those also carry dust nobody was credited for
-- `total` — the three added up, so an app never has to work out which pair to add
+That overdraft guard is the whole of what replaced the reservation ledger:
+`committed + amount ≤ balance`, computed from records that already exist, checked
+before anything is signed (§39). There is nothing materialised to keep in step,
+so there is nothing that can drift.
 
-The three parts partition the ledger, which is what lets a deposit's status name
-the bucket it is in: a `pending` deposit is what `pending` counts, a `credited`
-one is in `available` (§27).
-
-The ledger is **materialised for reads and recomputable from `log/`**, which is
-the property the old chain-materialised balance could not offer: `bsc inspect`
-rebuilds it from credited deposits and settled withdrawals and compares. It also
-checks the inequality that matters — custody ≥ ledger, per app — which is the
-first time this service has been able to assert that it is solvent.
-
-### Where the fee goes
-
-A withdrawal takes **one** reservation covering payout and fee, because both
-leave the ledger at the same moment. Only the payout moves on-chain. The fee is
-collected by *not* crediting it: it stays in the hot wallet, above the ledger,
-and is therefore ours (§24). A withdrawal is one transfer, there is no second leg
-to fail, and there is no `partial` status.
-
-What is left over — fees, the sub-cent remainders flooring leaves behind, and
-anything a stranger sends to a managed address — is one quantity after the
-ledger, and one rule collects it: the **house sweep**, resolved at signing time
-from `balanceOf` less the ledger, deferring to any pending payout (§25).
+Nothing is scaled and nothing is rounded. Flooring to cents was the only rounding
+in the service and the only place value could go missing; with the chain's own
+units there is nothing to floor, no dust, and no house to round towards (§36).
 
 ## Nothing escapes us, with one exception
 
 Every payable address is derived by us, and every USDT `Transfer` is a log with
-`from`, `to` and `value`, so deposits, drains, payouts and sweeps are all
-observed. That is what keeps custody honest; the ledger is then derived from the
-subset of those transfers that credit somebody. USDT on BSC has no rebase, no fee-on-transfer and no balance-mutating
-admin hook, so the sum of observed transfers *is* the balance. Our own gas spend
-follows from our own receipts.
+`from`, `to` and `value`, so deposits, drains and payouts are all observed. USDT
+on BSC has no rebase, no fee-on-transfer and no balance-mutating admin hook, so
+the sum of observed transfers *is* the balance.
 
 The exception is **native BNB arriving at the master** — an operator's manual gas
-top-up is a plain value transfer, which emits no log at all, and a receipt
-carries no `value` or `to` field to fall back on. That is a single
+top-up is a plain value transfer, which emits no log at all. That is a single
 `eth_getBalance` gauge, not reconciliation, and it is the number that matters
-most operationally: a dry master stops every pipeline.
+most operationally: a dry master stops every pipeline, and since §38 nothing
+refills it without being asked.
 
 There is therefore no reconciler process. Correctness is checked where it counts:
-`balanceOf` immediately before spending, and `bsc inspect` on demand — which
-since the ledger can check the balances too, not merely the indexes.
+`balanceOf` immediately before spending, and `bsc inspect` on demand.
 
 ## Decision log
 
@@ -220,7 +244,7 @@ Add an entry rather than silently changing a documented decision.
 11. **Gas is estimated, never configured.** A deposit wallet is funded once for
     one `approve` and never needs BNB again. Only the two multipliers remain,
     because estimates go stale.
-12. **A slug identifies an app; no API keys.** Loopback-only, first-party
+12. *(A ref identifies a wallet now — see §37 — but the no-keys reasoning is unchanged.)* **A slug identifies an app; no API keys.** Loopback-only, first-party
     callers. Registration is public and idempotent; apps configure themselves.
 13. **No admin API and no UI.** With slug addressing the app API already is the
     operator's read surface. Write-side operator actions did not survive
@@ -251,7 +275,7 @@ Add an entry rather than silently changing a documented decision.
 17. **Deposit addresses are permanent per ref.** No reuse, no rotation, no expiry.
 18. **Retention.** `state/` self-prunes as flows terminate; deposits and
     withdrawals are kept forever; there is no third log to age out.
-19. **Gas top-ups swap collected fees back into native currency**, reversing v1's
+19. *(Withdrawn by §38: trading is an operator command now.)* **Gas top-ups swap collected fees back into native currency**, reversing v1's
     decision that gas replenishment stays manual. That decision reasoned the
     operator holds the key and can swap by hand — true, but it weighed an
     attended service. The top-up is a flow like any other, so it inherits the
@@ -260,7 +284,7 @@ Add an entry rather than silently changing a documented decision.
     without lifting the balance above the floor would otherwise trade away every
     fee. It is the only operation whose outcome is a price rather than a yes or
     no, so it is also the only one with a slippage bound and a deadline.
-20. **The swap uses the Uniswap-V2 router interface**, not a Universal Router,
+20. *(Still true, but of `bsc swap` rather than of a flow — see §38.)* **The swap uses the Uniswap-V2 router interface**, not a Universal Router,
     despite newer venues existing on this chain (PancakeSwap V3 SmartRouter and
     Infinity, Uniswap v4). The trade is ~10 USDT at most once an hour, where V2's
     0.25% fee costs a couple of cents more than V3's best tier — well inside the
@@ -273,7 +297,7 @@ Add an entry rather than silently changing a documented decision.
 21. **Withdrawals are refused while the chain sync is behind.** Balances are only
     current at the head, and reserving against a stale one could overdraw an app.
     Reads keep working; only spending is held back.
-22. **An app's balance is an internal ledger, not a chain balance.** The chain can
+22. *(Reversed by §33. Kept in full because the reasoning is sound for a payments provider and is exactly what bsc decided not to be.)* **An app's balance is an internal ledger, not a chain balance.** The chain can
     say how much a wallet holds; it can never say whose it is. One hot wallet
     carries the app's money, the fees we have charged and sub-cent dust in a
     single number, and every attempt to make that number mean "what the app can
@@ -295,7 +319,7 @@ Add an entry rather than silently changing a documented decision.
     Money still sitting in a deposit address cannot be paid out of the hot
     wallet, so crediting it earlier would authorise a payout with nothing behind
     it. Until then it is `pending`.
-23. **Cents on the wire; wei only where we touch the chain.** Every amount an app
+23. *(Reversed by §36.)* **Cents on the wire; wei only where we touch the chain.** Every amount an app
     sends or receives is a whole number of cents as a decimal string. Flooring to
     cents happens exactly once, when a transfer is observed, and always rounds
     towards the house. The ledger is therefore exact — every entry is a whole
@@ -313,14 +337,14 @@ Add an entry rather than silently changing a documented decision.
     that could silently confiscate most of a dollar. What replaces it,
     `money.drain_threshold_wei`, decides only whether moving the money is worth the
     gas — the app is credited either way, and sees the difference as `pending`.
-24. **A withdrawal is one transfer again, and the fee is collected by not paying
+24. *(Withdrawn by §33: there is no fee.)* **A withdrawal is one transfer again, and the fee is collected by not paying
     it.** The fee leaves the app's ledger with the payout but never moves on its
     own: it stays in the hot wallet, now belonging to the house. This supersedes
     the sequential payout→fee flow, which cost a second transaction and a second
     settlement path per withdrawal, and it deletes the accrual namespace, the
     fee reservation and the `collecting` state along with it. Payout and fee now
     share one reservation because they share one lifetime.
-25. **One rule collects everything nobody is owed.** After the ledger, the fees we
+25. *(Withdrawn by §33: bsc cannot compute an excess it has no ledger for.)* **One rule collects everything nobody is owed.** After the ledger, the fees we
     charged, the sub-cent remainders flooring left behind, and any tokens a
     stranger sent to a managed address are the same quantity: the excess of
     custody over the ledger. A single `house_sweep` flow moves it to the
@@ -372,7 +396,7 @@ Add an entry rather than silently changing a documented decision.
     another — the wallets in it were derived for that chain and the amounts are
     denominated in its token, so moving it is a migration, not a config edit.
 
-27. **The app-facing API is a payments provider's, not a chain's.** An app asks
+27. *(Recast by §36 and §37: the surface is a wallet's, and the chain's own unit is now on the wire — but the ban on machinery, and `api/contract_test.go` enforcing it, stand.)* **The app-facing API is a payments provider's, not a chain's.** An app asks
     for an address, is told what arrived and what it may spend, and asks for a
     payout. Everything about *how* that happens on-chain is now absent from the
     wire: the wei amount beside every cents amount, the block height and log
@@ -460,8 +484,8 @@ Add an entry rather than silently changing a documented decision.
     §13 said no UI, and the reasoning there was about *write* actions: nothing an
     operator needed to do was missing from the app API. That still holds, and the
     dashboard adds no write of its own — every button on it calls the same
-    `/v1/apps/...` endpoints an integrating service calls, so what you watch work
-    there is exactly what an app gets. What §13 undervalued is reading: `curl`
+    `/v1/wallets/...` endpoints an integrating service calls, so what you watch
+    work there is exactly what a caller gets. What §13 undervalued is reading: `curl`
     against six endpoints, `/metrics` in Prometheus text, and a flow table that
     was not exposed at all is a poor way to answer "why has nothing moved for ten
     minutes".
@@ -556,6 +580,357 @@ Add an entry rather than silently changing a documented decision.
     middleware. Both earn their place on a public edge; this surface is
     loopback-only and first-party, and `/metrics` already carries every quantity
     that decides whether the money moves.
+
+
+
+---
+
+## The v2.1 retreat: from provider back to primitive
+
+Everything from here supersedes something above. The short version: v2.0 added a
+ledger so that bsc could answer "what may this app spend", and answering that
+question turned out to require knowing who the app's users were, what it charged
+them, and what share of a wallet was the house's. None of that is a chain
+problem. Removing it is §32 through §40.
+
+32. **The topology is a field, not a type.** `KindTopLevel` and `KindDeposit` are
+    replaced by one nullable `drain_to` on the wallet. A wallet with one forwards
+    everything it receives; a wallet without one keeps it and can pay out.
+
+    This supersedes §4's note that the drain rule is scoped by kind. It is now
+    scoped by whether there is anywhere to drain *to*, which is the same guard
+    expressed as data — and a strictly stronger one, since a wallet with no
+    destination cannot be told to move its balance to itself under any rule.
+
+    What it buys is every topology the two-level shape could not express: chains
+    (`leaf → middle → vault`), fan-in from many wallets to one, a wallet that is
+    both a collection point and a payout source, and retargeting any of it
+    without a migration. What it costs is §35.
+
+    Forwarding and accumulating are **mutually exclusive**, enforced rather than
+    documented: a withdrawal from a forwarding wallet is refused, and a wallet
+    with a pending withdrawal cannot start forwarding. They contradict each other
+    — one empties the wallet, the other spends from it — and both racing for the
+    same funds is how a payout reverts.
+
+33. **The ledger, the fee and the house sweep are all gone.** §22 made an
+    internal cents ledger the authority on what an app may spend. §24 collected a
+    fee by not crediting it. §25 swept the excess of custody over that ledger to
+    a collector. All three are removed, and so is the `App` record they hung off.
+
+    The reasoning that put them there still holds *for a payments provider*. The
+    error was that bsc is not one. Each addition was small and each was correct
+    in isolation; together they meant this service had to know who an app's users
+    were, what it charged them, and which share of a wallet belonged to whom —
+    questions a chain gateway has no way to answer and no business asking.
+
+    The replacement is a service boundary: whatever keeps the books does so above
+    bsc, and asks bsc to move money. A fee becomes two withdrawals — one to the
+    user, one to yourself. The house's share becomes a withdrawal to wherever you
+    keep it. Both are things the caller already knows how to express, and bsc no
+    longer needs a concept for either.
+
+    The cost is honest: bsc can no longer tell you it is solvent for a given
+    tenant, because it does not know what a tenant is. What it can still tell
+    you, and now checks, is that no wallet has promised more than it holds (§40).
+
+34. **A deposit's status says where the money is, not who is owed it.**
+    `pending → credited` becomes `received → forwarded`. The words changed
+    because the meaning did: `credited` was a statement about a ledger, and
+    there is no ledger to be credited to.
+
+    A deposit on a wallet that accumulates stays `received` forever. That is
+    terminal, not unfinished — the money is exactly where it was meant to land.
+
+    A consequence worth stating: when a wallet forwards into another managed
+    wallet, the arrival at the far end is recorded as a deposit too. Under the
+    ledger this had to be suppressed, because crediting both ends would have
+    double-counted; with no ledger there is nothing to double-count, and the two
+    records are genuinely two observations of two transfers. The upstream
+    record's `drain_tx` equals the downstream record's `tx_hash`, so a caller
+    counting money can pair them.
+
+35. **Arbitrary topology means cycles, so cycles are refused.** `A → B → A` moves
+    the same money round and round. Every individual transfer succeeds, so
+    nothing surfaces as an error; the only symptom is the master's gas draining
+    at the rate the chain produces blocks.
+
+    The two-level design made this unrepresentable, which is a real property §32
+    gave up. It is bought back with a check at write time: setting a `drain_to`
+    walks the chain of references and refuses one that returns to the wallet
+    being configured, or runs deeper than `MaxDrainDepth`. A destination bsc does
+    not manage ends the walk — somebody else's address cannot point back at us.
+
+    `Verify` re-checks it offline, because a record edited outside the service
+    would bypass the write-time guard, and this is the failure that costs money
+    silently.
+
+36. **One unit: the token's own.** §23 put cents on the wire and made
+    `money.Scale` the single bridge to wei. Both are gone. Amounts are the
+    integer the token itself moves, as a decimal string, in every direction.
+
+    Cents existed to make the ledger exact. With no ledger, the conversion is
+    pure loss: flooring was the only rounding in the service and the only place
+    value could go missing, and it existed solely so that a sub-cent remainder
+    could be called the house's. There is no house now.
+
+    So there is no dust, no minimum, and no `MIN_DEPOSIT_WEI` successor. A
+    one-unit transfer is recorded exactly like a thousand-token one.
+    `money.drain_threshold_wei` survives and means only what it always claimed
+    to: do not spend gas moving less than this. It never decides what is
+    recorded.
+
+    The token's `decimals()` is still read and recorded in `data/`. Nothing
+    scales by it any more; it is what lets `bsc check` and the dashboard render
+    a raw integer as something a human can read, and it keeps the database's
+    identity complete.
+
+37. **No tenancy, and the caller owns the namespace.** With apps gone there is
+    nothing to scope by, so `ref` is unique across the whole service, the deposit
+    feed is global, and so is the idempotency namespace.
+
+    This is a real loss of a real property: two callers sharing one bsc can now
+    collide on a ref or a key, and either can read the other's wallets. The
+    honest framing is that §12's threat model always said as much — loopback
+    only, first-party callers, no authentication — and the per-app scoping was
+    never a security boundary, only a convenience. A caller that needs one
+    namespaces its own refs (`acme:cust-1`), which is a line in its code rather
+    than a concept in this service.
+
+38. **Trading is an operator command, not a flow.** §19 made the gas top-up
+    automatic, reasoning that an unattended service must be able to refill
+    itself. §20 chose the router for it. Both are withdrawn.
+
+    The immediate reason is §33: the top-up sold *collected fees*, and there are
+    no fees. But the better reason is the one §19 half-admitted — it is the only
+    operation whose outcome is a price rather than a yes or no, and it fired at
+    whatever moment a balance crossed a line, at whatever the market happened to
+    be. An attended trade at a price somebody has just looked at is strictly
+    better, and the automation was buying very little: a top-up is a rare event
+    with hours of warning.
+
+    What replaces it is `bsc check` (balances, the floor, the gas price, and a
+    live quote in both directions) and `bsc swap` (`--sell-usdt` for an exact
+    input, `--buy-bnb` for an exact output), plus the `bsc_master_bnb_wei` gauge
+    to alert on. `/healthz` reports a master below the floor as degraded, which
+    §31 deliberately did *not* do — because under §19 it was self-healing and
+    reporting it would have cried wolf. Nothing heals it now, so it is exactly
+    the finding.
+
+    The trade-off taken knowingly: `bsc swap` signs with the same key the running
+    service signs with, and nonces come from the chain rather than a counter
+    (§7). Run it while a transaction is in flight and one of the two is rejected.
+    That is recoverable and loud, which is the right side to fail on for a
+    command a human runs a few times a year.
+
+39. **The overdraft guard is a comparison, not a balance.** `ReserveLedger` /
+    `ReleaseLedger` are replaced by: the sum of a wallet's pending withdrawals,
+    plus the amount being asked for, against what the chain says it holds.
+
+    Both sides are records that already exist, so there is no reservation to
+    materialise, nothing to release on settlement, and no way for a stored figure
+    to drift from what it summarises. A reverted payout needs no special handling
+    either — it stays pending, so it stays committed, which is exactly right.
+
+40. **The audit checks structure and solvency per wallet.** With no ledger to
+    recompute from `log/`, `Verify` changed shape: it walks every index in both
+    directions, checks that no wallet claims a flow that does not exist and no
+    flow owns a wallet that claims another, checks that no drain chain loops, and
+    checks that no wallet has promised more than it holds.
+
+    The last is what became of §22's solvency margin. It is narrower — it cannot
+    tell you a tenant is covered, because tenants are not a thing here — but it
+    is also stricter in the one way that matters, being asked of the address that
+    actually holds the money rather than of an abstraction above it.
+
+
+41. **Activation is lazy again, and creating a wallet spends nothing.** Deriving
+    a wallet is HMAC over the master secret and a write to bbolt. It signs no
+    transaction and pays no gas. The funding transfer and the approve happen as
+    the prefix of whichever flow first needs to move money — a drain when the
+    first deposit lands, a withdrawal when the first payout is asked for.
+
+    v2.1 briefly got this wrong. The old design pre-warmed an app's *top-level*
+    wallet at registration and left deposit addresses lazy, which was right for
+    both: there was one top-level per app and it was certain to be used, while
+    most of an address book might never receive anything. Collapsing the two
+    endpoints into `POST /v1/wallets` (§32) carried the prewarm onto every
+    wallet, so a caller registering ten thousand users who never deposit would
+    have paid for twenty thousand transactions against money that never arrived.
+
+    The cost of lazy is latency, and it falls where it is cheapest: the first
+    movement is three transactions instead of one. For a deposit that is
+    invisible — the money is already recorded and the caller is not waiting on
+    the forward. For a payout it is visible, which is what `prewarm: true` on
+    create is for: a treasury you are about to draw on, where you know the
+    activation is coming anyway and would rather not pay for it in the middle of
+    the first withdrawal.
+
+    The flag is off by default and deliberately narrow. The rule is: ask for it
+    when you can name the wallet, never on anything derived per user.
+
+
+42. **A drain is a debit, not a third kind of thing.** Every movement bsc records
+    is now money arriving at a managed wallet or money leaving one. A drain is
+    the second of those, with a reason attached and a link to the credits it
+    carried.
+
+    Before, a drain existed only as a `drain_tx` stamped on the deposits it
+    swept: a movement of real money with no record of its own, discoverable only
+    by finding something it had touched. A caller reconciling a wallet had to
+    learn a third concept and a third way of finding it. Now `sum(credits) −
+    sum(debits) == balanceOf`, and nothing is outside that.
+
+    The drain's record is created **when the transfer is observed**, not when the
+    flow starts, and is born terminal. That is the honest shape: a drain is not a
+    promise. Nothing is owed to anybody while it is in flight, nobody can refuse
+    it, and it never counts against the wallet — so there is no pending phase to
+    represent. A payout is the opposite and keeps its pending phase, because
+    somebody is waiting and the money must be held.
+
+    Two consequences fall out of that asymmetry and are worth stating:
+
+    - The sweep's amount is resolved at signing time from `balanceOf`, so the
+      **sender writes it onto the flow** before broadcasting. Without that the
+      settlement would know a transfer happened but not how much moved.
+    - `/v1/withdrawals` becomes a **settled feed** with a cursor, mirroring
+      `/v1/deposits`: both are observations of transfers that have happened, both
+      resumable, both walked together to reconcile. Outstanding payouts are a
+      different question — a promise has not happened yet — and are asked of a
+      wallet (`/v1/wallets/{ref}/withdrawals`) or of an id.
+
+    The line this must not cross: these are **observations of chain transfers**,
+    not entries asserting ownership. `sum(credits) − sum(debits)` is a fact about
+    an address. The moment something in bsc computes a net position *per person*
+    from them, the ledger is back and §33 has been undone.
+
+43. **A fee is a second debit, asked for in the same call.** `POST
+    …/withdrawals` takes an optional `fee`, and bsc writes two records: the
+    payout to where the caller said, and the fee to the wallet that pays for gas.
+
+    This sits exactly on the line between business logic and primitive, so it is
+    worth being precise about which side each part lands on. bsc does **not**
+    decide what a fee is, how it is computed, who owes it, or whether one applies
+    — the caller has already answered all of that and is passing a number. What
+    bsc adds is three things it is uniquely placed to: the two are checked
+    against the balance together, so a wallet can never accept the payout and
+    refuse the fee; one idempotency key covers both; and the destination is
+    resolved rather than named, because "the wallet that pays for gas" is not a
+    policy choice.
+
+    That last one closes a loop §38 opened. bsc spends native currency and earns
+    nothing back, so the master drains monotonically and has to be topped up.
+    Fees landing there are what `bsc swap` trades — without bsc having computed a
+    fee or decided that one was due.
+
+    **It is not atomic, and it cannot be.** Two ERC-20 transfers are two
+    transactions; nothing short of a contract that performs both in one call
+    makes them land together, and that would be a second trust root to deploy
+    and maintain. So the payout can confirm while the fee is still retrying. The
+    guarantee is joint *acceptance*, never joint *settlement*, and the records
+    are two ordinary debits rather than one with two legs precisely so that the
+    partial state is representable instead of being a status that needs repair —
+    which is the mistake §24 retired the first time.
+
+    The alternative considered was one record with two transfers and a status
+    that meant "half done". It is the same `partial` state, and it would need the
+    same manual repair.
+
+
+44. **Fees came back; the automatic swap did not.** §38 removed the gas top-up
+    for two reasons, and §43 voided the first of them — there are fees again,
+    and they land on the master. The second reason stands on its own, and is why
+    trading is still a command.
+
+    A swap is the only operation whose outcome is a **price** rather than a yes
+    or no. Everything else bsc does is deterministic: a transfer lands or it
+    reverts. A swap can succeed and still be a bad outcome — a thin pool, a wide
+    spread, a sandwich. Automating it means the service takes a price nobody
+    looked at, at a moment chosen by a threshold crossing.
+
+    That last part is the specific risk, and it is worth naming: an automatic
+    top-up is **predictable**. The trigger is a public balance crossing a
+    configured floor, the size is a configured constant, and the transaction
+    goes through a public mempool. Anyone who wants to can watch for it and
+    price accordingly. Attended trading is irregular in timing and size, which
+    is not a guarantee but is a much poorer target. The amounts here are small
+    enough that this is a bounded concern rather than an alarming one — but it
+    is a concern that only exists if the trade is automated.
+
+    And the urgency the automation was defending against does not survive
+    arithmetic. The floor is a *warning* line, not empty: at 0.05 native and
+    65k gas per transfer, the master has roughly 770 transfers of runway below
+    it at 1 gwei, and still 150 at 5. Hitting the floor is a "this week" problem,
+    not a "wake somebody" one — which is exactly the kind of thing a human
+    should decide with a price in front of them.
+
+    What is worth automating is the *checking*, and that is where it now lives:
+
+        bsc swap --buy-bnb 0.1 --if-below --yes
+
+    `--if-below` no-ops unless the master is under `gas.floor_wei`, so this is a
+    crontab line. The automation is the operator's — readable, auditable,
+    switch-off-able with a `#` — rather than a flow kind, five config settings
+    and an autonomous price-taking decision inside a service whose whole claim
+    is that it does not make business decisions.
+
+    An unset floor reads as "fine", never as "always trade". Getting that
+    backwards would mean trading on every run.
+
+
+45. **No compatibility code, because there is nothing to be compatible with.**
+    Nothing has been deployed and no database exists from a previous shape, so
+    everything written to tolerate one is deleted rather than carried.
+
+    Concretely: the enum values are densely numbered again, with no gaps
+    reserved around the flow kinds and states that §33 and §38 removed; the
+    audit no longer distinguishes "a reason a newer binary wrote" from "a reason
+    nobody wrote", because a rollback to a binary that predates this shape is
+    not a thing that can happen; and the schema check refuses a version it does
+    not recognise outright rather than reserving a path to migrate one forward.
+
+    The record version byte stays, and is the one deliberate exception. It is
+    not compatibility with the past — there is none — it is the ability to
+    append a field later without a migration, and it is the only part of this
+    that cannot be bought retroactively: giving existing records a version byte
+    is itself the migration it would have saved. One byte per record, paid now,
+    while it is free.
+
+    This entry exists so that the next person to add a gap or a legacy branch
+    has to say what data it is for.
+
+
+46. **One transfer flow, not two.** `FlowDrain` and `FlowWithdrawal` ran the same
+    state machine — same states, same transitions, same terminal handling — and
+    differed only in whether the amount was carried on the flow or read from the
+    chain at signing. That is a property of a value, not a reason for a type.
+
+    They are now one `FlowTransfer`, with `StateSweeping` and `StatePaying`
+    collapsed into `StateMoving` and `ActionSweep`/`ActionPay` into `ActionMove`.
+    The sender has one `move` that reads its amount from the action: nil means
+    everything the wallet holds, set means exactly that. This is the same move
+    §42 made on the records — one mechanism, the reason attached rather than
+    baked into it.
+
+    The distinction did not disappear, it moved and got stronger. `Amount` and
+    `Withdrawal` now travel together or not at all, enforced at `flow.Begin`, so
+    settlement reads `f.Pays()` as a validated fact rather than switching on a
+    kind that nothing checked against the flow's own contents. A half-specified
+    transfer — an amount with no withdrawal, or a withdrawal with no amount —
+    is refused at creation rather than discovered when it settles.
+
+    Logs, metrics and the dashboard still say `drain` and `payout`, via
+    `Flow.Label()`. Those are the words a debit's reason already uses, so one
+    movement reads the same whether you are watching it happen or reading what
+    happened.
+
+    **This uncovered a bug that had been live since §42.** A drain's amount is
+    resolved by the sender from a balance nobody else sees, and it was never
+    written back to the flow — so every drain's debit would have recorded an
+    amount of zero. The engine test passed because it set the field by hand.
+    `move` now returns what it moved and `journalAndSend` persists it in the same
+    transaction as the journal, and the assertion lives end-to-end in `app/`,
+    which is the only level at which the gap is visible.
 
 
 ## Verification

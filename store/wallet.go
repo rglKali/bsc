@@ -11,87 +11,53 @@ import (
 )
 
 var (
-	// ErrInsufficient means a reserve would exceed the wallet's available
-	// balance. The store refuses it rather than trusting callers, because an
-	// over-reserve is an overdraft and there is no on-chain backstop for one.
-	ErrInsufficient = errors.New("store: insufficient available balance")
-
 	// ErrImmutable means a mutation tried to change a field that indexes point
 	// at. Those are fixed at creation; changing one would silently orphan an index.
 	ErrImmutable = errors.New("store: immutable wallet field changed")
+
+	// ErrDrainCycle means a DrainTo would make funds circulate between managed
+	// wallets instead of arriving somewhere.
+	ErrDrainCycle = errors.New("store: drain destination forms a cycle")
+
+	// ErrDrainDepth means a drain chain is longer than the service will follow.
+	ErrDrainDepth = errors.New("store: drain chain is too deep")
+
+	// ErrRefTaken means another wallet already holds this ref.
+	ErrRefTaken = errors.New("store: ref is already in use")
 )
 
-// --- apps ---
-
-// PutApp writes an app record. Registration is idempotent, so this is both
-// create and update (§6).
-func (t *Tx) PutApp(a App) error {
-	if err := ValidSlug(a.Slug); err != nil {
-		return err
-	}
-	return put(t, bApp, []byte(a.Slug), a.encode)
-}
-
-// App looks up one app by slug.
-func (t *Tx) App(slug string) (App, bool, error) {
-	return get(t, bApp, []byte(slug), decodeApp)
-}
-
-// Apps returns every app, slug-ordered.
-func (t *Tx) Apps() ([]App, error) {
-	var out []App
-	err := scanPrefix(t, bApp, nil, func(_, v []byte) error {
-		a, err := decodeApp(v)
-		if err != nil {
-			return err
-		}
-		out = append(out, a)
-		return nil
-	})
-	return out, err
-}
-
-// MutateApp applies fn to an app in place. The slug is immutable.
-func (t *Tx) MutateApp(slug string, fn func(*App) error) (App, error) {
-	a, ok, err := t.App(slug)
-	if err != nil {
-		return App{}, err
-	}
-	if !ok {
-		return App{}, fmt.Errorf("%w: app %q", ErrNotFound, slug)
-	}
-	before := a.Slug
-	if err := fn(&a); err != nil {
-		return App{}, err
-	}
-	if a.Slug != before {
-		return App{}, fmt.Errorf("%w: slug", ErrImmutable)
-	}
-	a.UpdatedAt = time.Now().UTC()
-	return a, t.PutApp(a)
-}
+// MaxDrainDepth bounds how long a chain of DrainTo references may be. A chain
+// costs one transfer per hop, each paid for by the master, so depth is gas
+// spent on moving the same money repeatedly. Two hops covers every topology
+// anyone has asked for; the limit exists to make an accidental chain loud.
+const MaxDrainDepth = 8
 
 // --- wallets ---
 
-// PutWallet writes a wallet and its two lookup indexes (by address, and by
-// app+ref for deposit wallets). Both are maintained in the same transaction as
-// the record — the price of hand-rolled indexes is that this must never be
-// bypassed.
+// PutWallet writes a wallet and its two lookup indexes, by address and by ref.
+// Both are maintained in the same transaction as the record — the price of
+// hand-rolled indexes is that this must never be bypassed.
 func (t *Tx) PutWallet(w Wallet) error {
-	// The master belongs to no app — it is the service's own wallet — so it is
-	// the one record with an empty slug. Everything else must name a real app.
-	if w.Kind == KindMaster {
-		if w.App != "" {
-			return fmt.Errorf("store: the master wallet must not belong to an app (got %q)", w.App)
-		}
-	} else if err := ValidSlug(w.App); err != nil {
-		return err
-	}
 	if w.ID == uuid.Nil {
 		return errors.New("store: wallet id must be set")
 	}
 	if w.Address == (common.Address{}) {
 		return errors.New("store: wallet address must be set")
+	}
+	// The master is bsc's own wallet and is addressed as the master, never by a
+	// ref. Everything else the caller created must be nameable.
+	if w.Kind == KindMaster {
+		if w.Ref != "" {
+			return fmt.Errorf("store: the master wallet must not have a ref (got %q)", w.Ref)
+		}
+		if w.Proxies() {
+			return errors.New("store: the master wallet cannot drain elsewhere")
+		}
+	} else if err := ValidRef(w.Ref); err != nil {
+		return err
+	}
+	if w.DrainTo == w.Address {
+		return fmt.Errorf("%w: wallet %s drains to itself", ErrDrainCycle, w.Ref)
 	}
 	if err := put(t, bWallet, w.ID[:], w.encode); err != nil {
 		return err
@@ -99,11 +65,8 @@ func (t *Tx) PutWallet(w Wallet) error {
 	if err := t.tx.Bucket(bAddr).Put(w.Address.Bytes(), w.ID[:]); err != nil {
 		return fmt.Errorf("store: put addr index: %w", err)
 	}
-	if w.Kind == KindDeposit {
-		if w.Ref == "" {
-			return errors.New("store: deposit wallet requires a ref")
-		}
-		if err := t.tx.Bucket(bRef).Put(scoped(w.App, []byte(w.Ref)), w.ID[:]); err != nil {
+	if w.Kind != KindMaster {
+		if err := t.tx.Bucket(bRef).Put([]byte(w.Ref), w.ID[:]); err != nil {
 			return fmt.Errorf("store: put ref index: %w", err)
 		}
 	}
@@ -127,10 +90,10 @@ func (t *Tx) WalletByAddress(addr common.Address) (Wallet, bool, error) {
 	return t.Wallet(u)
 }
 
-// WalletByRef resolves an app's deposit wallet by the handle the app chose.
-// This is what makes deposit-address creation idempotent on ref (§6).
-func (t *Tx) WalletByRef(slug, ref string) (Wallet, bool, error) {
-	id := t.tx.Bucket(bRef).Get(scoped(slug, []byte(ref)))
+// WalletByRef resolves a wallet by the handle the caller chose. Refs are unique
+// across the service, which is what makes wallet creation idempotent on ref.
+func (t *Tx) WalletByRef(ref string) (Wallet, bool, error) {
+	id := t.tx.Bucket(bRef).Get([]byte(ref))
 	if id == nil {
 		return Wallet{}, false, nil
 	}
@@ -139,8 +102,8 @@ func (t *Tx) WalletByRef(slug, ref string) (Wallet, bool, error) {
 	return t.Wallet(u)
 }
 
-// EachWallet visits every wallet. Used at startup to build the watcher's
-// address set and to evaluate the drain invariant (§4).
+// EachWallet visits every wallet, master included. Used at startup to build the
+// watcher's address set and to evaluate the work rules.
 func (t *Tx) EachWallet(fn func(Wallet) error) error {
 	return scanPrefix(t, bWallet, nil, func(_, v []byte) error {
 		w, err := decodeWallet(v)
@@ -151,17 +114,16 @@ func (t *Tx) EachWallet(fn func(Wallet) error) error {
 	})
 }
 
-// DepositWallets lists an app's deposit wallets in ref order, starting after
-// afterRef. The ref index doubles as the pagination index, so listing needs no
-// extra bucket.
-func (t *Tx) DepositWallets(slug, afterRef string, limit int) ([]Wallet, error) {
-	prefix := scopePrefix(slug)
-	start := prefix
+// Wallets lists caller-created wallets in ref order, starting after afterRef.
+// The ref index doubles as the pagination index, so listing needs no extra
+// bucket — and the master, having no ref, is correctly absent from it.
+func (t *Tx) Wallets(afterRef string, limit int) ([]Wallet, error) {
+	start := []byte(nil)
 	if afterRef != "" {
-		start = append(scoped(slug, []byte(afterRef)), 0x00) // strictly after
+		start = append([]byte(afterRef), 0x00) // strictly after
 	}
 	var out []Wallet
-	err := scanFrom(t, bRef, prefix, start, func(_, v []byte) error {
+	err := scanFrom(t, bRef, nil, start, func(_, v []byte) error {
 		var u uuid.UUID
 		copy(u[:], v)
 		w, ok, err := t.Wallet(u)
@@ -181,6 +143,11 @@ func (t *Tx) DepositWallets(slug, afterRef string, limit int) ([]Wallet, error) 
 
 // MutateWallet applies fn to a wallet in place, rejecting changes to any field
 // an index points at.
+//
+// DrainTo is deliberately *not* immutable — retargeting is the one piece of
+// configuration a wallet has — but it is validated here rather than trusted,
+// because a cycle is not a bad value the caller sees, it is gas burning until
+// somebody notices (§35).
 func (t *Tx) MutateWallet(id uuid.UUID, fn func(*Wallet) error) (Wallet, error) {
 	w, ok, err := t.Wallet(id)
 	if err != nil {
@@ -196,8 +163,6 @@ func (t *Tx) MutateWallet(id uuid.UUID, fn func(*Wallet) error) (Wallet, error) 
 	switch {
 	case w.ID != before.ID:
 		return Wallet{}, fmt.Errorf("%w: id", ErrImmutable)
-	case w.App != before.App:
-		return Wallet{}, fmt.Errorf("%w: app", ErrImmutable)
 	case w.Kind != before.Kind:
 		return Wallet{}, fmt.Errorf("%w: kind", ErrImmutable)
 	case w.Ref != before.Ref:
@@ -205,12 +170,61 @@ func (t *Tx) MutateWallet(id uuid.UUID, fn func(*Wallet) error) (Wallet, error) 
 	case w.Address != before.Address:
 		return Wallet{}, fmt.Errorf("%w: address", ErrImmutable)
 	}
+	if w.DrainTo != before.DrainTo {
+		if err := t.CheckDrainChain(w.ID, w.Address, w.DrainTo); err != nil {
+			return Wallet{}, err
+		}
+		w.UpdatedAt = time.Now().UTC()
+	}
 	return w, put(t, bWallet, w.ID[:], w.encode)
 }
 
+// CheckDrainChain walks the DrainTo references from one wallet and refuses a
+// destination that leads back to it or runs longer than MaxDrainDepth.
+//
+// The two-level design could not express a cycle: a deposit wallet drained to
+// its app's top-level and a top-level drained nowhere, so the shape was a fact
+// about the type rather than a value anyone could set. Making the topology a
+// field is what buys arbitrary shapes, and A→B→A is one of them — a loop that
+// would re-fire every block and spend the master's gas as fast as the chain
+// produces blocks. Nothing downstream would notice, because every individual
+// transfer succeeds (§35).
+//
+// A destination bsc does not manage ends the walk: it is somebody else's
+// address and cannot point back at us.
+func (t *Tx) CheckDrainChain(id uuid.UUID, from, drainTo common.Address) error {
+	if drainTo == (common.Address{}) {
+		return nil
+	}
+	if drainTo == from {
+		return fmt.Errorf("%w: wallet %s drains to itself", ErrDrainCycle, id)
+	}
+	seen := map[uuid.UUID]bool{id: true}
+	next := drainTo
+	for depth := 1; ; depth++ {
+		w, ok, err := t.WalletByAddress(next)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil // an address we do not manage: the chain ends here
+		}
+		if seen[w.ID] {
+			return fmt.Errorf("%w: %s is already in the chain from %s", ErrDrainCycle, w.Address, id)
+		}
+		if depth >= MaxDrainDepth {
+			return fmt.Errorf("%w: more than %d hops from %s", ErrDrainDepth, MaxDrainDepth, id)
+		}
+		if !w.Proxies() {
+			return nil // it accumulates: the money stops there
+		}
+		seen[w.ID] = true
+		next = w.DrainTo
+	}
+}
+
 // Credit adds an observed incoming transfer to a wallet's balance. The watcher
-// credits every transfer it sees, including sub-threshold dust, so the balance
-// tracks the chain exactly even where no deposit record was written (§8).
+// credits every transfer it sees, so the balance tracks the chain exactly.
 func (t *Tx) Credit(id uuid.UUID, amount *big.Int) (Wallet, error) {
 	return t.MutateWallet(id, func(w *Wallet) error {
 		w.Balance = new(big.Int).Add(orZero(w.Balance), orZero(amount))
@@ -239,7 +253,7 @@ func (t *Tx) Debit(id uuid.UUID, amount *big.Int) (w Wallet, underflow bool, err
 // ClaimWallet points a wallet at the flow that now owns it, refusing if another
 // flow already does. This is the enforcement point for "at most one live flow
 // per wallet" — the invariant that stops a second deposit re-triggering
-// activation (§4).
+// activation.
 func (t *Tx) ClaimWallet(id, flow uuid.UUID) (Wallet, error) {
 	return t.MutateWallet(id, func(w *Wallet) error {
 		if !w.Idle() && w.Flow != flow {
@@ -270,9 +284,9 @@ func (t *Tx) SetActive(id uuid.UUID, active bool) (Wallet, error) {
 
 // BackOff records that this wallet's flow failed and when to allow the next
 // attempt. Without it, a declarative work rule plus a flow that can fail is a
-// retry loop that burns gas as fast as the chain allows (§4). It is per-wallet
-// rather than per-drain because a failed fee sweep re-fires its rule the same
-// way — and since one flow owns a wallet at a time, one counter covers both.
+// retry loop that burns gas as fast as the chain allows. It is per-wallet
+// rather than per-flow because one flow owns a wallet at a time, so one counter
+// covers a failed drain and a failed payout alike.
 func (t *Tx) BackOff(id uuid.UUID, retryAfter time.Time) (Wallet, error) {
 	return t.MutateWallet(id, func(w *Wallet) error {
 		w.FailedAttempts++

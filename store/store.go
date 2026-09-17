@@ -13,7 +13,8 @@ import (
 
 // schemaVersion is bumped only when a change cannot be expressed as an appended
 // record field. Record-level evolution is handled by each record's version byte
-// (see codec.go), so this should move very rarely.
+// (see codec.go), so this should move very rarely — and when it does, it needs
+// a migration written for it here. There is nothing to migrate from yet.
 const schemaVersion = 1
 
 // ErrNotFound is returned by helpers whose caller cannot sensibly continue
@@ -235,11 +236,20 @@ func beUint64(b []byte) uint64 {
 func scanPrefixReverse(t *Tx, bucket, prefix []byte, fn func(k, v []byte) error) error {
 	c := t.tx.Bucket(bucket).Cursor()
 	end := prefixEnd(prefix)
-	k, v := c.Seek(end)
-	if k == nil {
+	var k, v []byte
+	switch {
+	case len(end) == 0:
+		// No upper bound: either the prefix is empty (the whole bucket) or it
+		// is all 0xFF, and both run to the end. Seeking nil would land on the
+		// *first* key rather than past the last, so the scan has to start from
+		// the end explicitly.
 		k, v = c.Last()
-	} else {
-		k, v = c.Prev()
+	default:
+		if k, v = c.Seek(end); k == nil {
+			k, v = c.Last()
+		} else {
+			k, v = c.Prev()
+		}
 	}
 	for ; k != nil && hasPrefix(k, prefix); k, v = c.Prev() {
 		if err := fn(k, v); err != nil {

@@ -1,27 +1,34 @@
-# bsc — USDT chain gateway
+# bsc — USDT chain primitive
 
-One service that hands out deposit addresses, collects what lands on them, and
-pays out — so the services using it never touch a key, a nonce, or gas.
+One service that derives wallets, tells you what lands on them, forwards the ones
+you configure to forward, and pays out on request — so the services using it
+never touch a key, a nonce, or gas.
 
 ```
-   BSC ──▶ watcher ──┐                        ┌── apps call HTTP, and poll
+   BSC ──▶ watcher ──┐                        ┌── one caller, over HTTP
                      ├──▶ bbolt (one file) ◀──┤
-   BSC ◀── sender ───┘                        └── /v1/apps/{slug}/…
+   BSC ◀── sender ───┘                        └── /v1/wallets/…
 ```
 
 It is a single process with a single file for state. Everything the service
-knows — apps, derived wallets, in-flight transactions, deposits, withdrawals —
-lives in one bbolt database, which is what lets a finalized block be applied as
-one transaction: confirmations, balances, new work and the chain cursor commit
+knows — wallets, in-flight transactions, deposits, withdrawals — lives in one
+bbolt database, which is what lets a finalized block be applied as one
+transaction: confirmations, balances, new work and the chain cursor commit
 together or not at all.
 
 Only one component ever touches private keys, and it signs one transaction at a
 time.
 
+**bsc keeps no ledger.** It does not know who owes whom, charges no fee, and has
+no notion of an app or a user. A service that needs those keeps them above bsc
+and asks bsc to move money. That boundary is the whole design — see
+`docs/ARCHITECTURE.md` §32–§40 for how it got there, which was partly by
+reversing decisions this service had already made.
+
 ## Docs
 
-- **[docs/CONSUMING.md](docs/CONSUMING.md)** — the integrator's guide: register an
-  app, hand out deposit addresses, pay out, and poll for what happened.
+- **[docs/CONSUMING.md](docs/CONSUMING.md)** — the integrator's guide: create a
+  wallet, decide whether it forwards, pay out, and poll for what happened.
 - **[docs/OPERATING.md](docs/OPERATING.md)** — day-2 guide: what to watch, gas,
   backups, recovery.
 - **[deploy/README.md](deploy/README.md)** — installing on a VPS under systemd,
@@ -38,7 +45,7 @@ Needs nothing but a BSC RPC endpoint — no database server, no message broker.
 
 ```sh
 BSC_MASTER_SECRET=<32-byte-hex> task run
-curl -X PUT localhost:8800/v1/apps/demo
+curl -X PUT localhost:8800/v1/wallets/treasury -d '{}'
 ```
 
 `BSC_MASTER_SECRET` is the whole security model: it signs everything and holds an
@@ -54,6 +61,8 @@ task unit                            # offline: no chain, no network, no server
 task cover                           # coverage across the service packages
 task inspect -- snapshot.db          # audit a database file
 task sandbox                         # testnet + the dashboard at /ui/
+bsc check                            # the master's balances and the live price
+bsc swap --buy-bnb 0.1               # refill gas, by hand, at a price you saw
 ```
 
 Every test in `task unit` runs offline — the store is a temp file, the chain is a
@@ -64,22 +73,27 @@ build-tagged and skips unless configured; see
 
 ## Design highlights
 
-**Apps get a ledger, not a chain balance.** A hot wallet holds an app's money,
-the fees we charged and sub-cent dust in one number, and nothing can make that
-number mean "what the app can spend". So balances are an internal ledger in
-**cents**, recomputable from the deposit and withdrawal logs — which also makes
-`bsc inspect` able to prove the service is solvent, app by app.
+**A wallet either forwards or accumulates.** One nullable `drain_to` is the whole
+topology: set, and everything landing on the wallet is swept onward once it is
+worth the gas; unset, and it stays there and withdrawals are paid from it. That
+replaces a hardcoded two-level shape with a field, which buys chains, fan-in, and
+retargeting without a migration — and costs one new check, because a topology you
+can set is a topology that can loop.
 
-**A withdrawal is one transfer, not two.** The business fee leaves the app's
-ledger with the payout but never moves on its own: it simply stays in the wallet
-as ours. One transaction, no half-settled state to repair by hand, and one rule
-later collects everything nobody is owed.
+**There is one unit, and it is the chain's.** Amounts are the token's own base
+units, as decimal strings, in every direction. Nothing is scaled and nothing is
+rounded, so there is no dust, no minimum, and no remainder belonging to anybody.
+
+**A withdrawal is one transfer, and it cannot fail.** What cannot be honoured is
+refused at creation and never becomes a record. What breaks afterwards is ours:
+it stays pending, keeps its commitment, and is retried. The caller is never
+handed a terminal state it has to compensate for.
 
 **Nothing is scheduled; work is declared.** Rather than enqueueing a job when a
-deposit arrives, the service states what *should* exist — "a deposit wallet
-holding more than the drain threshold, with no flow running, is owed a drain" — and
-converges on it after every block. Two deposits in one block start one drain; a
-deposit landing mid-drain is picked up by the next evaluation rather than lost.
+deposit arrives, the service states what *should* exist — "a forwarding wallet
+holding more than the drain threshold, with no flow running, is owed a drain" —
+and converges on it after every block. Two deposits in one block start one drain;
+a deposit landing mid-drain is picked up by the next evaluation rather than lost.
 
 **Crash safety is ordering, not reconciliation.** Every signed transaction is
 committed before it is broadcast, so a restart re-sends the same bytes instead of
@@ -90,7 +104,7 @@ nothing was ever written in two places.
 
 ```
 store/    the only datastore: bbolt, packed binary, hand-rolled indexes
-money/    the two units and the one conversion between them: cents and wei
+money/    one unit, and the parsing that guards it
 keys/     key derivation from the master secret
 chain/    the single RPC client, one shared rate-limit budget
 usdt/     generated token bindings (task abi) · swap/ the router calldata

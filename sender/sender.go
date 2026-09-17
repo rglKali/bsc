@@ -21,21 +21,17 @@ package sender
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
 	"strings"
-	"sync"
 	"time"
 
 	"bsc/engine"
 	"bsc/flow"
 	"bsc/keys"
 	"bsc/metrics"
-	"bsc/money"
 	"bsc/store"
-	"bsc/swap"
 	"bsc/usdt"
 
 	"github.com/ethereum/go-ethereum"
@@ -62,19 +58,9 @@ type Chain interface {
 
 // Options configure the sender.
 type Options struct {
-	ChainID      uint64
-	Token        common.Address
-	FeeCollector common.Address // where the house's money lands
+	ChainID uint64
+	Token   common.Address
 
-	// Scale converts the ledger's cents into the chain's wei. Required for the
-	// house sweep, which is the only action whose amount depends on both units.
-	Scale money.Scale
-
-	// Gas top-up. Empty Router disables swapping entirely.
-	Router            common.Address
-	WrappedNative     common.Address // the router's path hop, e.g. WBNB
-	SlippageBPS       uint32
-	SwapDeadline      time.Duration
 	FundingMultiplier float64       // BNB headroom over the estimated approve cost
 	GasMultiplier     float64       // bump over the suggested gas price
 	RebroadcastAfter  time.Duration // how long to wait before re-sending an unconfirmed transaction
@@ -92,11 +78,6 @@ type Sender struct {
 	opts   Options
 	log    *slog.Logger
 	wake   chan struct{}
-
-	// wrapped caches the router's own wrapped-native token, resolved once.
-	wrappedOnce sync.Once
-	wrapped     common.Address
-	wrappedErr  error
 }
 
 // New builds a sender. It derives the master key up front so a bad secret fails
@@ -123,12 +104,6 @@ func New(st *store.Store, ch Chain, ring *keys.Ring, opts Options) (*Sender, err
 	}
 	if opts.ChainID == 0 {
 		opts.ChainID = 56
-	}
-	if opts.SwapDeadline <= 0 {
-		opts.SwapDeadline = 5 * time.Minute
-	}
-	if opts.SlippageBPS == 0 {
-		opts.SlippageBPS = 100 // 1%
 	}
 	return &Sender{
 		store:  st,
@@ -242,13 +217,10 @@ func (s *Sender) next() (store.Flow, bool, error) {
 			if f.State.IsTerminal() || f.Waiting() {
 				return nil
 			}
-			switch {
-			case !found:
-			case best.Kind == store.FlowGasTopUp && f.Kind != store.FlowGasTopUp:
-				return nil // already holding a top-up
-			case f.Kind == store.FlowGasTopUp && best.Kind != store.FlowGasTopUp:
-			case f.CreatedAt.Before(best.CreatedAt):
-			default:
+			// Oldest first. The gas top-up used to jump the queue, being the
+			// thing that kept every other flow able to pay for itself; with it
+			// gone there is no priority left to express.
+			if found && !f.CreatedAt.Before(best.CreatedAt) {
 				return nil
 			}
 			best, found = f, true
@@ -285,6 +257,7 @@ func (s *Sender) execute(ctx context.Context, f store.Flow) error {
 	var (
 		res    outcome
 		signed *types.Transaction
+		moved  *big.Int
 		reason string
 	)
 	switch act.Kind {
@@ -292,16 +265,8 @@ func (s *Sender) execute(ctx context.Context, f store.Flow) error {
 		res, signed, err = s.fund(ctx, key)
 	case flow.ActionApprove:
 		res, signed, err = s.approve(ctx, key)
-	case flow.ActionSweep:
-		res, signed, reason, err = s.sweep(ctx, key, act.To)
-	case flow.ActionPay:
-		res, signed, reason, err = s.pay(ctx, key, act.To, act.Amount, f.App)
-	case flow.ActionApproveRouter:
-		res, signed, err = s.approveRouter(ctx, key)
-	case flow.ActionSwap:
-		res, signed, reason, err = s.swapForGas(ctx, key, act.Amount)
-	case flow.ActionSweepHouse:
-		res, signed, reason, err = s.sweepHouse(ctx, key, act.To, f.App)
+	case flow.ActionMove:
+		res, signed, moved, reason, err = s.move(ctx, key, act, w.Ref)
 	default:
 		return fmt.Errorf("sender: flow %s in %s owes no action", f.ID, f.State)
 	}
@@ -313,14 +278,14 @@ func (s *Sender) execute(ctx context.Context, f store.Flow) error {
 	case outcomeSkip:
 		metrics.ActionsSkipped.WithLabelValues(act.Kind.String()).Inc()
 		s.log.Info("action already satisfied on-chain",
-			"flow", f.ID, "kind", f.Kind, "action", act.Kind, "wallet", w.Address.Hex())
+			"flow", f.ID, "kind", f.Label(), "action", act.Kind, "wallet", w.Address.Hex())
 		return s.advance(f, true, "")
 	case outcomeFail:
 		s.log.Error("action cannot proceed",
-			"flow", f.ID, "kind", f.Kind, "action", act.Kind, "wallet", w.Address.Hex(), "reason", reason)
+			"flow", f.ID, "kind", f.Label(), "action", act.Kind, "wallet", w.Address.Hex(), "reason", reason)
 		return s.advance(f, false, reason)
 	}
-	return s.journalAndSend(ctx, f, key.Address, signed, act)
+	return s.journalAndSend(ctx, f, key.Address, signed, act, moved)
 }
 
 // fund gives a wallet exactly enough BNB to pay for its own approve. Every
@@ -377,193 +342,43 @@ func (s *Sender) approve(ctx context.Context, key keys.Key) (outcome, *types.Tra
 	return outcomeSend, signed, err
 }
 
-// sweep moves a wallet's entire token balance, read from the chain at signing
-// time. The deposit that triggered the drain is only a trigger; balanceOf is
-// the authority, so whatever arrived in the meantime leaves with it.
-func (s *Sender) sweep(ctx context.Context, key keys.Key, to common.Address) (outcome, *types.Transaction, string, error) {
+// move performs the one transfer a flow in StateMoving owes.
+//
+// A nil amount means "everything the wallet holds", read from the chain right
+// now; a set one means exactly that, checked against the chain first. Those
+// were two methods behind two action kinds until §46 pointed out they are one
+// transferFrom differing only in where the number comes from.
+//
+// Either way the chain is the authority at signing time, which is the check
+// that replaces a periodic reconciler: one RPC call, made exactly where drift
+// would cost money, instead of a background sweep that mostly confirms nothing
+// happened.
+// It returns the amount it is moving. That matters for a sweep: the figure is
+// resolved here, from a balance nobody else saw, and settlement needs it to
+// record what the drain actually carried (§42). Leaving it here would make
+// every drain's debit read as zero.
+func (s *Sender) move(ctx context.Context, key keys.Key, act flow.Action, ref string) (outcome, *types.Transaction, *big.Int, string, error) {
 	balance, err := s.balance(ctx, key.Address)
 	if err != nil {
-		return outcomeFail, nil, "", err
-	}
-	if balance.Sign() == 0 {
-		return outcomeSkip, nil, "", nil // nothing to move; do not spend gas proving it
-	}
-	signed, err := s.transferFrom(ctx, key.Address, to, balance)
-	return outcomeSend, signed, "", err
-}
-
-// pay moves an exact amount, verifying against the chain first.
-//
-// This is the "verify at the point of spending" check that replaces a periodic
-// reconciler: one RPC call, made exactly where drift would cost money, instead
-// of a background sweep that mostly confirms nothing happened.
-func (s *Sender) pay(ctx context.Context, key keys.Key, to common.Address, amount *big.Int, app string) (outcome, *types.Transaction, string, error) {
-	balance, err := s.balance(ctx, key.Address)
-	if err != nil {
-		return outcomeFail, nil, "", err
-	}
-	if balance.Cmp(amount) < 0 {
-		metrics.InsufficientBalance.WithLabelValues(app).Inc()
-		return outcomeFail, nil, fmt.Sprintf("on-chain balance %s is below the %s required", balance, amount), nil
-	}
-	signed, err := s.transferFrom(ctx, key.Address, to, amount)
-	return outcomeSend, signed, "", err
-}
-
-// approveRouter lets the swap router spend the master's tokens. Same shape as a
-// managed wallet approving the master: granted once, unlimited, and skipped if
-// it is already in place.
-func (s *Sender) approveRouter(ctx context.Context, key keys.Key) (outcome, *types.Transaction, error) {
-	if s.opts.Router == (common.Address{}) {
-		return outcomeFail, nil, errors.New("sender: no swap router configured")
-	}
-	allowance, err := s.allowanceTo(ctx, key.Address, s.opts.Router)
-	if err != nil {
-		return outcomeFail, nil, err
-	}
-	if allowance.Sign() > 0 {
-		return outcomeSkip, nil, nil
-	}
-	signed, err := s.build(ctx, key, s.opts.Token, new(big.Int),
-		s.abi.PackApprove(s.opts.Router, maxUint256))
-	return outcomeSend, signed, err
-}
-
-// swapForGas trades an exact amount of tokens for native currency.
-//
-// This is the only transaction bsc sends whose outcome is a price rather than a
-// yes or no, so it is bounded twice: the router is asked what the trade is worth
-// and the result is floored by the configured slippage, and a deadline stops a
-// transaction that sits in the mempool from executing later at a price nobody
-// agreed to.
-func (s *Sender) swapForGas(ctx context.Context, key keys.Key, amount *big.Int) (outcome, *types.Transaction, string, error) {
-	if s.opts.Router == (common.Address{}) {
-		return outcomeFail, nil, "no swap router configured", nil
-	}
-	wrapped, err := s.wrappedNative(ctx)
-	if err != nil {
-		return outcomeFail, nil, "", err
-	}
-	held, err := s.balance(ctx, key.Address)
-	if err != nil {
-		return outcomeFail, nil, "", err
-	}
-	if held.Cmp(amount) < 0 {
-		// The fees were spent or swept elsewhere since the flow started.
-		return outcomeFail, nil, fmt.Sprintf("holds %s, needs %s to swap", held, amount), nil
+		return outcomeFail, nil, nil, "", err
 	}
 
-	path := []common.Address{s.opts.Token, wrapped}
-	quoted, err := s.chain.Call(ctx, s.opts.Router, swap.PackGetAmountsOut(amount, path))
-	if err != nil {
-		return outcomeFail, nil, "", fmt.Errorf("sender: quote swap: %w", err)
-	}
-	amounts, err := swap.UnpackAmounts(quoted)
-	if err != nil {
-		return outcomeFail, nil, "", fmt.Errorf("sender: decode quote: %w", err)
-	}
-	if len(amounts) != len(path) {
-		return outcomeFail, nil, fmt.Sprintf("router quoted %d amounts for a %d-hop path", len(amounts), len(path)), nil
-	}
-	minOut, err := swap.MinOut(amounts[len(amounts)-1], s.opts.SlippageBPS)
-	if err != nil {
-		return outcomeFail, nil, err.Error(), nil
-	}
-
-	deadline := big.NewInt(time.Now().Add(s.opts.SwapDeadline).Unix())
-	data := swap.PackSwapExactTokensForETH(amount, minOut, path, key.Address, deadline)
-	signed, err := s.build(ctx, key, s.opts.Router, new(big.Int), data)
-	if err != nil {
-		return outcomeFail, nil, "", err
-	}
-	s.log.Info("swapping fees for gas",
-		"amount", amount, "quoted", amounts[len(amounts)-1], "min_out", minOut,
-		"slippage_bps", s.opts.SlippageBPS)
-	return outcomeSend, signed, "", nil
-}
-
-// wrappedNative resolves the token the swap path ends at.
-//
-// The swap yields native currency — the router unwraps at the end — but a path
-// is a list of ERC-20s and native currency is not one, so the path must end at
-// the wrapped token. Asking the router for its own removes a setting that could
-// be configured inconsistently with the router actually in use. A configured
-// override wins, for a fork that names the accessor something else.
-func (s *Sender) wrappedNative(ctx context.Context) (common.Address, error) {
-	if s.opts.WrappedNative != (common.Address{}) {
-		return s.opts.WrappedNative, nil
-	}
-	s.wrappedOnce.Do(func() {
-		out, err := s.chain.Call(ctx, s.opts.Router, swap.PackWrappedNative())
-		if err != nil {
-			s.wrappedErr = fmt.Errorf("sender: ask router for its wrapped token: %w", err)
-			return
+	amount := act.Amount
+	if amount == nil || amount.Sign() == 0 {
+		// A sweep. Nothing to move is not a failure, and proving it on-chain
+		// would cost gas to achieve nothing.
+		if balance.Sign() == 0 {
+			return outcomeSkip, nil, nil, "", nil
 		}
-		addr, err := swap.UnpackAddress(out)
-		if err != nil {
-			s.wrappedErr = fmt.Errorf("sender: %w — set swap.wrapped_native if this router names it differently", err)
-			return
-		}
-		s.wrapped = addr
-		s.log.Info("resolved the router's wrapped native token", "router", s.opts.Router.Hex(), "wrapped", addr.Hex())
-	})
-	return s.wrapped, s.wrappedErr
-}
-
-// sweepHouse moves what a wallet holds beyond its app's ledger to the collector.
-//
-// The amount is resolved here, at signing time, and from two readings taken as
-// close together as they can be: what the chain says the wallet holds, and what
-// the ledger says the app is owed. This is the one operation whose amount is a
-// computation over somebody else's money rather than a figure agreed in advance,
-// so it is deliberately conservative — a stale reading must leave money behind
-// rather than take money that was owed (§25).
-//
-// Anything that lands after this reading is simply swept next time, and the
-// direction is what makes that safe: while this transaction is in flight the
-// excess can only *rise*, never fall. A landing drain lifts custody by the full
-// wei but the ledger by only the floored cents, so it adds its dust to the
-// excess; a settling payout lifts it by the fee. Both leave this sweep taking
-// less than it could rather than more than it should.
-func (s *Sender) sweepHouse(ctx context.Context, key keys.Key, to common.Address, app string) (outcome, *types.Transaction, string, error) {
-	if !s.opts.Scale.Valid() {
-		return outcomeFail, nil, "no token scale configured", nil
-	}
-	var owed money.Cents
-	if err := s.store.View(func(tx *store.Tx) error {
-		a, found, err := tx.App(app)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return fmt.Errorf("sender: house sweep for unknown app %q", app)
-		}
-		owed = a.Ledger
-		return nil
-	}); err != nil {
-		return outcomeFail, nil, "", err
+		amount = balance
+	} else if balance.Cmp(amount) < 0 {
+		metrics.InsufficientBalance.WithLabelValues(ref).Inc()
+		return outcomeFail, nil, nil, fmt.Sprintf(
+			"on-chain balance %s is below the %s required", balance, amount), nil
 	}
 
-	held, err := s.balance(ctx, key.Address)
-	if err != nil {
-		return outcomeFail, nil, "", err
-	}
-	excess := s.opts.Scale.Excess(held, owed)
-	if excess.Sign() < 0 {
-		// We hold less than we owe. Sweeping is out of the question, and this is
-		// an alarm rather than a transfer that did not happen: the ledger and
-		// the chain disagree about money that belongs to somebody.
-		metrics.SolvencyShortfalls.Inc()
-		return outcomeFail, nil, fmt.Sprintf(
-			"holds %s wei but the app is owed %s cents — refusing to sweep while short", held, owed), nil
-	}
-	if excess.Sign() == 0 {
-		return outcomeSkip, nil, "", nil // nothing over; do not spend gas proving it
-	}
-	s.log.Info("sweeping the house's excess",
-		"app", app, "wallet", key.Address.Hex(), "held", held, "owed_cents", owed, "excess", excess)
-	signed, err := s.transferFrom(ctx, key.Address, to, excess)
-	return outcomeSend, signed, "", err
+	signed, err := s.transferFrom(ctx, key.Address, act.To, amount)
+	return outcomeSend, signed, amount, "", err
 }
 
 // transferFrom builds the master's move of a managed wallet's tokens.
@@ -608,7 +423,14 @@ func (s *Sender) build(ctx context.Context, key keys.Key, to common.Address, val
 // journalAndSend commits the signed transaction and only then broadcasts it.
 // The ordering is the crash-safety guarantee: a restart between the two
 // re-broadcasts these exact bytes rather than signing a second transfer.
-func (s *Sender) journalAndSend(ctx context.Context, f store.Flow, signer common.Address, signed *types.Transaction, act flow.Action) error {
+// journalAndSend commits the signed transaction and then broadcasts it, in that
+// order: a crash re-sends the same bytes rather than signing a second transfer.
+//
+// `moved` is the amount the action resolved, which for a sweep is only known
+// here. It is written onto the flow in the same transaction as the journal, so
+// settlement can record what the drain carried without re-reading a balance
+// that has since changed.
+func (s *Sender) journalAndSend(ctx context.Context, f store.Flow, signer common.Address, signed *types.Transaction, act flow.Action, moved *big.Int) error {
 	raw, err := signed.MarshalBinary()
 	if err != nil {
 		return fmt.Errorf("sender: encode transaction: %w", err)
@@ -628,6 +450,9 @@ func (s *Sender) journalAndSend(ctx context.Context, f store.Flow, signer common
 		}
 		_, err := tx.MutateFlow(f.ID, func(f *store.Flow) error {
 			f.Tx = hash
+			if moved != nil && moved.Sign() > 0 {
+				f.Amount = moved
+			}
 			return nil
 		})
 		return err
@@ -637,7 +462,7 @@ func (s *Sender) journalAndSend(ctx context.Context, f store.Flow, signer common
 
 	metrics.TransactionsSent.WithLabelValues(act.Kind.String()).Inc()
 	s.log.Info("broadcasting",
-		"flow", f.ID, "kind", f.Kind, "action", act.Kind,
+		"flow", f.ID, "kind", f.Label(), "action", act.Kind,
 		"tx", hash.Hex(), "nonce", signed.Nonce(), "signer", signer.Hex())
 
 	if _, err := s.chain.SendRawTx(ctx, raw); err != nil {
@@ -683,7 +508,10 @@ func (s *Sender) advance(f store.Flow, ok bool, reason string) error {
 		if reason != "" {
 			f.Error = reason
 		}
-		_, err := engine.Advance(tx, f, ok, now)
+		// Block zero: nothing landed, so there is no chain position to record.
+		// A settlement reached this way never produces a debit, because no
+		// transfer happened to observe (§42).
+		_, err := engine.Advance(tx, f, 0, ok, now)
 		return err
 	})
 }

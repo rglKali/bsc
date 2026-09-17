@@ -7,175 +7,173 @@ import (
 	"testing"
 	"time"
 
-	"bsc/engine"
-	"bsc/store"
 	"bsc/swap"
+	"bsc/usdt"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/google/uuid"
+	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// quote asks the router what the swap amount is currently worth, which is also
-// how we learn whether the pool exists at all.
-func (h *harness) quote(amount *big.Int) (*big.Int, error) {
-	h.t.Helper()
-	out, err := h.chain.Call(h.ctx, h.router, swap.PackWrappedNative())
-	if err != nil {
-		return nil, err
-	}
-	wrapped, err := swap.UnpackAddress(out)
-	if err != nil {
-		return nil, err
-	}
-	path := []common.Address{h.token, wrapped}
-	quoted, err := h.chain.Call(h.ctx, h.router, swap.PackGetAmountsOut(amount, path))
-	if err != nil {
-		return nil, err
-	}
-	amounts, err := swap.UnpackAmounts(quoted)
-	if err != nil {
-		return nil, err
-	}
-	return amounts[len(amounts)-1], nil
-}
-
-// TestGasTopUpSwap exercises the one operation whose outcome is a price rather
-// than a yes or no: the master trading collected fees back into native gas.
+// TestOperatorSwap exercises the path `bsc swap` takes, against a real router
+// on a real chain.
 //
-// It is the hardest flow to fake convincingly — a simulator can only confirm our
-// own assumptions about a router — so it matters most that it runs here.
-func TestGasTopUpSwap(t *testing.T) {
+// It is the one operation whose outcome is a price rather than a yes or no,
+// which is exactly why it is no longer something the service starts on its own
+// (§38) — and exactly why a simulator proves nothing about it. A fake router
+// can only confirm our own assumptions about calldata; only a real one can say
+// whether the quote, the slippage bound and the exact-output call actually
+// behave the way the encoding assumes.
+//
+// This drives the same sequence the command does — quote, bound, approve, swap,
+// confirm — rather than shelling out, so a failure points at a line of Go.
+func TestOperatorSwap(t *testing.T) {
 	h := setup(t, needs{swap: true})
 
-	// A testnet pool may simply not exist. That is an environment problem, not
-	// a failure of the code, so say so plainly rather than failing.
-	expected, err := h.quote(h.swapAmount)
-	if err != nil {
-		t.Skipf("router %s cannot quote %s of %s → native: %v\n"+
-			"There is probably no pool for this pair on this chain. "+
-			"Set E2E_SWAP_ROUTER or E2E_TOKEN_ADDRESS to a pair that has liquidity.",
-			h.router.Hex(), fmtToken(h.swapAmount), h.token.Hex(), err)
-	}
-	if expected == nil || expected.Sign() == 0 {
-		t.Skipf("router quoted zero native for %s — no liquidity to swap against", fmtToken(h.swapAmount))
-	}
-	t.Logf("router quotes %s native for %s tokens", fmtToken(expected), fmtToken(h.swapAmount))
+	wrapped := h.wrappedNative()
+	path := []common.Address{h.token, wrapped}
+	sell := h.swapAmount
 
-	// The master trades its own collected fees, so give it some to trade. On a
-	// live service these arrive from withdrawals; here the funder stands in.
-	//
-	// Wait for the balance to *rise*, not merely to clear the swap amount: the
-	// master is the wallet that funds everything, so it already holds tokens and
-	// "at least one" is true before the transfer has mined. Reading the balance
-	// then would snapshot it mid-flight, and the token that arrived afterwards
-	// would silently cancel out the one the swap spends.
-	want := new(big.Int).Add(h.tokenBalance(h.master), h.swapAmount)
-	h.sendTokens(h.master, h.swapAmount)
-	h.pump("master funded with tokens to trade", func() bool {
-		return h.tokenBalance(h.master).Cmp(want) >= 0
+	nativeBefore, err := h.chain.BalanceBNB(h.ctx, h.master)
+	if err != nil {
+		t.Fatalf("native balance: %v", err)
+	}
+	tokensBefore := h.tokenBalance(h.master)
+	if tokensBefore.Cmp(sell) < 0 {
+		t.Skipf("master holds %s tokens, which is less than the %s this test trades",
+			fmtToken(tokensBefore), fmtToken(sell))
+	}
+
+	t.Run("the router quotes both directions", func(t *testing.T) {
+		// getAmountsOut answers "what would this fetch"; getAmountsIn answers
+		// "what would that cost". A caller refilling gas thinks in the second,
+		// and computing it by dividing the first would be wrong — the price
+		// moves with the size of the trade.
+		out := h.quote(swap.PackGetAmountsOut(sell, path))
+		if out[len(out)-1].Sign() <= 0 {
+			t.Fatalf("getAmountsOut returned %v", out)
+		}
+		want := out[len(out)-1]
+
+		in := h.quote(swap.PackGetAmountsIn(want, path))
+		if in[0].Sign() <= 0 {
+			t.Fatalf("getAmountsIn returned %v", in)
+		}
+		// Round-tripping a quote should land within a whisker of where it
+		// started. A wide gap means the path or the encoding is wrong, not that
+		// the pool moved.
+		diff := new(big.Int).Sub(in[0], sell)
+		diff.Abs(diff)
+		tolerance := new(big.Int).Div(sell, big.NewInt(20)) // 5%
+		if diff.Cmp(tolerance) > 0 {
+			t.Fatalf("round-tripped quote: sold %s, getAmountsIn says %s costs it",
+				fmtToken(sell), fmtToken(in[0]))
+		}
+		t.Logf("%s tokens ⇄ %s native", fmtToken(sell), fmtToken(want))
 	})
 
-	beforeNative, err := h.chain.BalanceBNB(h.ctx, h.master)
-	if err != nil {
-		t.Fatalf("master balance: %v", err)
-	}
-	beforeTokens := h.tokenBalance(h.master)
+	t.Run("an exact-input trade lands inside its floor", func(t *testing.T) {
+		out := h.quote(swap.PackGetAmountsOut(sell, path))
+		expected := out[len(out)-1]
+		minOut, err := swap.MinOut(expected, 300) // testnet pools are thin
+		if err != nil {
+			t.Fatalf("MinOut: %v", err)
+		}
 
-	// Record the master as a wallet and put its balance where the rule can see
-	// it, then set a floor above the current balance so a top-up is due.
-	master := h.masterWallet(beforeTokens)
-	cfg := engine.Config{
-		SwapEnabled:  true,
-		SwapAmount:   h.swapAmount,
-		GasFloor:     new(big.Int).Add(beforeNative, big.NewInt(1)),
-		SwapCooldown: time.Minute,
-	}
-	var started bool
-	if err := h.store.Update(func(tx *store.Tx) error {
-		var err error
-		started, err = engine.EvaluateGas(tx, cfg, master, beforeNative, time.Now())
-		return err
-	}); err != nil {
-		t.Fatalf("EvaluateGas: %v", err)
-	}
-	if !started {
-		t.Fatalf("no top-up started: native %s below floor %s, holding %s tokens",
-			beforeNative, cfg.GasFloor, fmtToken(beforeTokens))
-	}
+		h.approveRouter(sell)
 
-	// Two transactions: the router allowance, then the trade itself.
-	h.pump("swap completed", func() bool {
-		n := 0
-		_ = h.store.View(func(tx *store.Tx) error {
-			return tx.EachFlow(func(f store.Flow) error {
-				if f.Kind == store.FlowGasTopUp {
-					n++
-				}
-				return nil
-			})
-		})
-		return n == 0
+		deadline := big.NewInt(time.Now().Add(5 * time.Minute).Unix())
+		data := swap.PackSwapExactTokensForETH(sell, minOut, path, h.master, deadline)
+		hash := h.signAndSend(h.masterKey, h.router, new(big.Int), data)
+		t.Logf("swap %s", hash.Hex())
+		h.awaitReceipt(hash)
+
+		// Exactly the input left, and at least the floor arrived. Gas makes the
+		// native side inexact, so the assertion is the direction and the bound,
+		// not an equality.
+		tokensAfter := h.tokenBalance(h.master)
+		spent := new(big.Int).Sub(tokensBefore, tokensAfter)
+		if spent.Cmp(sell) != 0 {
+			t.Fatalf("spent %s tokens, want exactly %s", fmtToken(spent), fmtToken(sell))
+		}
+		nativeAfter, err := h.chain.BalanceBNB(h.ctx, h.master)
+		if err != nil {
+			t.Fatalf("native balance: %v", err)
+		}
+		if nativeAfter.Cmp(nativeBefore) <= 0 {
+			t.Fatalf("native went from %s to %s — the trade did not pay for its own gas",
+				nativeBefore, nativeAfter)
+		}
+		t.Logf("native %s → %s (floor was %s)", nativeBefore, nativeAfter, minOut)
 	})
-
-	afterNative, err := h.chain.BalanceBNB(h.ctx, h.master)
-	if err != nil {
-		t.Fatalf("master balance: %v", err)
-	}
-	afterTokens := h.tokenBalance(h.master)
-
-	// Tokens went out.
-	spent := new(big.Int).Sub(beforeTokens, afterTokens)
-	if spent.Cmp(h.swapAmount) != 0 {
-		t.Fatalf("traded %s tokens, want exactly the configured %s",
-			fmtToken(spent), fmtToken(h.swapAmount))
-	}
-
-	// Native came back. The master also paid gas for the approve and the swap,
-	// so the net change can be smaller than the quote — what matters is that
-	// the proceeds landed, not that the balance rose by the full amount.
-	if afterNative.Cmp(beforeNative) <= 0 {
-		t.Fatalf("native balance did not rise: %s → %s (gas may have exceeded a very small trade)",
-			beforeNative, afterNative)
-	}
-	t.Logf("swapped %s tokens for native: balance %s → %s",
-		fmtToken(h.swapAmount), beforeNative, afterNative)
-
-	// And the audit still agrees with the chain afterwards.
-	rep, err := h.audit()
-	if err != nil {
-		t.Fatalf("audit: %v", err)
-	}
-	if !rep.OK() {
-		t.Fatalf("audit findings after the swap: %v", rep.Findings)
-	}
 }
 
-// masterWallet records the master, as the running service does at startup.
-func (h *harness) masterWallet(balance *big.Int) store.Wallet {
+// wrappedNative asks the router for its own wrapped token, which is what
+// removes a setting that could be configured inconsistently with it.
+func (h *harness) wrappedNative() common.Address {
 	h.t.Helper()
-	var out store.Wallet
-	if err := h.store.Update(func(tx *store.Tx) error {
-		existing, ok, err := tx.WalletByAddress(h.master)
-		if err != nil {
-			return err
-		}
-		if ok {
-			out = existing
-			_, err = tx.MutateWallet(out.ID, func(w *store.Wallet) error {
-				w.Balance = balance
-				return nil
-			})
-			out.Balance = balance
-			return err
-		}
-		out = store.Wallet{
-			ID:   uuid.NewSHA1(uuid.NameSpaceOID, h.master.Bytes()),
-			Kind: store.KindMaster, Address: h.master,
-			Balance: balance, CreatedAt: time.Now().UTC(),
-		}
-		return tx.PutWallet(out)
-	}); err != nil {
-		h.t.Fatalf("record master wallet: %v", err)
+	raw, err := h.chain.Call(h.ctx, h.router, swap.PackWrappedNative())
+	if err != nil {
+		h.t.Fatalf("router WETH(): %v", err)
 	}
-	return out
+	addr, err := swap.UnpackAddress(raw)
+	if err != nil {
+		h.t.Fatalf("decode WETH(): %v", err)
+	}
+	return addr
+}
+
+func (h *harness) quote(data []byte) []*big.Int {
+	h.t.Helper()
+	raw, err := h.chain.Call(h.ctx, h.router, data)
+	if err != nil {
+		h.t.Fatalf("router quote: %v", err)
+	}
+	amounts, err := swap.UnpackAmounts(raw)
+	if err != nil {
+		h.t.Fatalf("decode amounts: %v", err)
+	}
+	if len(amounts) < 2 {
+		h.t.Fatalf("router returned %d amounts", len(amounts))
+	}
+	return amounts
+}
+
+// approveRouter grants the allowance the trade needs, skipping when one is
+// already in place — the same shape the command uses.
+func (h *harness) approveRouter(need *big.Int) {
+	h.t.Helper()
+	abi := usdt.NewUsdt()
+	raw, err := h.chain.Call(h.ctx, h.token, abi.PackAllowance(h.master, h.router))
+	if err != nil {
+		h.t.Fatalf("allowance: %v", err)
+	}
+	allowance, err := abi.UnpackAllowance(raw)
+	if err != nil {
+		h.t.Fatalf("decode allowance: %v", err)
+	}
+	if allowance.Cmp(need) >= 0 {
+		return
+	}
+	max := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+	hash := h.signAndSend(h.masterKey, h.token, new(big.Int), abi.PackApprove(h.router, max))
+	h.t.Logf("approve %s", hash.Hex())
+	h.awaitReceipt(hash)
+}
+
+// awaitReceipt blocks until a transaction is mined, failing if it reverted.
+func (h *harness) awaitReceipt(hash common.Hash) {
+	h.t.Helper()
+	ok := h.waitFor("receipt for "+hash.Hex(), func() bool {
+		rc, err := h.chain.Receipt(h.ctx, hash)
+		if err != nil || rc == nil {
+			return false
+		}
+		if rc.Status != types.ReceiptStatusSuccessful {
+			h.t.Fatalf("transaction %s reverted", hash.Hex())
+		}
+		return true
+	})
+	if !ok {
+		h.t.Fatalf("gave up waiting for %s", hash.Hex())
+	}
 }

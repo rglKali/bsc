@@ -71,7 +71,7 @@ every activation, drain and payout, and nothing tops it up automatically.
 
 Two files. `config.yaml` is every operational setting, each one documented with
 its default; `bsc.env` is the master secret and nothing else. The split exists
-so that the secret's secrecy does not have to spread to the other twenty-five
+so that the secret's secrecy does not have to spread to the two dozen other
 settings, which are then safe to review, diff and keep in version control (§30).
 
 **`deploy/config.yaml` is the reference.** It lists every setting that exists,
@@ -86,8 +86,8 @@ in upper case with `BSC_` in front:
 | --- | --- |
 | `db_path` | `BSC_DB_PATH` |
 | `chain.rpc_rate_limit` | `BSC_CHAIN_RPC_RATE_LIMIT` |
-| `swap.amount_wei` | `BSC_SWAP_AMOUNT_WEI` |
-| `money.house_sweep_min_cents` | `BSC_MONEY_HOUSE_SWEEP_MIN_CENTS` |
+| `gas.floor_wei` | `BSC_GAS_FLOOR_WEI` |
+| `money.drain_threshold_wei` | `BSC_MONEY_DRAIN_THRESHOLD_WEI` |
 
 Precedence is **flag, then environment, then file, then default** — so you can
 override one value during an incident without editing a reviewed file, and the
@@ -99,7 +99,7 @@ A handful of settings also have flags (`bsc --help`): `--db`, `--http-addr`,
 
 > **`BSC_MASTER_SECRET` is required, and is environment-only by policy rather
 > than by mechanism.** 32-byte hex. It signs everything and holds an unlimited
-> allowance on every derived wallet, so whoever has it can move every app's
+> allowance on every derived wallet, so whoever has it can move every wallet's
 > funds. Secrets manager only — never in `config.yaml`, never in git.
 
 ### On `chain.rpc_rate_limit`
@@ -116,9 +116,9 @@ the config refuses anything below 5 outright.
 ## Network
 
 Nothing here is public. bsc listens on loopback, has no authentication, and
-expects every caller to be a first-party service on the same box — the app slug
-in the path is identity, not a credential. Do not put it behind a public
-reverse proxy.
+expects every caller to be a first-party service on the same box — a ref in the
+path is a name rather than a credential, and any caller can read any wallet
+(§37). Do not put it behind a public reverse proxy.
 
 `/metrics` is on the same listener and scraped over loopback; see
 `prometheus.yml`.
@@ -156,9 +156,10 @@ The top row is what an operator actually watches, and
 [`../docs/OPERATING.md`](../docs/OPERATING.md) explains why each one matters:
 
 - **Master wallet** — the one to alert on. A dry master stops every pipeline, and
-  gas top-ups defend it, but only while there are fees to sell — which is why
-  the same panel plots `bsc_master_usdt_wei` beside it. Native falling while
-  tokens sit at zero is the combination that needs a human.
+  **nothing refills it**: the automatic top-up was removed along with the fee
+  that funded it (§38). The same panel plots `bsc_master_usdt_wei` beside it,
+  because tokens parked there are what `bsc swap` can trade for gas. Native
+  below `gas.floor_wei` is a page, not a warning.
 - **Blocks behind** — sustained growth means the RPC cannot keep up, and
   withdrawals start being refused once it passes `chain.max_lag_blocks`.
 - **In-flight age** — signing is sequential, so this growing means one
@@ -166,17 +167,17 @@ The top row is what an operator actually watches, and
 
 Two panels are worth reading carefully rather than at a glance:
 
-- *Deposits* shows recorded and ignored side by side. Ignored transfers were
-  worth less than a whole cent, so there was no ledger entry to write: the two
-  series differing is correct, not a fault.
-- *Problems* should sit flat at zero. **A solvency shortfall is the serious one**
-  — a hot wallet holding less than its app is owed, which nothing self-corrects.
-  A balance underflow is a bug in our own accounting; insufficient-balance
-  refusals mean our record of custody drifted from the chain.
+- *Deposits* shows transfers seen against deposits recorded. The two differ by
+  transfers touching the master, which is bsc's own wallet and not a deposit
+  anybody is waiting on. There is no longer an "ignored" series: with the
+  chain's own units there is no amount too small to record (§36).
+- *Problems* should sit flat at zero. A balance underflow is a bug in our own
+  accounting; insufficient-balance refusals mean our record of custody drifted
+  from the chain.
 
 What to alert on is in [`../docs/OPERATING.md`](../docs/OPERATING.md); the short
 version is a master that stays low on gas, a watcher that stays behind, and any
-solvency shortfall at all.
+balance underflow at all.
 
 ## Upgrading
 

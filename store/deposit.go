@@ -1,8 +1,6 @@
 package store
 
 import (
-	"bsc/money"
-
 	"fmt"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -13,11 +11,11 @@ import (
 // already recorded. Dedup is a property of the key (tx hash ++ log index), so
 // there is no uniqueness check to forget and a reprocessed block is harmless.
 //
-// It maintains two indexes: idx/dep, whose key is the app-facing cursor, and
-// idx/dep_open, the set awaiting a drain.
+// It maintains three indexes: the global feed whose key is the caller-facing
+// cursor, a per-wallet listing, and the set still awaiting a drain.
 func (t *Tx) PutDeposit(d Deposit) (created bool, err error) {
-	if err := ValidSlug(d.App); err != nil {
-		return false, err
+	if d.Wallet == uuid.Nil {
+		return false, fmt.Errorf("store: deposit needs a wallet")
 	}
 	key := depositKey(d.TxHash, d.LogIndex)
 	if t.tx.Bucket(bDeposit).Get(key) != nil {
@@ -26,15 +24,29 @@ func (t *Tx) PutDeposit(d Deposit) (created bool, err error) {
 	if err := put(t, bDeposit, key, d.encode); err != nil {
 		return false, err
 	}
-	// The cursor index: "<slug>\0<block><logindex>" -> deposit key. Written in
+	cur := d.Cursor().Key()
+	// The cursor index: "<block><logindex>" -> deposit key. Written in
 	// block-then-log order by construction, which is what makes the cursor
-	// monotonic for readers (§9).
-	if err := t.tx.Bucket(iDep).Put(scoped(d.App, d.Cursor().Key()), key); err != nil {
+	// monotonic for readers.
+	if err := t.tx.Bucket(iDep).Put(cur, key); err != nil {
 		return false, fmt.Errorf("store: put dep index: %w", err)
 	}
-	if d.Status == DepositPending {
-		if err := t.tx.Bucket(iDepOpen).Put(scoped(d.App, d.Wallet[:], key), key); err != nil {
-			return false, fmt.Errorf("store: put dep_open index: %w", err)
+	if err := t.tx.Bucket(iDepWallet).Put(join(d.Wallet[:], cur), key); err != nil {
+		return false, fmt.Errorf("store: put dep_wallet index: %w", err)
+	}
+	// Only a deposit that still has somewhere to go joins the open set. On a
+	// wallet that accumulates there is no drain coming, so the deposit is
+	// already in its final state and would otherwise sit in this index forever
+	// (§34).
+	if d.Status == DepositReceived {
+		w, found, err := t.Wallet(d.Wallet)
+		if err != nil {
+			return false, err
+		}
+		if found && w.Proxies() {
+			if err := t.tx.Bucket(iDepOpen).Put(join(d.Wallet[:], key), key); err != nil {
+				return false, fmt.Errorf("store: put dep_open index: %w", err)
+			}
 		}
 	}
 	return true, nil
@@ -45,25 +57,23 @@ func (t *Tx) Deposit(tx common.Hash, logIndex uint32) (Deposit, bool, error) {
 	return get(t, bDeposit, depositKey(tx, logIndex), decodeDeposit)
 }
 
-// DepositsSince reads an app's deposit feed strictly after `after`, in chain
-// order, returning the cursor to pass back next time. This is the only cursor
-// in the system: deposits are unsolicited, so the app needs "what is new", while
-// withdrawals it initiated are polled by id (§9).
+// DepositsSince reads the deposit feed strictly after `after`, in chain order,
+// returning the cursor to pass back next time. This is the only cursor in the
+// system: deposits are unsolicited, so the caller needs "what is new", while
+// withdrawals it initiated are polled by id.
 //
-// The returned cursor is `after` unchanged when nothing new exists, so an app
+// The returned cursor is `after` unchanged when nothing new exists, so a caller
 // that keeps passing it back never loses its place.
-func (t *Tx) DepositsSince(slug string, after Cursor, limit int) ([]Deposit, Cursor, error) {
-	prefix := scopePrefix(slug)
-	start := scoped(slug, after.Next().Key())
+func (t *Tx) DepositsSince(after Cursor, limit int) ([]Deposit, Cursor, error) {
 	next := after
 	var out []Deposit
-	err := scanFrom(t, iDep, prefix, start, func(k, v []byte) error {
+	err := scanFrom(t, iDep, nil, after.Next().Key(), func(k, v []byte) error {
 		d, err := decodeDeposit(t.tx.Bucket(bDeposit).Get(v))
 		if err != nil {
 			return fmt.Errorf("store: decode deposit for index key: %w", err)
 		}
 		out = append(out, d)
-		if c, ok := cursorFromScoped(k); ok {
+		if c, ok := cursorFromKey(k); ok {
 			next = c
 		}
 		if limit > 0 && len(out) >= limit {
@@ -77,12 +87,10 @@ func (t *Tx) DepositsSince(slug string, after Cursor, limit int) ([]Deposit, Cur
 	return out, next, nil
 }
 
-// OpenDeposits lists an app's deposits that have been detected but not yet
-// swept into its top-level wallet — the `?status=pending` view, and the sum an
-// app sees as `pending_cents`.
-func (t *Tx) OpenDeposits(slug string, limit int) ([]Deposit, error) {
+// WalletDeposits lists one wallet's deposits in chain order.
+func (t *Tx) WalletDeposits(wallet uuid.UUID, limit int) ([]Deposit, error) {
 	var out []Deposit
-	err := scanPrefix(t, iDepOpen, scopePrefix(slug), func(_, v []byte) error {
+	err := scanPrefix(t, iDepWallet, walletPrefix(wallet), func(_, v []byte) error {
 		d, err := decodeDeposit(t.tx.Bucket(bDeposit).Get(v))
 		if err != nil {
 			return err
@@ -96,42 +104,58 @@ func (t *Tx) OpenDeposits(slug string, limit int) ([]Deposit, error) {
 	return out, err
 }
 
-// CreditDeposits marks every deposit awaiting a drain on this wallet as
-// credited, stamping the sweep that did it, and returns the cents they are
-// worth. One sweep moves the whole balance and so credits several deposits at
-// once, which is exactly why crediting is a status on the record rather than an
-// entry in the feed (§9).
+// OpenDeposits lists deposits on proxy wallets that have arrived but not yet
+// been forwarded — the `?status=received` view on a wallet that drains.
+func (t *Tx) OpenDeposits(wallet uuid.UUID, limit int) ([]Deposit, error) {
+	var out []Deposit
+	err := scanPrefix(t, iDepOpen, walletPrefix(wallet), func(_, v []byte) error {
+		d, err := decodeDeposit(t.tx.Bucket(bDeposit).Get(v))
+		if err != nil {
+			return err
+		}
+		out = append(out, d)
+		if limit > 0 && len(out) >= limit {
+			return errStop
+		}
+		return nil
+	})
+	return out, err
+}
+
+// ForwardDeposits marks every deposit awaiting a drain on this wallet as
+// forwarded, linking each to the debit that carried it, and returns how many.
+// One drain moves the whole balance and so consumes several credits at once,
+// which is exactly why this is a link on the record rather than an entry in the
+// feed.
 //
-// The returned total is what the caller must add to the app's ledger, in the
-// same transaction: the sweep landing is precisely the moment the money becomes
-// spendable, because it is the moment it reaches the wallet payouts draw on.
-func (t *Tx) CreditDeposits(slug string, wallet uuid.UUID, drainTx common.Hash) (int, money.Cents, error) {
+// Nothing is credited anywhere. The status is a statement about where the money
+// physically is, not about who is owed it — bsc does not know that any more
+// (§34).
+func (t *Tx) ForwardDeposits(wallet, debit uuid.UUID) (int, error) {
 	var keys [][]byte
-	if err := scanPrefix(t, iDepOpen, scoped(slug, wallet[:]), func(_, v []byte) error {
+	if err := scanPrefix(t, iDepOpen, walletPrefix(wallet), func(_, v []byte) error {
 		keys = append(keys, append([]byte(nil), v...))
 		return nil
 	}); err != nil {
-		return 0, 0, err
+		return 0, err
 	}
-	var credited money.Cents
 	for _, key := range keys {
 		raw := t.tx.Bucket(bDeposit).Get(key)
 		if raw == nil {
-			return 0, 0, fmt.Errorf("store: dep_open points at missing deposit")
+			return 0, fmt.Errorf("store: dep_open points at missing deposit")
 		}
 		d, err := decodeDeposit(raw)
 		if err != nil {
-			return 0, 0, err
+			return 0, err
 		}
-		d.Status = DepositCredited
-		d.DrainTx = drainTx
+		d.Status = DepositForwarded
+		d.SweptBy = debit
 		if err := put(t, bDeposit, key, d.encode); err != nil {
-			return 0, 0, err
+			return 0, err
 		}
-		if err := t.tx.Bucket(iDepOpen).Delete(scoped(slug, wallet[:], key)); err != nil {
-			return 0, 0, fmt.Errorf("store: delete dep_open: %w", err)
+		if err := t.tx.Bucket(iDepOpen).Delete(join(wallet[:], key)); err != nil {
+			return 0, fmt.Errorf("store: delete dep_open: %w", err)
 		}
-		credited += d.Cents
 	}
-	return len(keys), credited, nil
+	return len(keys), nil
 }

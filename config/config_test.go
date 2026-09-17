@@ -50,8 +50,8 @@ func TestDefaults(t *testing.T) {
 	if cfg.DrainThreshold.Cmp(oneUSDT) != 0 {
 		t.Fatalf("drain threshold = %s", cfg.DrainThreshold)
 	}
-	if cfg.DefaultFee != 100 || cfg.HouseSweepMin != 100 {
-		t.Fatalf("default fee %d / house sweep min %d", cfg.DefaultFee, cfg.HouseSweepMin)
+	if cfg.GasFloor.Cmp(big.NewInt(50_000_000_000_000_000)) != 0 {
+		t.Fatalf("gas floor = %s, want 0.05 native", cfg.GasFloor)
 	}
 	// The endpoint is the one chain input, so it is the only one with a
 	// literal default; the token follows the chain the endpoint reports.
@@ -62,8 +62,8 @@ func TestDefaults(t *testing.T) {
 		t.Fatalf("Load resolved chain-dependent settings: chain %d token %s",
 			cfg.ChainID, cfg.Token.Hex())
 	}
-	if cfg.FeeCollector != "" {
-		t.Fatalf("collector = %q, want empty so it resolves to the master", cfg.FeeCollector)
+	if cfg.SwapRouter != "" {
+		t.Fatalf("router = %q, want empty so it resolves from the chain", cfg.SwapRouter)
 	}
 }
 
@@ -95,20 +95,25 @@ func TestRateLimitMustOutrunTheChain(t *testing.T) {
 
 func TestValidation(t *testing.T) {
 	tests := map[string][2]string{
-		"bad token":       {"BSC_CHAIN_TOKEN_ADDRESS", "not-an-address"},
-		"bad collector":   {"BSC_MONEY_FEE_COLLECTOR", "nope"},
-		"bad min deposit": {"BSC_MONEY_DRAIN_THRESHOLD_WEI", "abc"},
-		"negative fee":    {"BSC_MONEY_DEFAULT_FEE_CENTS", "-1"},
-		"negative sweep":  {"BSC_MONEY_HOUSE_SWEEP_MIN_CENTS", "-1"},
-		"zero batch":      {"BSC_CHAIN_BACKFILL_BATCH", "0"},
-		"low funding mul": {"BSC_GAS_FUNDING_MULTIPLIER", "0.9"},
-		"low gas mul":     {"BSC_GAS_PRICE_MULTIPLIER", "0.5"},
+		"bad token":           {"BSC_CHAIN_TOKEN_ADDRESS", "not-an-address"},
+		"bad drain threshold": {"BSC_MONEY_DRAIN_THRESHOLD_WEI", "abc"},
+		"bad gas floor":       {"BSC_GAS_FLOOR_WEI", "abc"},
+		"bad router":          {"BSC_SWAP_ROUTER", "nope"},
+		"absurd slippage":     {"BSC_SWAP_SLIPPAGE_BPS", "10000"},
+		"zero batch":          {"BSC_CHAIN_BACKFILL_BATCH", "0"},
+		"low rate limit":      {"BSC_CHAIN_RPC_RATE_LIMIT", "1"},
+		"low funding mul":     {"BSC_GAS_FUNDING_MULTIPLIER", "0.9"},
+		"low gas mul":         {"BSC_GAS_PRICE_MULTIPLIER", "0.5"},
 	}
 	for name, kv := range tests {
-		withEnv(t, kv[0], kv[1])
-		if _, err := Load(); err == nil {
-			t.Fatalf("%s: Load accepted %s=%q", name, kv[0], kv[1])
-		}
+		// A subtest per case: t.Setenv restores at the end of the *test*, so a
+		// shared loop would leak one case's values into the next.
+		t.Run(name, func(t *testing.T) {
+			withEnv(t, kv[0], kv[1])
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load accepted %s=%q", kv[0], kv[1])
+			}
+		})
 	}
 }
 
@@ -159,7 +164,10 @@ func TestSwappingDefaultsToTheChainsRouter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !cfg.SwapEnabled {
+	if cfg.SwapSlippage != 100 {
+		t.Fatalf("slippage = %d bps, want 100", cfg.SwapSlippage)
+	}
+	if false {
 		t.Fatal("swapping is off by default")
 	}
 
@@ -206,18 +214,17 @@ func TestEnvironmentAlwaysBeatsTheChainDefaults(t *testing.T) {
 	}
 }
 
-func TestEnablingSwapsDemandsCompleteConfiguration(t *testing.T) {
-	// Half-specified swapping is worse than none: it would either fail at the
-	// worst moment or trade on terms nobody chose.
+func TestSwapSettingsAreValidated(t *testing.T) {
+	// These only drive the `bsc swap` command now, but a bad value still has to
+	// be refused before anything dials: an operator discovering it mid-trade is
+	// exactly the moment it costs something.
 	router := "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 
 	tests := map[string][]string{
 		"bad wrapped native": {"BSC_SWAP_ROUTER", router, "BSC_SWAP_WRAPPED_NATIVE", "nonsense"},
 		"bad router":         {"BSC_SWAP_ROUTER", "nonsense"},
-		"zero swap amount":   {"BSC_SWAP_ROUTER", router, "BSC_SWAP_AMOUNT_WEI", "0"},
-		"zero floor":         {"BSC_SWAP_ROUTER", router, "BSC_SWAP_GAS_FLOOR_WEI", "0"},
 		"absurd slippage":    {"BSC_SWAP_ROUTER", router, "BSC_SWAP_SLIPPAGE_BPS", "10000"},
-		"no cooldown":        {"BSC_SWAP_ROUTER", router, "BSC_SWAP_COOLDOWN", "0s"},
+		"no deadline":        {"BSC_SWAP_ROUTER", router, "BSC_SWAP_DEADLINE", "0s"},
 	}
 	for name, env := range tests {
 		// A subtest per case: t.Setenv restores at the end of the *test*, so a
@@ -238,9 +245,6 @@ func TestEnablingSwapsDemandsCompleteConfiguration(t *testing.T) {
 		cfg, err = Load()
 		if err != nil {
 			t.Fatalf("complete configuration rejected: %v", err)
-		}
-		if cfg.SwapAmount.Cmp(new(big.Int).Mul(oneUSDT, big.NewInt(10))) != 0 {
-			t.Fatalf("swap amount = %s, want 10 tokens", cfg.SwapAmount)
 		}
 	})
 	if cfg.SwapSlippage != 100 {
@@ -374,12 +378,7 @@ snapshot:
 	if cfg.RPCURL != "https://rpc.example" || cfg.RPCRateLimit != 33 || cfg.MaxLagBlocks != 400 {
 		t.Errorf("chain group not read: %s %d %d", cfg.RPCURL, cfg.RPCRateLimit, cfg.MaxLagBlocks)
 	}
-	if cfg.DefaultFee != 250 || cfg.HouseSweepMin != 500 {
-		t.Errorf("money group not read: %d %d", cfg.DefaultFee, cfg.HouseSweepMin)
-	}
-	if cfg.SwapEnabled {
-		t.Error("swap.enabled: false was not read")
-	}
+
 	if cfg.SnapshotDir != "/srv/backups" || cfg.SnapshotKeep != 48 {
 		t.Errorf("snapshot group not read: %s %d", cfg.SnapshotDir, cfg.SnapshotKeep)
 	}
@@ -438,7 +437,7 @@ func TestEnvVarNaming(t *testing.T) {
 		"master_secret":        "BSC_MASTER_SECRET",
 		"db_path":              "BSC_DB_PATH",
 		"chain.rpc_rate_limit": "BSC_CHAIN_RPC_RATE_LIMIT",
-		"swap.gas_floor_wei":   "BSC_SWAP_GAS_FLOOR_WEI",
+		"gas.floor_wei":        "BSC_GAS_FLOOR_WEI",
 	} {
 		if got := EnvVar(key); got != want {
 			t.Errorf("EnvVar(%q) = %q, want %q", key, got, want)
@@ -482,10 +481,8 @@ func TestShippedConfigMatchesTheDefaults(t *testing.T) {
 		shipped.PollInterval != defaults.PollInterval || shipped.BackfillBatch != defaults.BackfillBatch {
 		t.Errorf("chain group drifted: %+v", shipped)
 	}
-	if shipped.DefaultFee != defaults.DefaultFee || shipped.HouseSweepMin != defaults.HouseSweepMin ||
-		shipped.DrainThreshold.Cmp(defaults.DrainThreshold) != 0 {
-		t.Errorf("money group drifted: %d %d %s",
-			shipped.DefaultFee, shipped.HouseSweepMin, shipped.DrainThreshold)
+	if shipped.DrainThreshold.Cmp(defaults.DrainThreshold) != 0 {
+		t.Errorf("money group drifted: drain_threshold_wei = %s", shipped.DrainThreshold)
 	}
 	if shipped.FundingMultiplier != defaults.FundingMultiplier ||
 		shipped.GasMultiplier != defaults.GasMultiplier ||
@@ -493,11 +490,9 @@ func TestShippedConfigMatchesTheDefaults(t *testing.T) {
 		shipped.MasterPoll != defaults.MasterPoll {
 		t.Errorf("gas group drifted: %+v", shipped)
 	}
-	if shipped.SwapEnabled != defaults.SwapEnabled ||
-		shipped.SwapAmount.Cmp(defaults.SwapAmount) != 0 ||
-		shipped.GasFloor.Cmp(defaults.GasFloor) != 0 ||
+	if shipped.GasFloor.Cmp(defaults.GasFloor) != 0 ||
 		shipped.SwapSlippage != defaults.SwapSlippage ||
-		shipped.SwapCooldown != defaults.SwapCooldown {
+		shipped.SwapDeadline != defaults.SwapDeadline {
 		t.Errorf("swap group drifted: %+v", shipped)
 	}
 	if shipped.SnapshotInterval != defaults.SnapshotInterval || shipped.SnapshotKeep != defaults.SnapshotKeep {

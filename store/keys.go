@@ -1,50 +1,56 @@
 package store
 
 import (
-	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/google/uuid"
 )
 
-// Buckets. One per logical collection; the name mirrors the namespace path in
-// docs/REWRITE.md §3. Keys inside a bucket are byte-sorted, which several parts
-// of the design lean on directly: the timer due-queue is an ordered scan, the
-// send journal is nonce-ordered per signer, deposit dedup is a property of the
-// key, and the deposit cursor is the key itself.
+// Buckets. One per logical collection. Keys inside a bucket are byte-sorted,
+// which several parts of the design lean on directly: the send journal is
+// nonce-ordered per signer, deposit dedup is a property of the key, and the
+// deposit cursor is the key itself.
+//
+// Every per-app prefix is gone. Scoping used to be "<slug>\0<rest>" on five
+// indexes, which is what made an app a thing the store had to know about; a
+// wallet id is fixed-width, so the composites below need no separator and no
+// slug validation to keep them unambiguous (§32).
 var (
-	bMeta = []byte("meta")  // "version"
+	bMeta = []byte("meta")  // "version", "token", "decimals", "chain_id"
 	bStat = []byte("state") // "cursor"
 
-	bFlow = []byte("state/flow") // flow id            -> Flow
-	bTx   = []byte("state/tx")   // tx hash            -> TxRef   (THE tx watchlist)
-	bSend = []byte("state/send") // signer ++ nonce -> Send (the journal)
+	bFlow = []byte("state/flow") // flow id          -> Flow
+	bTx   = []byte("state/tx")   // tx hash          -> TxRef   (THE tx watchlist)
+	bSend = []byte("state/send") // signer ++ nonce  -> Send    (the journal)
 
-	bApp    = []byte("data/app")    // slug        -> App (carries the ledger)
-	bWallet = []byte("data/wallet") // wallet id   -> Wallet
-	bAddr   = []byte("data/addr")   // address     -> wallet id
-	bRef    = []byte("data/ref")    // slug \0 ref -> wallet id
+	bWallet = []byte("data/wallet") // wallet id -> Wallet
+	bAddr   = []byte("data/addr")   // address   -> wallet id
+	bRef    = []byte("data/ref")    // ref       -> wallet id
 
 	bDeposit    = []byte("log/deposit")    // tx hash ++ log index -> Deposit
 	bWithdrawal = []byte("log/withdrawal") // withdrawal id        -> Withdrawal
 
-	iDep     = []byte("idx/dep")      // slug \0 block ++ logidx    -> deposit key (the cursor)
-	iDepOpen = []byte("idx/dep_open") // slug \0 wallet ++ depkey   -> deposit key (awaiting drain)
-	iWd      = []byte("idx/wd")       // slug \0 created ++ id      -> nil
-	iWdOpen  = []byte("idx/wd_open")  // slug \0 id                 -> nil
-	iWdIdem  = []byte("idx/wd_idem")  // slug \0 key                -> withdrawal id
+	iDep       = []byte("idx/dep")        // block ++ logidx            -> deposit key (the cursor)
+	iDepWallet = []byte("idx/dep_wallet") // wallet ++ block ++ logidx  -> deposit key
+	iDepOpen   = []byte("idx/dep_open")   // wallet ++ depkey           -> deposit key (awaiting a drain)
+	iWd        = []byte("idx/wd")         // created ++ id              -> nil
+	iWdFeed    = []byte("idx/wd_feed")    // block ++ id                -> nil (settled only)
+	iWdWallet  = []byte("idx/wd_wallet")  // wallet ++ created ++ id    -> nil
+	iWdOpen    = []byte("idx/wd_open")    // id                         -> nil
+	iWdIdem    = []byte("idx/wd_idem")    // idempotency key            -> withdrawal id
 )
 
 // buckets is every bucket the store creates on open.
 var buckets = [][]byte{
 	bMeta, bStat,
 	bFlow, bTx, bSend,
-	bApp, bWallet, bAddr, bRef,
+	bWallet, bAddr, bRef,
 	bDeposit, bWithdrawal,
-	iDep, iDepOpen, iWd, iWdOpen, iWdIdem,
+	iDep, iDepWallet, iDepOpen, iWd, iWdFeed, iWdWallet, iWdOpen, iWdIdem,
 }
 
 var (
@@ -55,45 +61,31 @@ var (
 	keyChainID  = []byte("chain_id") // the chain it lives on, reported by the endpoint
 )
 
-// ErrBadSlug is returned for an app slug that cannot be used in a key.
-var ErrBadSlug = errors.New("store: invalid app slug")
+// ErrBadRef is returned for a wallet ref that cannot be used as a key or in a URL.
+var ErrBadRef = errors.New("store: invalid wallet ref")
 
-// slugSep separates a variable-length slug from the fixed-width remainder of a
-// composite key. Slugs may not contain it, which validSlug enforces.
-const slugSep = 0x00
+// MaxRef bounds a ref. It is a key in bbolt and a path segment over HTTP, and
+// neither wants an unbounded string.
+const MaxRef = 128
 
-// ValidSlug accepts the conservative subset that keeps composite keys
-// unambiguous and URLs clean: lowercase letters, digits, '-', '_' and ':' (so
-// namespaced ids like "lkr:acme" work), 1..64 bytes. It is exported because the
-// HTTP layer must reject a bad slug before it reaches a key.
-func ValidSlug(s string) error {
-	if s == "" || len(s) > 64 {
-		return fmt.Errorf("%w: length %d", ErrBadSlug, len(s))
+// ValidRef accepts the conservative subset that stays unambiguous in a key and
+// clean in a URL: lowercase letters, digits, '-', '_', '.' and ':' — the last
+// so a caller can namespace its own handles (`acme:cust-1`), which it must now
+// do for itself, since bsc no longer has an app to scope them by (§37).
+func ValidRef(s string) error {
+	if s == "" || len(s) > MaxRef {
+		return fmt.Errorf("%w: length %d (want 1..%d)", ErrBadRef, len(s), MaxRef)
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
-		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_', c == ':':
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_', c == '.', c == ':':
 		default:
-			return fmt.Errorf("%w: byte %q at %d", ErrBadSlug, c, i)
+			return fmt.Errorf("%w: byte %q at %d", ErrBadRef, c, i)
 		}
 	}
 	return nil
 }
-
-// scoped builds "<slug>\0<rest...>" — the prefix form every per-app index uses.
-func scoped(slug string, rest ...[]byte) []byte {
-	k := make([]byte, 0, len(slug)+1+8)
-	k = append(k, slug...)
-	k = append(k, slugSep)
-	for _, r := range rest {
-		k = append(k, r...)
-	}
-	return k
-}
-
-// scopePrefix is the range prefix for one app inside a scoped bucket.
-func scopePrefix(slug string) []byte { return scoped(slug) }
 
 func be64(v uint64) []byte {
 	var b [8]byte
@@ -107,36 +99,53 @@ func be32(v uint32) []byte {
 	return b[:]
 }
 
+// join concatenates fixed-width key parts. Every composite in this store is
+// built from fixed-width pieces, so concatenation is unambiguous without a
+// separator.
+func join(parts ...[]byte) []byte {
+	n := 0
+	for _, p := range parts {
+		n += len(p)
+	}
+	k := make([]byte, 0, n)
+	for _, p := range parts {
+		k = append(k, p...)
+	}
+	return k
+}
+
+// walletPrefix is the range prefix for one wallet inside a wallet-scoped index.
+func walletPrefix(id uuid.UUID) []byte { return id[:] }
+
 // depositKey is tx hash ++ log index: unique per on-chain transfer, so the key
 // itself is the dedup constraint — no uniqueness check to forget.
 func depositKey(tx common.Hash, logIndex uint32) []byte {
-	k := make([]byte, 0, common.HashLength+4)
-	k = append(k, tx.Bytes()...)
-	return append(k, be32(logIndex)...)
+	return join(tx.Bytes(), be32(logIndex))
 }
 
 // sendKey is signer ++ nonce, so a scan over one signer's entries is in nonce
 // order — which is what makes re-broadcasting a dropped transaction
-// deterministic (§4).
+// deterministic.
 func sendKey(signer common.Address, nonce uint64) []byte {
-	k := make([]byte, 0, common.AddressLength+8)
-	k = append(k, signer.Bytes()...)
-	return append(k, be64(nonce)...)
+	return join(signer.Bytes(), be64(nonce))
 }
 
 // Cursor is a deposit-feed position: the chain's own ordering, (block,
 // log_index). Every deposit has one by construction, being a Transfer log, and
-// as a 12-byte key it is directly seekable (§9).
+// as a 12-byte key it is directly seekable.
 //
-// It is internal. Apps see String(), which renders it as opaque hex — they are
-// told to compare and pass back, never to parse (§27).
+// The feed is global now rather than per-app. There is one caller — the service
+// that keeps the books — and it reads every deposit bsc records, filtering by
+// wallet if it wants to. Splitting the feed per app was only ever there to keep
+// one tenant from reading another's, which is not a boundary this service draws
+// any more (§37).
 type Cursor struct {
 	Block    uint64
 	LogIndex uint32
 }
 
 // Key renders the cursor as its 12-byte sortable form.
-func (c Cursor) Key() []byte { return append(be64(c.Block), be32(c.LogIndex)...) }
+func (c Cursor) Key() []byte { return join(be64(c.Block), be32(c.LogIndex)) }
 
 // Next returns the smallest cursor strictly greater than c, which is what a
 // "give me everything after this" scan seeks to.
@@ -147,19 +156,9 @@ func (c Cursor) Next() Cursor {
 	return Cursor{Block: c.Block, LogIndex: c.LogIndex + 1}
 }
 
-// String is the wire form handed to apps: the 12-byte sortable key as hex.
-//
-// It used to be "<block>-<logindex>", which invited apps to read the chain's
-// position out of it and reason about blocks. They should not have to: a block
-// height and a log index are internal counters, and an app integrating a
-// payments provider has no use for either (§27). Hex is chosen over base64
-// because the byte order survives it — two cursors compare as strings in the
-// same order the chain produced them — so an app can still dedupe and compare
-// without being able to read anything out.
-//
-// The encoding is reversible, which is deliberate: `bsc inspect` and the logs
-// still need to locate a deposit on a block explorer. Opaque is a contract with
-// the app, not a secret.
+// String is the wire form: the 12-byte sortable key as hex. Two cursors compare
+// as strings in the order the chain produced them, so a caller can dedupe and
+// resume without parsing one.
 func (c Cursor) String() string { return hex.EncodeToString(c.Key()) }
 
 // ParseCursor reads the wire form. An empty string is the zero cursor, i.e.
@@ -178,15 +177,68 @@ func ParseCursor(s string) (Cursor, error) {
 	}, nil
 }
 
-// cursorFromScoped recovers the cursor from an idx/dep key ("<slug>\0<block><logidx>").
-func cursorFromScoped(key []byte) (Cursor, bool) {
-	i := bytes.IndexByte(key, slugSep)
-	if i < 0 || len(key)-i-1 != 12 {
+// Settled is a position in the finalized-debit feed: the block a withdrawal
+// landed in, plus its id to break ties within that block.
+//
+// Deposits get the chain's own (block, log_index), which every one has by
+// construction. A withdrawal's ordering has to be *invented* — a payout is one
+// transfer among many in its block and nothing ranks it against the others — so
+// this pairs the block with the id. That is total and immutable, which is all a
+// cursor needs; it is not meaningful, and a caller must not read one.
+type Settled struct {
+	Block uint64
+	ID    uuid.UUID
+}
+
+// Key renders the position as its 24-byte sortable form.
+func (s Settled) Key() []byte { return join(be64(s.Block), s.ID[:]) }
+
+// Next is the smallest position strictly greater than s, which is what a
+// "give me everything after this" scan seeks to.
+func (s Settled) Next() Settled {
+	next := s
+	for i := len(next.ID) - 1; i >= 0; i-- {
+		next.ID[i]++
+		if next.ID[i] != 0 {
+			return next
+		}
+	}
+	// Every byte wrapped: the largest id in this block, so move to the next.
+	return Settled{Block: s.Block + 1}
+}
+
+func (s Settled) String() string { return hex.EncodeToString(s.Key()) }
+
+// ParseSettled reads the wire form. An empty string is the zero position.
+func ParseSettled(v string) (Settled, error) {
+	if v == "" {
+		return Settled{}, nil
+	}
+	raw, err := hex.DecodeString(v)
+	if err != nil || len(raw) != 8+16 {
+		return Settled{}, fmt.Errorf("store: bad cursor %q", v)
+	}
+	out := Settled{Block: binary.BigEndian.Uint64(raw[:8])}
+	copy(out.ID[:], raw[8:])
+	return out, nil
+}
+
+func settledFromKey(key []byte) (Settled, bool) {
+	if len(key) != 8+16 {
+		return Settled{}, false
+	}
+	out := Settled{Block: binary.BigEndian.Uint64(key[:8])}
+	copy(out.ID[:], key[8:])
+	return out, true
+}
+
+// cursorFromKey recovers the cursor from a 12-byte idx/dep key.
+func cursorFromKey(key []byte) (Cursor, bool) {
+	if len(key) != 12 {
 		return Cursor{}, false
 	}
-	rest := key[i+1:]
 	return Cursor{
-		Block:    binary.BigEndian.Uint64(rest[:8]),
-		LogIndex: binary.BigEndian.Uint32(rest[8:12]),
+		Block:    binary.BigEndian.Uint64(key[:8]),
+		LogIndex: binary.BigEndian.Uint32(key[8:12]),
 	}, true
 }

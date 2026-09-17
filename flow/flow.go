@@ -4,10 +4,7 @@
 //
 // Everything here is a pure function over values. There is no I/O, no store and
 // no clock of its own, which is what makes the rules testable with synthetic
-// events — no RPC fake, no confirmer fake, no sleeping. The v1 executor could
-// not be tested this way because its pipeline *was* a function that sent a
-// transaction and blocked on finality; here "waiting" is a persisted state and
-// advancing it is arithmetic.
+// events — no RPC fake, no confirmer fake, no sleeping.
 //
 // The division of labour is deliberate: this package decides *what* should
 // happen, the store records it, and sender/ builds and signs the transaction.
@@ -33,14 +30,12 @@ var ErrTerminal = errors.New("flow: already terminal")
 
 // Params describes the flow to begin.
 type Params struct {
-	Kind   store.FlowKind
-	Wallet uuid.UUID
-	App    string
-	To     common.Address // destination: the top-level for a drain, the
-	// recipient for a withdrawal, the collector for a house sweep
-	Amount     *big.Int  // exact amount; must be unset for a drain, which sweeps everything
-	Withdrawal uuid.UUID // set for FlowWithdrawal
-	Active     bool      // whether the wallet has already approved the master
+	Kind       store.FlowKind
+	Wallet     uuid.UUID
+	To         common.Address // the drain destination, or the payout recipient
+	Amount     *big.Int       // exact amount; must be unset for a drain, which sweeps everything
+	Withdrawal uuid.UUID      // the withdrawal this transfer pays, when it pays one
+	Active     bool           // whether the wallet has already approved the master
 	Now        time.Time
 }
 
@@ -56,15 +51,7 @@ func Begin(p Params) (store.Flow, error) {
 		return store.Flow{}, err
 	}
 	state := store.StateFunding
-	if p.Kind == store.FlowGasTopUp {
-		// The master pays its own gas and needs no funding; what it needs is an
-		// allowance for the router, which Active records just as it does for a
-		// managed wallet's allowance to the master.
-		state = store.StateApprovingRouter
-		if p.Active {
-			state = store.StateSwapping
-		}
-	} else if p.Active {
+	if p.Active {
 		state = mainState(p.Kind)
 	}
 	now := p.Now
@@ -77,7 +64,6 @@ func Begin(p Params) (store.Flow, error) {
 		Kind:       p.Kind,
 		State:      state,
 		Wallet:     p.Wallet,
-		App:        p.App,
 		Withdrawal: p.Withdrawal,
 		Amount:     p.Amount,
 		To:         p.To,
@@ -86,46 +72,35 @@ func Begin(p Params) (store.Flow, error) {
 	}, nil
 }
 
+// validate enforces the one invariant a transfer has: an amount and a
+// withdrawal id travel together or not at all.
+//
+// With them, the flow is paying that withdrawal exactly what it promised.
+// Without them, it is sweeping whatever the wallet holds, read from the chain
+// when the transaction is signed. Half of either is a flow that cannot say what
+// it intends to move, and it is refused here rather than discovered at
+// settlement (§46).
 func validate(p Params) error {
 	switch p.Kind {
-	case store.FlowDrain:
+	case store.FlowTransfer:
 		if p.To == (common.Address{}) {
-			return errors.New("flow: drain needs a destination")
+			return errors.New("flow: a transfer needs a destination")
 		}
-		// A drain moves whatever is actually there, read from the chain when the
-		// transaction is signed. Carrying an amount would imply otherwise.
-		if p.Amount != nil && p.Amount.Sign() != 0 {
-			return errors.New("flow: drain must not carry an amount")
-		}
-	case store.FlowWithdrawal:
-		if p.To == (common.Address{}) {
-			return errors.New("flow: withdrawal needs a destination")
-		}
-		if p.Amount == nil || p.Amount.Sign() <= 0 {
-			return errors.New("flow: withdrawal needs a positive amount")
-		}
-		if p.Withdrawal == uuid.Nil {
-			return errors.New("flow: withdrawal needs its withdrawal id")
+		hasAmount := p.Amount != nil && p.Amount.Sign() > 0
+		switch {
+		case p.Amount != nil && p.Amount.Sign() < 0:
+			return errors.New("flow: a transfer cannot move a negative amount")
+		case hasAmount && p.Withdrawal == uuid.Nil:
+			return errors.New("flow: a transfer with an amount must name the withdrawal it pays")
+		case !hasAmount && p.Withdrawal != uuid.Nil:
+			return errors.New("flow: a transfer paying a withdrawal needs a positive amount")
 		}
 	case store.FlowPrewarm:
 		if p.Amount != nil && p.Amount.Sign() != 0 {
 			return errors.New("flow: prewarm must not carry an amount")
 		}
-	case store.FlowGasTopUp:
-		// The amount is how much of the token to trade away — fixed when the
-		// flow starts, so the size of the trade can never drift.
-		if p.Amount == nil || p.Amount.Sign() <= 0 {
-			return errors.New("flow: gas top-up needs a positive amount to swap")
-		}
-	case store.FlowHouseSweep:
-		if p.To == (common.Address{}) {
-			return errors.New("flow: house sweep needs a collector")
-		}
-		// Like a drain, the amount is resolved from the chain at signing time:
-		// it is the excess over the app's ledger, and both halves of that
-		// subtraction move while the flow waits.
-		if p.Amount != nil && p.Amount.Sign() != 0 {
-			return errors.New("flow: house sweep must not carry an amount")
+		if p.Withdrawal != uuid.Nil {
+			return errors.New("flow: prewarm pays nothing")
 		}
 	default:
 		return fmt.Errorf("flow: unknown kind %d", p.Kind)
@@ -137,29 +112,21 @@ func validate(p Params) error {
 // wallet is active. Prewarm has none: activating *is* its work.
 func mainState(k store.FlowKind) store.FlowState {
 	switch k {
-	case store.FlowDrain:
-		return store.StateSweeping // the whole balance
-	case store.FlowWithdrawal:
-		return store.StatePaying // an exact amount
+	case store.FlowTransfer:
+		return store.StateMoving
 	case store.FlowPrewarm:
 		return store.StateDone
-	case store.FlowGasTopUp:
-		return store.StateSwapping
-	case store.FlowHouseSweep:
-		return store.StateSweepingHouse
 	}
 	return store.StateFailed
 }
 
 // Next returns the state a flow moves to once the transaction it was waiting on
-// reaches finality. ok is false when that transaction reverted, which is
-// terminal: a reverted transfer means the amount, the balance or the allowance
-// was wrong, and none of those get better by sending it again.
+// reaches finality. ok is false when that transaction reverted.
 //
 // ok is also true for an action the sender found unnecessary — a wallet that
 // already holds enough gas, or whose allowance is already set. Those advance
-// without a transaction, which is how v1's on-chain idempotency checks survive
-// into a model where waiting is a state.
+// without a transaction, which is how on-chain idempotency checks survive into
+// a model where waiting is a state.
 func Next(f store.Flow, ok bool) (store.FlowState, error) {
 	if f.State.IsTerminal() {
 		return f.State, fmt.Errorf("%w: %s flow in %s", ErrTerminal, f.Kind, f.State)
@@ -172,16 +139,7 @@ func Next(f store.Flow, ok bool) (store.FlowState, error) {
 		return store.StateApproving, nil
 	case store.StateApproving:
 		return mainState(f.Kind), nil
-	case store.StateApprovingRouter:
-		return store.StateSwapping, nil
-	case store.StateSwapping:
-		return store.StateDone, nil
-	case store.StatePaying:
-		// A withdrawal ends here. The fee it charged never leaves in a transfer
-		// of its own — it is collected by not being credited to the app — so
-		// there is nothing left for the flow to do (§24).
-		return store.StateDone, nil
-	case store.StateSweeping, store.StateSweepingHouse:
+	case store.StateMoving:
 		return store.StateDone, nil
 	}
 	return store.StateFailed, fmt.Errorf("flow: unreachable state %s", f.State)
@@ -191,14 +149,14 @@ func Next(f store.Flow, ok bool) (store.FlowState, error) {
 type ActionKind uint8
 
 const (
-	ActionNone          ActionKind = iota // terminal: nothing to send
-	ActionFund                            // master sends the wallet enough BNB for its approve
-	ActionApprove                         // the wallet approves the master for MaxUint256
-	ActionSweep                           // master moves the wallet's whole token balance
-	ActionPay                             // master moves an exact amount from the wallet
-	ActionApproveRouter                   // the master lets the swap router spend its tokens
-	ActionSwap                            // the master trades tokens for native gas
-	ActionSweepHouse                      // master moves a wallet's excess over the ledger
+	ActionNone    ActionKind = iota // terminal: nothing to send
+	ActionFund                      // master sends the wallet enough BNB for its approve
+	ActionApprove                   // the wallet approves the master for MaxUint256
+	// ActionMove is one action for both shapes of transfer. A nil Amount means
+	// "everything the wallet holds", resolved from the chain at signing; a set
+	// one means exactly that. Two actions that differed only in where the
+	// number came from were two names for one transferFrom (§46).
+	ActionMove
 )
 
 func (k ActionKind) String() string {
@@ -209,16 +167,8 @@ func (k ActionKind) String() string {
 		return "fund"
 	case ActionApprove:
 		return "approve"
-	case ActionSweep:
-		return "sweep"
-	case ActionPay:
-		return "pay"
-	case ActionApproveRouter:
-		return "approve_router"
-	case ActionSwap:
-		return "swap"
-	case ActionSweepHouse:
-		return "sweep_house"
+	case ActionMove:
+		return "move"
 	}
 	return "unknown"
 }
@@ -229,34 +179,24 @@ func (k ActionKind) String() string {
 type Action struct {
 	Kind   ActionKind
 	Wallet uuid.UUID      // the managed wallet the value moves from
-	To     common.Address // destination, for Sweep and Pay
-	Amount *big.Int       // exact amount, for Pay only
+	To     common.Address // destination, for Move
+	Amount *big.Int       // exact amount, or nil to move everything
 }
 
 // Needed reports whether this action requires a transaction.
 func (a Action) Needed() bool { return a.Kind != ActionNone }
 
-// Next returns the action a flow's current state owes.
+// NextAction returns the action a flow's current state owes.
 func NextAction(f store.Flow) Action {
 	switch f.State {
 	case store.StateFunding:
 		return Action{Kind: ActionFund, Wallet: f.Wallet}
 	case store.StateApproving:
 		return Action{Kind: ActionApprove, Wallet: f.Wallet}
-	case store.StateSweeping:
-		return Action{Kind: ActionSweep, Wallet: f.Wallet, To: f.To}
-	case store.StatePaying:
-		return Action{Kind: ActionPay, Wallet: f.Wallet, To: f.To, Amount: f.Amount}
-	case store.StateApprovingRouter:
-		return Action{Kind: ActionApproveRouter, Wallet: f.Wallet}
-	case store.StateSwapping:
-		return Action{Kind: ActionSwap, Wallet: f.Wallet, Amount: f.Amount}
-	case store.StateSweepingHouse:
-		// The amount is resolved when the transaction is signed: what the wallet
-		// holds, less what its app's ledger says is owed. Both move while the
-		// flow waits, and only the reading taken at signing time is safe to act
-		// on (§25).
-		return Action{Kind: ActionSweepHouse, Wallet: f.Wallet, To: f.To}
+	case store.StateMoving:
+		// Amount rides along as it is: nil for a sweep, exact for a payout. The
+		// sender reads which from the value rather than from a kind.
+		return Action{Kind: ActionMove, Wallet: f.Wallet, To: f.To, Amount: f.Amount}
 	}
 	return Action{Kind: ActionNone, Wallet: f.Wallet}
 }

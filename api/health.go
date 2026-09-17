@@ -21,13 +21,8 @@ type Health struct {
 	// an empty master.
 	MasterGas func() *big.Int
 
-	// Floor is swap.gas_floor_wei: below this, a top-up is due.
+	// Floor is gas.floor_wei: below this, the master needs refilling.
 	Floor *big.Int
-
-	// SwapAmount is swap.amount_wei — the tokens a top-up has to sell. Nil when
-	// swapping is disabled, which is what turns a low master from a condition
-	// that fixes itself into one that does not.
-	SwapAmount *big.Int
 }
 
 // healthView is deliberately more than "ok". A health check that cannot fail
@@ -49,14 +44,14 @@ type healthView struct {
 //   - the store will not answer, so nothing can be read or written;
 //   - the watcher is far enough behind that withdrawals are being refused,
 //     because balances are no longer current (§21);
-//   - the master cannot pay for gas and cannot fix that itself.
+//   - the master is below the gas floor, so it can no longer pay to move
+//     anything.
 //
-// That last one is the subtle one and is why this check exists at all. A low
-// master is normally self-healing: the top-up sells collected fees back into
-// gas. It is only a human's problem when it is low *and* there is nothing to
-// sell — or swapping is off — which is exactly the combination the Grafana
-// panel guidance calls out. Reporting a low master on its own would cry wolf on
-// a condition the service fixes by itself every day.
+// That last check used to be a conjunction — low *and* unable to recover —
+// because the automatic top-up meant a low master normally fixed itself, and
+// reporting it would have cried wolf. With trading moved to an operator command
+// nothing fixes it automatically any more, so being low is exactly the finding:
+// it is the signal to go and run `bsc swap` (§38).
 //
 // **This is for monitoring, not for restarting.** A 503 here means "do not send
 // this traffic and look at me", never "bounce me": nothing it reports is fixed
@@ -66,10 +61,8 @@ func (s *Server) getHealth(w http.ResponseWriter, _ *http.Request) error {
 
 	// Cheapest possible proof the store is readable and consistent, and the one
 	// failure that leaves the process up but unable to do anything.
-	var apps []store.App
 	if err := s.store.View(func(tx *store.Tx) error {
-		var err error
-		apps, err = tx.Apps()
+		_, err := tx.Wallets("", 1)
 		return err
 	}); err != nil {
 		view.Status, view.Store = "degraded", err.Error()
@@ -78,7 +71,6 @@ func (s *Server) getHealth(w http.ResponseWriter, _ *http.Request) error {
 		writeJSON(w, http.StatusServiceUnavailable, view)
 		return nil
 	}
-	_ = apps
 
 	view.Behind = s.sync.Behind()
 	if view.Behind > s.opts.MaxLagBlocks {
@@ -101,9 +93,8 @@ func (s *Server) getHealth(w http.ResponseWriter, _ *http.Request) error {
 	return nil
 }
 
-// gasTrouble reports a master that is low on gas *and* cannot recover on its
-// own. A master that is merely low is not a finding: the top-up exists for
-// exactly that and runs without being asked.
+// gasTrouble reports a master below the gas floor. Nothing refills it without
+// being asked, so low is the whole finding.
 func (s *Server) gasTrouble() (string, bool) {
 	h := s.opts.Health
 	if h.MasterGas == nil || h.Floor == nil || h.Floor.Sign() <= 0 {
@@ -117,36 +108,5 @@ func (s *Server) gasTrouble() (string, bool) {
 		return "", false
 	}
 
-	// Below the floor. Whether that is a problem depends entirely on whether a
-	// top-up can still happen.
-	if h.SwapAmount == nil || h.SwapAmount.Sign() <= 0 {
-		return "the master is below the gas floor and gas top-ups are disabled: " +
-			"nothing will refill it", true
-	}
-
-	// A top-up sells the master's own collected fees, so the question is
-	// whether it holds enough of them.
-	var held *big.Int
-	if err := s.store.View(func(tx *store.Tx) error {
-		master, err := s.ring.Master()
-		if err != nil {
-			return err
-		}
-		wl, found, err := tx.WalletByAddress(master.Address)
-		if err != nil || !found {
-			return err
-		}
-		held = wl.Balance
-		return nil
-	}); err != nil {
-		return "", false // a store failure is already reported above
-	}
-	if held == nil {
-		held = new(big.Int)
-	}
-	if held.Cmp(h.SwapAmount) < 0 {
-		return "the master is below the gas floor and holds too little to swap for more: " +
-			"this is the combination that does not fix itself", true
-	}
-	return "", false
+	return "the master is below the gas floor: it cannot pay for transfers until it is refilled", true
 }

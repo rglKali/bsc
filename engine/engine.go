@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"bsc/flow"
-	"bsc/money"
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -28,34 +27,20 @@ import (
 )
 
 // Config carries the operator settings the rules need.
+//
+// It used to carry the fee collector, the house-sweep minimum, the token scale
+// and five swap settings. All of those existed to serve the ledger or the gas
+// top-up, and both are gone: what is left is the one number that decides
+// whether moving money is worth the gas.
 type Config struct {
-	// Scale converts between the ledger's cents and the chain's wei. It has no
-	// default: a component that was never told the token's decimals must fail
-	// at construction rather than silently value everything at one wei.
-	Scale money.Scale
-
-	DrainThreshold *big.Int       // don't spend gas moving less than this
-	FeeCollector   common.Address // where the house's money lands
-
-	// HouseSweepMin is how much excess over an app's ledger is worth a transfer.
-	// Zero disables sweeping entirely, which is safe: the excess is ours either
-	// way and simply keeps accumulating in the wallet.
-	HouseSweepMin *big.Int
-
-	// Gas top-up. Disabled unless a router is configured: this is the only work
-	// the service starts on its own initiative, and the only one whose outcome
-	// is a price rather than a yes/no.
-	SwapEnabled  bool
-	SwapAmount   *big.Int      // tokens to trade in one go
-	GasFloor     *big.Int      // native balance below which a top-up is due
-	SwapCooldown time.Duration // minimum gap between attempts
+	DrainThreshold *big.Int // don't spend gas moving less than this
 }
 
 // Advance applies a flow transition and, when the flow becomes terminal,
 // everything settlement implies. ok is false when the transaction reverted, and
 // true both for a confirmation and for an action the sender skipped as
 // unnecessary.
-func Advance(tx *store.Tx, f store.Flow, ok bool, now time.Time) (store.Flow, error) {
+func Advance(tx *store.Tx, f store.Flow, block uint64, ok bool, now time.Time) (store.Flow, error) {
 	next, err := flow.Next(f, ok)
 	if err != nil {
 		return f, err
@@ -78,7 +63,7 @@ func Advance(tx *store.Tx, f store.Flow, ok bool, now time.Time) (store.Flow, er
 		f.Tx = common.Hash{} // the next state owes a new transaction
 		return f, tx.PutFlow(f)
 	}
-	if err := settle(tx, f, from, confirmed, ok, now); err != nil {
+	if err := settle(tx, f, from, confirmed, block, ok, now); err != nil {
 		return f, err
 	}
 	// Deleting releases the wallet, which is what makes it eligible for the
@@ -93,47 +78,60 @@ func Advance(tx *store.Tx, f store.Flow, ok bool, now time.Time) (store.Flow, er
 // that reverted from a withdrawal that never got as far as paying. Neither is
 // terminal for the request — both retry (§28) — but only the first has a payout
 // transaction worth recording.
-func settle(tx *store.Tx, f store.Flow, from store.FlowState, confirmed common.Hash, ok bool, now time.Time) error {
-	switch f.Kind {
-	case store.FlowDrain:
-		return settleDrain(tx, f, confirmed, ok, now)
-	case store.FlowWithdrawal:
-		return settleWithdrawal(tx, f, from, confirmed, ok, now)
-	case store.FlowPrewarm:
+func settle(tx *store.Tx, f store.Flow, from store.FlowState, confirmed common.Hash, block uint64, ok bool, now time.Time) error {
+	switch {
+	case f.Kind == store.FlowPrewarm:
 		return nil // activation already recorded above
-	case store.FlowGasTopUp:
-		// Whatever happened, do not try again until the cooldown expires —
-		// including on success, since a swap that did not lift the balance
-		// above the floor would otherwise re-fire and keep trading.
-		return nil
-	case store.FlowHouseSweep:
-		// Nothing to record: the money was never owed to anybody, so no ledger
-		// entry changes. A failure just backs the wallet off so the rule does
-		// not re-fire into the same problem every block.
-		if !ok {
-			return backOff(tx, f.Wallet, now)
-		}
-		_, err := tx.ClearBackoff(f.Wallet)
-		return err
+	case f.Kind != store.FlowTransfer:
+		return fmt.Errorf("engine: cannot settle unknown flow kind %d", f.Kind)
+	// Which of the two a transfer is comes from whether it names a withdrawal,
+	// which flow.Begin guarantees travels with the amount (§46).
+	case f.Pays():
+		return settleWithdrawal(tx, f, from, confirmed, block, ok, now)
+	default:
+		return settleDrain(tx, f, confirmed, block, ok, now)
 	}
-	return fmt.Errorf("engine: cannot settle unknown flow kind %d", f.Kind)
 }
 
-func settleDrain(tx *store.Tx, f store.Flow, confirmed common.Hash, ok bool, now time.Time) error {
+// settleDrain records the debit the drain performed and links the credits it
+// carried to it.
+//
+// The record is created here rather than when the drain started, and is born
+// terminal. A drain is not a promise: nothing was owed to anybody while it was
+// in flight, nobody could refuse it, and it never counted against the wallet.
+// What there is, once it lands, is an observation — money left this address —
+// which is the same kind of fact as a deposit and is recorded the same way
+// (§42).
+//
+// Nothing is credited. Under the ledger this was the moment an app's money
+// became spendable; now it is simply the moment the money left one address for
+// another.
+func settleDrain(tx *store.Tx, f store.Flow, confirmed common.Hash, block uint64, ok bool, now time.Time) error {
 	if !ok {
 		return backOff(tx, f.Wallet, now)
 	}
-	// One sweep moves the whole balance, so it credits every deposit waiting on
-	// this wallet at once — and the money only becomes spendable now, because
-	// only now is it in the wallet payouts are drawn from (§22).
-	_, cents, err := tx.CreditDeposits(f.App, f.Wallet, confirmed)
-	if err != nil {
-		return fmt.Errorf("engine: credit deposits: %w", err)
+	// A drain that needed no transaction — an empty wallet the sender skipped —
+	// moved nothing, so there is nothing to observe and no debit to record.
+	if confirmed == (common.Hash{}) {
+		_, err := tx.ClearBackoff(f.Wallet)
+		return err
 	}
-	if cents > 0 {
-		if _, err := tx.CreditLedger(f.App, cents); err != nil {
-			return fmt.Errorf("engine: credit ledger: %w", err)
-		}
+	debit := store.Withdrawal{
+		ID: uuid.New(), Wallet: f.Wallet, Reason: store.ReasonDrain,
+		Destination: f.To,
+		// Resolved when the sweep was signed, from the balance the chain
+		// reported then — a drain never carries an amount before that.
+		Amount: f.Amount,
+		Status: store.WithdrawalConfirmed, TxHash: confirmed, Block: block,
+		CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
+	}
+	if err := tx.PutWithdrawal(debit); err != nil {
+		return fmt.Errorf("engine: record drain: %w", err)
+	}
+	// One sweep moves the whole balance, so it consumes every credit waiting on
+	// this wallet at once.
+	if _, err := tx.ForwardDeposits(f.Wallet, debit.ID); err != nil {
+		return fmt.Errorf("engine: forward deposits: %w", err)
 	}
 	if _, err := tx.ClearBackoff(f.Wallet); err != nil {
 		return fmt.Errorf("engine: clear backoff: %w", err)
@@ -141,12 +139,12 @@ func settleDrain(tx *store.Tx, f store.Flow, confirmed common.Hash, ok bool, now
 	return nil
 }
 
-func settleWithdrawal(tx *store.Tx, f store.Flow, from store.FlowState, confirmed common.Hash, ok bool, now time.Time) error {
-	// A withdrawal that never reached its payout has not been decided: the
+func settleWithdrawal(tx *store.Tx, f store.Flow, from store.FlowState, confirmed common.Hash, block uint64, ok bool, now time.Time) error {
+	// A withdrawal that never reached the transfer has not been decided: the
 	// funding or the approval failed, and the request stays `pending` for the
 	// rules to retry. Backing the wallet off is what keeps that retry from
 	// becoming a loop that burns gas as fast as blocks arrive.
-	if from != store.StatePaying {
+	if from != store.StateMoving {
 		if ok {
 			return fmt.Errorf("engine: withdrawal flow %s ended in %s without paying", f.ID, from)
 		}
@@ -161,11 +159,11 @@ func settleWithdrawal(tx *store.Tx, f store.Flow, from store.FlowState, confirme
 		return fmt.Errorf("engine: withdrawal %s vanished", f.Withdrawal)
 	}
 
-	// A payout that reverted is not the app's problem to compensate for: the
-	// money stays reserved, the record stays `pending`, and the wallet backs off
-	// so ShouldPay picks it up again later (§28). Releasing the reservation here
-	// would hand the app back money it has already committed, and marking the
-	// record terminal would make it look settled when nothing moved.
+	// A payout that reverted is not the caller's problem to compensate for: the
+	// record stays `pending` and the wallet backs off so ShouldPay picks it up
+	// again later (§28). Marking it terminal would make it look settled when
+	// nothing moved — and while it is pending it still counts against the
+	// wallet's committed total, so the overdraft guard keeps holding.
 	if !ok {
 		_, err := tx.MutateWithdrawal(wd.ID, func(w *store.Withdrawal) error {
 			// Kept for the operator, not as a verdict: the request is still
@@ -180,24 +178,16 @@ func settleWithdrawal(tx *store.Tx, f store.Flow, from store.FlowState, confirme
 		return backOff(tx, f.Wallet, now)
 	}
 
-	// Release exactly what this record reserved, rather than recomputing it: a
-	// policy change between request and settlement must not move the figure.
-	if _, err := tx.ReleaseLedger(f.App, wd.Debit); err != nil {
-		return fmt.Errorf("engine: release reserve: %w", err)
-	}
-	// Payout and fee leave the ledger together. Only the payout moved on-chain;
-	// the fee stays in the wallet, uncredited, which is precisely how it is
-	// collected (§24).
-	if _, err := tx.DebitLedger(f.App, wd.Debit); err != nil {
-		return fmt.Errorf("engine: debit ledger: %w", err)
-	}
 	if _, err := tx.ClearBackoff(f.Wallet); err != nil {
 		return fmt.Errorf("engine: clear backoff: %w", err)
 	}
-
+	// The wallet's balance is not adjusted here. The watcher observes the
+	// outgoing Transfer in the same block and debits custody from the log,
+	// which keeps one source of truth for what a wallet holds.
 	_, err = tx.MutateWithdrawal(wd.ID, func(w *store.Withdrawal) error {
-		w.Status = store.WithdrawalDebited
+		w.Status = store.WithdrawalConfirmed
 		w.TxHash = confirmed
+		w.Block = block
 		w.Error = ""
 		return nil
 	})
@@ -222,122 +212,52 @@ func backOff(tx *store.Tx, wallet uuid.UUID, now time.Time) error {
 	return nil
 }
 
-// EvaluateWallet starts a drain if this wallet is owed one, reporting whether
-// it did. Callers pass the wallets a block actually touched rather than every
-// wallet in the database.
-func EvaluateWallet(tx *store.Tx, w store.Wallet, cfg Config, now time.Time) (bool, error) {
-	if !flow.ShouldDrain(w, cfg.DrainThreshold, now) {
-		return false, nil
-	}
-	app, found, err := tx.App(w.App)
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		return false, fmt.Errorf("engine: wallet %s belongs to unknown app %q", w.ID, w.App)
-	}
-	top, found, err := tx.Wallet(app.Wallet)
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		return false, fmt.Errorf("engine: app %q has no top-level wallet", w.App)
-	}
-	return true, begin(tx, flow.Params{
-		Kind: store.FlowDrain, Wallet: w.ID, App: w.App,
-		To: top.Address, Active: w.Active, Now: now,
-	})
-}
-
-// EvaluateApp starts a pending withdrawal if one is owed and the app's top-level
-// wallet is free, and otherwise considers sweeping the house's excess.
+// EvaluateWallet starts whatever this wallet is owed, reporting whether it did.
 //
-// The two are ordered, not raced: one wallet runs one flow at a time, and the
-// app's payout is the more urgent use of it. The excess is ours and is not going
-// anywhere, so it waits for a quiet moment.
-func EvaluateApp(tx *store.Tx, a store.App, cfg Config, now time.Time) (bool, error) {
-	top, found, err := tx.Wallet(a.Wallet)
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		return false, fmt.Errorf("engine: app %q has no top-level wallet", a.Slug)
-	}
-	if !top.Idle() {
+// One function covers both rules now, because with the topology on the wallet
+// the two cases are mutually exclusive by construction: a wallet either
+// forwards what it receives or holds it and pays out. There is no ordering to
+// get right between them and no app-level pass above it (§32).
+func EvaluateWallet(tx *store.Tx, w store.Wallet, cfg Config, now time.Time) (bool, error) {
+	if !w.Idle() {
 		return false, nil
 	}
-
-	pending, err := oldestPending(tx, a.Slug)
-	if err != nil {
-		return false, err
-	}
-	if flow.ShouldPay(a, top, pending != nil, now) {
+	if w.Proxies() {
+		if !flow.ShouldDrain(w, cfg.DrainThreshold, now) {
+			return false, nil
+		}
 		return true, begin(tx, flow.Params{
-			Kind: store.FlowWithdrawal, Wallet: top.ID, App: a.Slug,
-			To: pending.Destination, Amount: cfg.Scale.Wei(pending.Payout),
-			Withdrawal: pending.ID, Active: top.Active, Now: now,
+			Kind: store.FlowTransfer, Wallet: w.ID,
+			To: w.DrainTo, Active: w.Active, Now: now,
 		})
 	}
 
-	// What the wallet holds beyond what the app is owed is the house's: the
-	// fees withdrawals charged, the sub-cent remainders flooring left behind,
-	// and anything a stranger sent to the address. After the ledger they are
-	// one quantity and one rule collects them all (§25).
-	excess := cfg.Scale.Excess(top.Balance, a.Ledger)
-	if flow.ShouldSweepHouse(top, excess, cfg.HouseSweepMin, pending != nil, now) {
-		return true, begin(tx, flow.Params{
-			Kind: store.FlowHouseSweep, Wallet: top.ID, App: a.Slug,
-			To: cfg.FeeCollector, Active: top.Active, Now: now,
-		})
-	}
-
-	return false, nil
-}
-
-// EvaluateGas starts a gas top-up if the master is running low. The native
-// balance is passed in because it cannot be derived from logs — an operator's
-// manual top-up is a plain value transfer that emits nothing — so the caller
-// supplies whatever its last poll saw.
-func EvaluateGas(tx *store.Tx, cfg Config, master store.Wallet, native *big.Int, now time.Time) (bool, error) {
-	if !flow.ShouldTopUpGas(master, native, cfg.GasFloor, cfg.SwapAmount, cfg.SwapEnabled, now) {
-		return false, nil
-	}
-	// Stamp the cooldown as the flow starts, not when it finishes, so a crash
-	// mid-swap cannot produce a burst of attempts on restart.
-	if _, err := tx.BackOff(master.ID, now.Add(cfg.SwapCooldown)); err != nil {
+	pending, err := oldestPending(tx, w.ID)
+	if err != nil {
 		return false, err
+	}
+	if !flow.ShouldPay(w, pending != nil, now) {
+		return false, nil
 	}
 	return true, begin(tx, flow.Params{
-		Kind: store.FlowGasTopUp, Wallet: master.ID, App: master.App,
-		Amount: cfg.SwapAmount, Active: master.Active, Now: now,
+		Kind: store.FlowTransfer, Wallet: w.ID,
+		To: pending.Destination, Amount: pending.Amount,
+		Withdrawal: pending.ID, Active: w.Active, Now: now,
 	})
 }
 
-// EvaluateAll runs every rule over every app and wallet. It is the startup pass
-// and the safety net: because the rules read current state rather than react to
-// events, one sweep converges whatever was missed while the process was down.
+// EvaluateAll runs every rule over every wallet. It is the startup pass and the
+// safety net: because the rules read current state rather than react to events,
+// one sweep converges whatever was missed while the process was down.
 func EvaluateAll(tx *store.Tx, cfg Config, now time.Time) (int, error) {
-	started := 0
-	apps, err := tx.Apps()
-	if err != nil {
-		return 0, err
-	}
-	for _, a := range apps {
-		ok, err := EvaluateApp(tx, a, cfg, now)
-		if err != nil {
-			return started, err
-		}
-		if ok {
-			started++
-		}
-	}
 	var wallets []store.Wallet
 	if err := tx.EachWallet(func(w store.Wallet) error {
 		wallets = append(wallets, w)
 		return nil
 	}); err != nil {
-		return started, err
+		return 0, err
 	}
+	started := 0
 	for _, w := range wallets {
 		ok, err := EvaluateWallet(tx, w, cfg, now)
 		if err != nil {
@@ -350,14 +270,14 @@ func EvaluateAll(tx *store.Tx, cfg Config, now time.Time) (int, error) {
 	return started, nil
 }
 
-// oldestPending returns the app's longest-waiting pending withdrawal, or nil.
+// oldestPending returns a wallet's longest-waiting pending withdrawal, or nil.
 //
-// Oldest-first is what stops a withdrawal that keeps reverting from starving the
-// ones behind it forever: it is retried rather than failed (§28), so without an
-// ordering it could hold the wallet on every evaluation. Its wallet backoff lets
-// the queue behind it move in the meantime.
-func oldestPending(tx *store.Tx, slug string) (*store.Withdrawal, error) {
-	open, err := tx.OpenWithdrawals(slug)
+// Oldest-first is what stops a withdrawal that keeps reverting from starving
+// the ones behind it forever: it is retried rather than failed (§28), so
+// without an ordering it could hold the wallet on every evaluation. Its wallet
+// backoff lets the queue behind it move in the meantime.
+func oldestPending(tx *store.Tx, wallet uuid.UUID) (*store.Withdrawal, error) {
+	open, err := tx.WalletOpenWithdrawals(wallet)
 	if err != nil {
 		return nil, err
 	}

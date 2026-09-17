@@ -6,13 +6,13 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
 	"bsc/keys"
-	"bsc/money"
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -72,8 +72,7 @@ func newFixture(t *testing.T) *fixture {
 		sync:  &fakeSync{},
 	}
 	f.srv = New(st, ring, f.addrs, f.sync, Options{
-		DefaultFee: store.FeePolicy{Flat: 1},
-		Notify:     func() { f.notify++ },
+		Notify: func() { f.notify++ },
 	})
 	f.mux = http.NewServeMux()
 	f.srv.Routes(f.mux)
@@ -112,106 +111,201 @@ func (f *fixture) json(w *httptest.ResponseRecorder, want int, into any) {
 }
 
 // register creates an app and returns its view.
-func (f *fixture) register(slug string) appView {
+// wallet creates a wallet and returns its view.
+func (f *fixture) wallet(ref string) walletView {
 	f.t.Helper()
-	var out appView
-	f.json(f.do("PUT", "/v1/apps/"+slug, appBody{}), http.StatusCreated, &out)
+	var out walletView
+	f.json(f.do("PUT", "/v1/wallets/"+ref, createWalletBody{}), http.StatusCreated, &out)
 	return out
 }
 
-// credit gives an app a spendable ledger balance and the custody behind it, as
-// a settled drain would. Cents and wei are one-to-one here, which is the truth
-// for a two-decimal token and keeps the figures readable as both.
-func (f *fixture) credit(slug string, v int64) {
+// proxy creates a forwarding wallet pointed at drainTo.
+func (f *fixture) proxy(ref, drainTo string) walletView {
+	f.t.Helper()
+	var out walletView
+	f.json(f.do("PUT", "/v1/wallets/"+ref, createWalletBody{DrainTo: drainTo}),
+		http.StatusCreated, &out)
+	return out
+}
+
+// credit puts custody on a wallet, as an observed transfer would. Custody is
+// the only balance there is now, so this is the whole of "give it money".
+func (f *fixture) credit(ref string, v int64) {
 	f.t.Helper()
 	if err := f.st.Update(func(tx *store.Tx) error {
-		a, _, err := tx.App(slug)
-		if err != nil {
-			return err
+		w, ok, err := tx.WalletByRef(ref)
+		if err != nil || !ok {
+			f.t.Fatalf("wallet %q: ok=%v err=%v", ref, ok, err)
 		}
-		if _, err := tx.Credit(a.Wallet, big.NewInt(v)); err != nil {
-			return err
-		}
-		_, err = tx.CreditLedger(slug, money.Cents(v))
+		_, err = tx.Credit(w.ID, big.NewInt(v))
 		return err
 	}); err != nil {
 		f.t.Fatalf("credit: %v", err)
 	}
 }
 
-func TestRegisterAppIsIdempotent(t *testing.T) {
-	// Registration is public and idempotent by design: calling it on every boot
-	// is the intended usage.
+func TestCreateWalletIsIdempotentOnRef(t *testing.T) {
 	f := newFixture(t)
-	first := f.register("df")
-	if first.Address == "" || first.Slug != "df" {
+	first := f.wallet("cust-1")
+	if first.Address == "" || first.Ref != "cust-1" {
 		t.Fatalf("view = %+v", first)
 	}
 	if !f.addrs.has(common.HexToAddress(first.Address)) {
-		t.Fatal("the new top-level address was not registered for watching")
+		t.Fatal("the new address was not registered for watching")
 	}
 
-	var second appView
-	f.json(f.do("PUT", "/v1/apps/df", appBody{}), http.StatusOK, &second)
-	if second.Address != first.Address {
-		t.Fatalf("re-registration changed the address: %s -> %s", first.Address, second.Address)
+	var again walletView
+	f.json(f.do("PUT", "/v1/wallets/"+"cust-1", createWalletBody{}), http.StatusOK, &again)
+	if again.Address != first.Address {
+		t.Fatalf("ref remapped: %s -> %s", first.Address, again.Address)
 	}
 
-	// Exactly one wallet and one prewarm flow, not two.
-	var wallets, flows int
+	// Exactly one wallet, and no flow at all: creating a wallet spends nothing.
+	wallets, flows := f.counts()
+	if wallets != 1 || flows != 0 {
+		t.Fatalf("wallets=%d flows=%d, want 1 and 0", wallets, flows)
+	}
+}
+
+// Creating a wallet must not spend anything. An address book of users who
+// register and never deposit would otherwise cost one funding transfer and one
+// approve each, paid by the master, for money that never arrives (§41).
+func TestCreatingAWalletStartsNoWork(t *testing.T) {
+	f := newFixture(t)
+	before := f.notify
+	for _, ref := range []string{"a", "b", "c"} {
+		f.wallet(ref)
+	}
+
+	wallets, flows := f.counts()
+	if wallets != 3 || flows != 0 {
+		t.Fatalf("wallets=%d flows=%d, want 3 and 0", wallets, flows)
+	}
+	if f.notify != before {
+		t.Fatal("the sender was nudged for work that does not exist")
+	}
+
+	// The wallet is inactive, which is what makes the first real flow start at
+	// funding rather than skipping straight to the transfer.
 	if err := f.st.View(func(tx *store.Tx) error {
-		if err := tx.EachWallet(func(store.Wallet) error { wallets++; return nil }); err != nil {
-			return err
+		w, ok, err := tx.WalletByRef("a")
+		if err != nil || !ok {
+			t.Fatalf("lookup: ok=%v err=%v", ok, err)
 		}
+		if w.Active {
+			t.Fatal("a freshly created wallet is already active")
+		}
+		if !w.Idle() {
+			t.Fatal("a freshly created wallet is already busy")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Prewarming is the opt-out, for a wallet you know will be used — a treasury
+// you are about to pay out of, where three transactions of latency on the first
+// payout is worse than one activation you were always going to pay for.
+func TestPrewarmIsOptIn(t *testing.T) {
+	f := newFixture(t)
+	before := f.notify
+
+	var w walletView
+	f.json(f.do("PUT", "/v1/wallets/"+"treasury", createWalletBody{Prewarm: true}),
+		http.StatusCreated, &w)
+
+	wallets, flows := f.counts()
+	if wallets != 1 || flows != 1 {
+		t.Fatalf("wallets=%d flows=%d, want 1 and 1", wallets, flows)
+	}
+	if f.notify <= before {
+		t.Fatal("the sender was not nudged for the prewarm")
+	}
+	if err := f.st.View(func(tx *store.Tx) error {
 		return tx.EachFlow(func(fl store.Flow) error {
-			flows++
 			if fl.Kind != store.FlowPrewarm {
 				t.Fatalf("flow kind = %s, want prewarm", fl.Kind)
 			}
 			return nil
 		})
 	}); err != nil {
-		t.Fatalf("View: %v", err)
-	}
-	if wallets != 1 || flows != 1 {
-		t.Fatalf("wallets=%d flows=%d, want 1 and 1", wallets, flows)
+		t.Fatal(err)
 	}
 }
 
-func TestRegisterRejectsABadSlug(t *testing.T) {
+// counts is (wallets, live flows).
+func (f *fixture) counts() (int, int) {
+	f.t.Helper()
+	var wallets, flows int
+	if err := f.st.View(func(tx *store.Tx) error {
+		if err := tx.EachWallet(func(store.Wallet) error { wallets++; return nil }); err != nil {
+			return err
+		}
+		return tx.EachFlow(func(store.Flow) error { flows++; return nil })
+	}); err != nil {
+		f.t.Fatalf("View: %v", err)
+	}
+	return wallets, flows
+}
+
+// Idempotent on ref, but only for the same wallet: handing back one configured
+// differently from what was asked for would be a silent disagreement about
+// where its money goes.
+func TestCreateWalletConflictsOnADifferentDrainTo(t *testing.T) {
 	f := newFixture(t)
-	for _, slug := range []string{"Bad", "with%20space", "a:b:c:" + strings.Repeat("x", 70)} {
-		if w := f.do("PUT", "/v1/apps/"+slug, appBody{}); w.Code != http.StatusBadRequest {
-			t.Fatalf("slug %q: status %d, want 400", slug, w.Code)
+	hot := f.wallet("hot")
+	f.proxy("cust-1", hot.Address)
+
+	w := f.do("PUT", "/v1/wallets/"+"cust-1", createWalletBody{})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateWalletRejectsABadRef(t *testing.T) {
+	f := newFixture(t)
+	// Escaped, so the handler actually sees the ref and rejects it rather than
+	// the router refusing a malformed path first.
+	for _, ref := range []string{"Bad", "with space", "nul\x00ref", strings.Repeat("x", 200)} {
+		path := "/v1/wallets/" + url.PathEscape(ref)
+		if w := f.do("PUT", path, createWalletBody{}); w.Code != http.StatusBadRequest {
+			t.Fatalf("ref %q: status %d, want 400", ref, w.Code)
+		}
+	}
+	// A ref cannot be empty or contain a slash, and neither is expressible as
+	// one path segment — the router refuses both before a handler sees them,
+	// which is the same answer by a shorter road.
+	for _, path := range []string{"/v1/wallets/", "/v1/wallets/a/b"} {
+		if w := f.do("PUT", path, createWalletBody{}); w.Code < 400 {
+			t.Fatalf("%s: status %d, want a refusal", path, w.Code)
 		}
 	}
 }
 
-func TestAppConfiguresItsOwnFee(t *testing.T) {
-	// No operator floor: the fee is a charge on the app's own users.
+// Refs are a single global namespace now, so the caller has to namespace them
+// itself — which is why ':' is allowed in one (§37).
+func TestRefsAreGlobalAndMayBeNamespaced(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-
-	var got appView
-	f.json(f.do("PUT", "/v1/apps/df", appBody{
-		Fee: &feeBody{FlatCents: "200", MinCents: "10"},
-	}), http.StatusOK, &got)
-	if got.Fee.FlatCents != "200" || got.Fee.MinCents != "10" {
-		t.Fatalf("fee = %+v", got.Fee)
+	a := f.wallet("acme:cust-1")
+	b := f.wallet("globex:cust-1")
+	if a.Address == b.Address {
+		t.Fatal("two refs produced one address")
 	}
 
-	// Zero is a legitimate policy: some apps do not charge at all.
-	f.json(f.do("PUT", "/v1/apps/df", appBody{Fee: &feeBody{FlatCents: "0"}}), http.StatusOK, &got)
-	if got.Fee.FlatCents != "0" {
-		t.Fatalf("fee = %+v, want a free policy", got.Fee)
+	var list struct {
+		Wallets []walletView `json:"wallets"`
+	}
+	f.json(f.do("GET", "/v1/wallets", nil), http.StatusOK, &list)
+	if len(list.Wallets) != 2 {
+		t.Fatalf("listing = %d wallets, want both", len(list.Wallets))
 	}
 }
 
-func TestUnknownAppIsNotFound(t *testing.T) {
+func TestUnknownWalletIsNotFound(t *testing.T) {
 	f := newFixture(t)
 	for _, path := range []string{
-		"/v1/apps/nope", "/v1/apps/nope/balance", "/v1/apps/nope/deposits",
-		"/v1/apps/nope/withdrawals", "/v1/apps/nope/addresses",
+		"/v1/wallets/nope", "/v1/wallets/nope/deposits", "/v1/wallets/nope/withdrawals",
 	} {
 		if w := f.do("GET", path, nil); w.Code != http.StatusNotFound {
 			t.Fatalf("%s: status %d, want 404", path, w.Code)
@@ -221,9 +315,8 @@ func TestUnknownAppIsNotFound(t *testing.T) {
 
 func TestMalformedBodiesAreRejected(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
 
-	r := httptest.NewRequest("POST", "/v1/apps/df/addresses", strings.NewReader("{not json"))
+	r := httptest.NewRequest("PUT", "/v1/wallets/x", strings.NewReader("{not json"))
 	w := httptest.NewRecorder()
 	f.mux.ServeHTTP(w, r)
 	if w.Code != http.StatusBadRequest {
@@ -232,7 +325,7 @@ func TestMalformedBodiesAreRejected(t *testing.T) {
 
 	// A misspelled field must not be silently ignored — it usually means the
 	// caller thinks it configured something it did not.
-	r = httptest.NewRequest("POST", "/v1/apps/df/addresses", strings.NewReader(`{"reff":"x"}`))
+	r = httptest.NewRequest("PUT", "/v1/wallets/x", strings.NewReader(`{"drain_too":"x"}`))
 	w = httptest.NewRecorder()
 	f.mux.ServeHTTP(w, r)
 	if w.Code != http.StatusBadRequest {
@@ -240,74 +333,127 @@ func TestMalformedBodiesAreRejected(t *testing.T) {
 	}
 }
 
-func TestDepositAddressIsIdempotentOnRef(t *testing.T) {
+// DrainTo is the one piece of configuration a wallet has, and retargeting is
+// validated rather than trusted: a cycle would move the same money round and
+// round, succeeding every hop (§35).
+func TestPatchRetargetsAWallet(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
+	hot := f.wallet("hot")
+	w := f.wallet("cust-1")
 
-	var first depositAddressView
-	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}),
-		http.StatusCreated, &first)
-	if first.Address == "" {
-		t.Fatal("no address returned")
-	}
-	if !f.addrs.has(common.HexToAddress(first.Address)) {
-		t.Fatal("new deposit address not registered for watching")
+	var got walletView
+	f.json(f.do("PATCH", "/v1/wallets/cust-1", patchWalletBody{DrainTo: ptr(hot.Address)}),
+		http.StatusOK, &got)
+	if got.DrainTo != hot.Address {
+		t.Fatalf("drain_to = %q, want %s", got.DrainTo, hot.Address)
 	}
 
-	var again depositAddressView
-	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}),
-		http.StatusOK, &again)
-	if again.Address != first.Address {
-		t.Fatalf("ref remapped: %s -> %s", first.Address, again.Address)
+	// And back to accumulating: an empty string is how that is said. A fresh
+	// struct, because drain_to is omitempty and would keep the old value.
+	var cleared walletView
+	f.json(f.do("PATCH", "/v1/wallets/cust-1", patchWalletBody{DrainTo: ptr("")}),
+		http.StatusOK, &cleared)
+	if cleared.DrainTo != "" {
+		t.Fatalf("drain_to = %q, want it cleared", cleared.DrainTo)
 	}
+	_ = w
+}
 
-	var fetched depositAddressView
-	f.json(f.do("GET", "/v1/apps/df/addresses/cust-1", nil), http.StatusOK, &fetched)
-	if fetched.Address != first.Address {
-		t.Fatalf("lookup = %s, want %s", fetched.Address, first.Address)
+func TestPatchRefusesADrainCycle(t *testing.T) {
+	f := newFixture(t)
+	a := f.wallet("a")
+	b := f.proxy("b", a.Address)
+
+	w := f.do("PATCH", "/v1/wallets/a", patchWalletBody{DrainTo: ptr(b.Address)})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body = %s", w.Code, w.Body.String())
 	}
-	if w := f.do("GET", "/v1/apps/df/addresses/nobody", nil); w.Code != http.StatusNotFound {
-		t.Fatalf("unknown ref: status %d", w.Code)
+	if !strings.Contains(w.Body.String(), "drain_cycle") {
+		t.Fatalf("body = %s, want the cycle named", w.Body.String())
 	}
 }
 
-func TestDepositAddressesAreScopedPerApp(t *testing.T) {
+func TestPatchRefusesSelfReference(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.register("lkr:acme")
-
-	var a, b depositAddressView
-	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, &a)
-	f.json(f.do("POST", "/v1/apps/lkr:acme/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, &b)
-	if a.Address == b.Address {
-		t.Fatal("the same ref under two apps produced one address")
-	}
-
-	var list struct {
-		Addresses []depositAddressView `json:"addresses"`
-	}
-	f.json(f.do("GET", "/v1/apps/df/addresses", nil), http.StatusOK, &list)
-	if len(list.Addresses) != 1 || list.Addresses[0].Address != a.Address {
-		t.Fatalf("listing leaked across apps: %+v", list.Addresses)
+	a := f.wallet("a")
+	w := f.do("PATCH", "/v1/wallets/a", patchWalletBody{DrainTo: ptr(a.Address)})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", w.Code)
 	}
 }
 
-func TestDepositAddressListPaginates(t *testing.T) {
+// A wallet with money already promised must not start forwarding: the drain
+// would race the payout for the same funds.
+func TestPatchRefusesToForwardWhileAPayoutIsPending(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
+	hot := f.wallet("hot")
+	f.credit("hot", 1_000)
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+		To: addrHex(0xDD), Amount: "100",
+	}), http.StatusCreated, nil)
+
+	w := f.do("PATCH", "/v1/wallets/hot", patchWalletBody{DrainTo: ptr(addrHex(0xEE))})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", w.Code, w.Body.String())
+	}
+	_ = hot
+}
+
+func TestPatchPauses(t *testing.T) {
+	f := newFixture(t)
+	f.wallet("hot")
+	yes := true
+
+	var got walletView
+	f.json(f.do("PATCH", "/v1/wallets/hot", patchWalletBody{Paused: &yes}), http.StatusOK, &got)
+	if !got.Paused {
+		t.Fatal("pause was not applied")
+	}
+}
+
+func TestWalletListPaginates(t *testing.T) {
+	f := newFixture(t)
 	for _, ref := range []string{"a", "b", "c"} {
-		f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: ref}), http.StatusCreated, nil)
+		f.wallet(ref)
 	}
 	var page struct {
-		Addresses []depositAddressView `json:"addresses"`
-		After     string               `json:"after"`
+		Wallets []walletView `json:"wallets"`
+		After   string       `json:"after"`
 	}
-	f.json(f.do("GET", "/v1/apps/df/addresses?limit=2", nil), http.StatusOK, &page)
-	if len(page.Addresses) != 2 || page.After != "b" {
+	f.json(f.do("GET", "/v1/wallets?limit=2", nil), http.StatusOK, &page)
+	if len(page.Wallets) != 2 || page.After != "b" {
 		t.Fatalf("first page = %+v", page)
 	}
-	f.json(f.do("GET", "/v1/apps/df/addresses?limit=2&after="+page.After, nil), http.StatusOK, &page)
-	if len(page.Addresses) != 1 || page.Addresses[0].Ref != "c" {
-		t.Fatalf("second page = %+v", page.Addresses)
+	f.json(f.do("GET", "/v1/wallets?limit=2&after="+page.After, nil), http.StatusOK, &page)
+	if len(page.Wallets) != 1 || page.Wallets[0].Ref != "c" {
+		t.Fatalf("second page = %+v", page.Wallets)
 	}
+}
+
+// The balance view is custody minus what is already promised. There is no
+// ledger behind it: what the chain says the address holds is the whole truth
+// the service has (§36, §39).
+func TestWalletViewReportsCustodyAndCommitment(t *testing.T) {
+	f := newFixture(t)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+		To: addrHex(0xDD), Amount: "300",
+	}), http.StatusCreated, nil)
+
+	var got walletView
+	f.json(f.do("GET", "/v1/wallets/hot", nil), http.StatusOK, &got)
+	if got.Balance != "1000" || got.Committed != "300" || got.Available != "700" {
+		t.Fatalf("view = %+v, want 1000/300/700", got)
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func addrHex(b byte) string { return hexAddr(b).Hex() }
+
+func hexAddr(b byte) common.Address {
+	var a common.Address
+	a[common.AddressLength-1] = b
+	return a
 }

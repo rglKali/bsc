@@ -40,15 +40,11 @@ func database(t *testing.T) string {
 		t.Fatalf("Open: %v", err)
 	}
 	w := store.Wallet{
-		ID: uuid.New(), App: "df", Kind: store.KindTopLevel, Address: common.HexToAddress("0xabc"),
+		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged,
+		Address: common.HexToAddress("0xabc"),
 		Balance: big.NewInt(100), CreatedAt: time.Now(),
 	}
-	if err := st.Update(func(tx *store.Tx) error {
-		if err := tx.PutWallet(w); err != nil {
-			return err
-		}
-		return tx.PutApp(store.App{Slug: "df", Wallet: w.ID, CreatedAt: time.Now()})
-	}); err != nil {
+	if err := st.Update(func(tx *store.Tx) error { return tx.PutWallet(w) }); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	// Close so the audit can take the read lock: bbolt allows one writer, which
@@ -100,8 +96,19 @@ func TestInspectReportsFindingsAndExitsNonZero(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	if err := st.Update(func(tx *store.Tx) error {
-		// A ledger balance with no deposit behind it: money from nowhere.
-		_, err := tx.CreditLedger("df", 25)
+		// A wallet claiming a flow that does not exist: the ownership half of
+		// the "one live flow per wallet" invariant, broken.
+		var w store.Wallet
+		if err := tx.EachWallet(func(got store.Wallet) error {
+			w = got
+			return nil
+		}); err != nil {
+			return err
+		}
+		_, err := tx.MutateWallet(w.ID, func(x *store.Wallet) error {
+			x.Flow = uuid.New()
+			return nil
+		})
 		return err
 	}); err != nil {
 		t.Fatalf("Update: %v", err)
@@ -115,7 +122,7 @@ func TestInspectReportsFindingsAndExitsNonZero(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1; output:\n%s", code, out)
 	}
-	if !strings.Contains(out, "finding(s)") || !strings.Contains(out, "ledger") {
+	if !strings.Contains(out, "finding(s)") || !strings.Contains(out, "ownership") {
 		t.Fatalf("output = %q", out)
 	}
 }

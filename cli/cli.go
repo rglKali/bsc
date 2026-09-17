@@ -49,8 +49,8 @@ func Root(code *int) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "bsc",
 		Short: "USDT chain gateway",
-		Long: "bsc watches finalized BSC blocks, derives and drains deposit wallets,\n" +
-			"and pays out withdrawals for the apps registered with it.\n\n" +
+		Long: "bsc watches finalized BSC blocks, derives wallets, records what lands on\n" +
+			"them, forwards the ones configured to forward, and pays out withdrawals.\n\n" +
 			"Run with no subcommand to start the service. Settings come from the config\n" +
 			"file (see deploy/config.yaml) and BSC_* environment variables; flags below\n" +
 			"override both. BSC_MASTER_SECRET is required and belongs only in the\n" +
@@ -104,6 +104,7 @@ func Root(code *int) *cobra.Command {
 	_ = v.BindPFlag("log.level", cmd.PersistentFlags().Lookup("log-level"))
 
 	cmd.AddCommand(inspectCmd(v, code), versionCmd())
+	cmd.AddCommand(masterCmds(v, code)...)
 	return cmd
 }
 
@@ -175,19 +176,19 @@ func versionCmd() *cobra.Command {
 func report(w io.Writer, path string, rep store.Report, quiet, withRPC bool) int {
 	if !quiet {
 		fmt.Fprintf(w, "%s\n", path)
-		fmt.Fprintf(w, "  apps         %d\n", rep.Apps)
-		fmt.Fprintf(w, "  wallets      %d\n", rep.Wallets)
+		fmt.Fprintf(w, "  wallets      %d (%d forwarding)\n", rep.Wallets, rep.Proxies)
 		fmt.Fprintf(w, "  flows        %d\n", rep.Flows)
 		fmt.Fprintf(w, "  deposits     %d\n", rep.Deposits)
 		fmt.Fprintf(w, "  withdrawals  %d\n", rep.Withdrawals)
-		fmt.Fprintf(w, "  owed         %s (%s cents)\n", rep.Owed.Tokens(), rep.Owed)
+		fmt.Fprintf(w, "  held         %s base units\n", rep.Held)
+		fmt.Fprintf(w, "  committed    %s base units\n", rep.Committed)
 	}
 	if rep.OK() {
 		if !quiet {
 			fmt.Fprintln(w, "  audit        clean")
 			if !withRPC {
-				// The ledger was recomputed and the solvency margin checked
-				// against our own record of custody. What is still unchecked is
+				// Every index was walked both ways and no wallet owes more
+				// than our record says it holds. What is still unchecked is
 				// that record against the token itself.
 				fmt.Fprintln(w, "  custody      not checked against the chain (re-run with --rpc)")
 			}

@@ -24,7 +24,9 @@ const word = 32
 
 var (
 	selGetAmountsOut = selector("getAmountsOut(uint256,address[])")
+	selGetAmountsIn  = selector("getAmountsIn(uint256,address[])")
 	selSwapForETH    = selector("swapExactTokensForETH(uint256,uint256,address[],address,uint256)")
+	selSwapForExact  = selector("swapTokensForExactETH(uint256,uint256,address[],address,uint256)")
 	selWrapped       = selector("WETH()")
 )
 
@@ -85,6 +87,45 @@ func PackSwapExactTokensForETH(amountIn, amountOutMin *big.Int, path []common.Ad
 	return out
 }
 
+// PackGetAmountsIn encodes the mirror price query: how much of the *first*
+// token in the path is needed to receive `amountOut` of the last.
+//
+// It exists because an operator refilling gas thinks in the output. "I need a
+// tenth of a BNB" is the actual requirement; how many tokens that costs is the
+// answer, not the question — and computing it by dividing a getAmountsOut quote
+// would be wrong, since the price moves with the size of the trade.
+func PackGetAmountsIn(amountOut *big.Int, path []common.Address) []byte {
+	out := make([]byte, 0, 4+3*word+len(path)*word)
+	out = append(out, selGetAmountsIn...)
+	out = appendUint(out, amountOut)
+	out = appendUint(out, big.NewInt(2*word)) // offset to the path array
+	out = appendPath(out, path)
+	return out
+}
+
+// PackSwapTokensForExactETH encodes a swap that buys an exact amount of native
+// currency, spending no more than amountInMax of the token.
+//
+// The bound runs the other way from the exact-input call: there the caller is
+// protected by a floor on what it receives, here by a ceiling on what it
+// spends. Either way the transaction reverts rather than filling at a price the
+// caller did not agree to.
+//
+// Whatever is not spent stays with the caller — the router only pulls what the
+// trade actually costs — so a generous ceiling is safe, which is the opposite
+// of how an amountOutMin behaves.
+func PackSwapTokensForExactETH(amountOut, amountInMax *big.Int, path []common.Address, to common.Address, deadline *big.Int) []byte {
+	out := make([]byte, 0, 4+6*word+len(path)*word)
+	out = append(out, selSwapForExact...)
+	out = appendUint(out, amountOut)
+	out = appendUint(out, amountInMax)
+	out = appendUint(out, big.NewInt(5*word)) // offset to the path array
+	out = appendAddr(out, to)
+	out = appendUint(out, deadline)
+	out = appendPath(out, path)
+	return out
+}
+
 // UnpackAmounts decodes a `uint[]` return value, as both router calls produce.
 func UnpackAmounts(data []byte) ([]*big.Int, error) {
 	if len(data) < 2*word {
@@ -129,6 +170,24 @@ func MinOut(expected *big.Int, slippageBPS uint32) (*big.Int, error) {
 	}
 	keep := new(big.Int).SetUint64(uint64(10_000 - slippageBPS))
 	out := new(big.Int).Mul(expected, keep)
+	return out.Div(out, big.NewInt(10_000)), nil
+}
+
+// MaxIn is MinOut's mirror for an exact-output trade: the most the caller will
+// spend to receive the amount it asked for. It rounds up, so the ceiling is
+// never tighter than asked for — the opposite rounding from MinOut, and for the
+// same reason, which is that slack must always fall on the caller's side.
+func MaxIn(expected *big.Int, slippageBPS uint32) (*big.Int, error) {
+	if expected == nil || expected.Sign() <= 0 {
+		return nil, errors.New("swap: expected input must be positive")
+	}
+	if slippageBPS >= 10_000 {
+		return nil, fmt.Errorf("swap: slippage of %d bps would accept any price", slippageBPS)
+	}
+	total := new(big.Int).SetUint64(uint64(10_000 + slippageBPS))
+	out := new(big.Int).Mul(expected, total)
+	// Ceiling division: +9999 before dividing by 10000.
+	out.Add(out, big.NewInt(9_999))
 	return out.Div(out, big.NewInt(10_000)), nil
 }
 

@@ -2,254 +2,288 @@ package store
 
 import (
 	"errors"
+	"math/big"
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/google/uuid"
 )
 
-// depositWallet creates a deposit wallet for slug with the given ref.
-func depositWallet(t *testing.T, s *Store, slug, ref string, a byte, balance int64) Wallet {
-	t.Helper()
-	w := Wallet{
-		ID: uuid.New(), App: slug, Kind: KindDeposit, Ref: ref, Address: addr(a),
-		Balance: wei(balance), CreatedAt: time.Now().UTC(),
-	}
-	update(t, s, func(tx *Tx) error { return tx.PutWallet(w) })
-	return w
-}
-
 func TestWalletLookupIndexes(t *testing.T) {
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x20, 0)
+	w := seedWallet(t, s, "cust-1", 0)
 
 	if err := s.View(func(tx *Tx) error {
+		byID, ok, err := tx.Wallet(w.ID)
+		if err != nil || !ok {
+			t.Fatalf("by id: %v ok=%v", err, ok)
+		}
 		byAddr, ok, err := tx.WalletByAddress(w.Address)
 		if err != nil || !ok {
-			t.Fatalf("WalletByAddress: ok=%v err=%v", ok, err)
+			t.Fatalf("by address: %v ok=%v", err, ok)
 		}
-		if byAddr.ID != w.ID {
-			t.Fatalf("WalletByAddress = %s, want %s", byAddr.ID, w.ID)
-		}
-		byRef, ok, err := tx.WalletByRef("df", "cust-1")
+		byRef, ok, err := tx.WalletByRef("cust-1")
 		if err != nil || !ok {
-			t.Fatalf("WalletByRef: ok=%v err=%v", ok, err)
+			t.Fatalf("by ref: %v ok=%v", err, ok)
 		}
-		if byRef.ID != w.ID {
-			t.Fatalf("WalletByRef = %s, want %s", byRef.ID, w.ID)
-		}
-		// A ref belongs to one app only.
-		if _, ok, err := tx.WalletByRef("other", "cust-1"); err != nil || ok {
-			t.Fatalf("ref leaked across apps: ok=%v err=%v", ok, err)
+		if byID.ID != w.ID || byAddr.ID != w.ID || byRef.ID != w.ID {
+			t.Fatal("the three lookups disagree")
 		}
 		return nil
 	}); err != nil {
-		t.Fatalf("View: %v", err)
+		t.Fatal(err)
+	}
+}
+
+// Refs are unique across the service now, not per app. Nothing scopes them any
+// more, so the caller owns the whole namespace (§37).
+func TestRefsAreUniqueAcrossTheWholeService(t *testing.T) {
+	s := open(t)
+	seedWallet(t, s, "cust-1", 0)
+
+	second := Wallet{
+		ID: uuid.New(), Ref: "cust-1", Kind: KindManaged, Address: addr(0x33),
+		Balance: new(big.Int), CreatedAt: time.Now().UTC(),
+	}
+	update(t, s, func(tx *Tx) error { return tx.PutWallet(second) })
+
+	// The later write wins the ref, which is why callers must namespace.
+	if err := s.View(func(tx *Tx) error {
+		got, ok, err := tx.WalletByRef("cust-1")
+		if err != nil || !ok {
+			t.Fatalf("lookup: %v ok=%v", err, ok)
+		}
+		if got.ID != second.ID {
+			t.Fatal("ref did not resolve to the most recent writer")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestPutWalletValidates(t *testing.T) {
 	s := open(t)
-	base := Wallet{ID: uuid.New(), App: "df", Kind: KindDeposit, Ref: "r", Address: addr(1)}
-
-	tests := map[string]func(Wallet) Wallet{
-		"bad slug":       func(w Wallet) Wallet { w.App = "Bad Slug"; return w },
-		"no id":          func(w Wallet) Wallet { w.ID = uuid.Nil; return w },
-		"no address":     func(w Wallet) Wallet { w.Address = addr(0); return w },
-		"deposit no ref": func(w Wallet) Wallet { w.Ref = ""; return w },
+	cases := map[string]Wallet{
+		"no id":           {Ref: "a", Kind: KindManaged, Address: addr(1)},
+		"no address":      {ID: uuid.New(), Ref: "a", Kind: KindManaged},
+		"no ref":          {ID: uuid.New(), Kind: KindManaged, Address: addr(1)},
+		"bad ref":         {ID: uuid.New(), Ref: "Cust 1", Kind: KindManaged, Address: addr(1)},
+		"master with ref": {ID: uuid.New(), Ref: "m", Kind: KindMaster, Address: addr(1)},
+		"master draining": {ID: uuid.New(), Kind: KindMaster, Address: addr(1), DrainTo: addr(2)},
+		"drains to self":  {ID: uuid.New(), Ref: "a", Kind: KindManaged, Address: addr(1), DrainTo: addr(1)},
 	}
-	for name, mutate := range tests {
-		if err := s.Update(func(tx *Tx) error { return tx.PutWallet(mutate(base)) }); err == nil {
-			t.Fatalf("%s: PutWallet accepted", name)
-		}
+	for name, w := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := s.Update(func(tx *Tx) error { return tx.PutWallet(w) }); err == nil {
+				t.Fatal("accepted an invalid wallet")
+			}
+		})
 	}
 }
 
 func TestMutateWalletRefusesIndexedFields(t *testing.T) {
-	// These fields are what the indexes point at; letting one change would
-	// silently orphan an index, which is the standing risk of hand-rolling them.
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x21, 0)
+	w := seedWallet(t, s, "cust-1", 0)
 
-	tests := map[string]func(*Wallet){
-		"id":      func(w *Wallet) { w.ID = uuid.New() },
-		"app":     func(w *Wallet) { w.App = "other" },
-		"kind":    func(w *Wallet) { w.Kind = KindTopLevel },
-		"ref":     func(w *Wallet) { w.Ref = "cust-2" },
-		"address": func(w *Wallet) { w.Address = addr(0x99) },
+	cases := map[string]func(*Wallet){
+		"id":      func(x *Wallet) { x.ID = uuid.New() },
+		"ref":     func(x *Wallet) { x.Ref = "other" },
+		"address": func(x *Wallet) { x.Address = addr(0x44) },
+		"kind":    func(x *Wallet) { x.Kind = KindMaster },
 	}
-	for name, mutate := range tests {
-		err := s.Update(func(tx *Tx) error {
-			_, err := tx.MutateWallet(w.ID, func(w *Wallet) error { mutate(w); return nil })
-			return err
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := s.Update(func(tx *Tx) error {
+				_, err := tx.MutateWallet(w.ID, func(x *Wallet) error {
+					mutate(x)
+					return nil
+				})
+				return err
+			})
+			if !errors.Is(err, ErrImmutable) {
+				t.Fatalf("err = %v, want ErrImmutable", err)
+			}
 		})
-		if !errors.Is(err, ErrImmutable) {
-			t.Fatalf("%s: got %v, want ErrImmutable", name, err)
-		}
 	}
+}
+
+// DrainTo is the one piece of configuration a wallet has, so unlike every other
+// indexed field it may change — which is exactly why it is validated here.
+func TestDrainToIsMutable(t *testing.T) {
+	s := open(t)
+	w := seedWallet(t, s, "cust-1", 0)
+	target := addr(0x55)
+
+	update(t, s, func(tx *Tx) error {
+		_, err := tx.MutateWallet(w.ID, func(x *Wallet) error {
+			x.DrainTo = target
+			return nil
+		})
+		return err
+	})
+	if err := s.View(func(tx *Tx) error {
+		got, _, err := tx.Wallet(w.ID)
+		if err != nil {
+			return err
+		}
+		if !got.Proxies() || got.DrainTo != target {
+			t.Fatalf("drain_to = %s, want %s", got.DrainTo.Hex(), target.Hex())
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mustBeClean(t, verify(t, s))
+}
+
+// A→B→A would move the same money round and round, succeeding every hop and
+// spending the master's gas forever. The two-level design could not express it;
+// making the topology a field is what makes this check necessary (§35).
+func TestDrainChainRefusesACycle(t *testing.T) {
+	s := open(t)
+	a := seedWalletAt(t, s, "a", addr(0x0A), addr(0x0B), 0)
+	b := seedWalletAt(t, s, "b", addr(0x0B), common.Address{}, 0)
+
+	err := s.Update(func(tx *Tx) error {
+		_, err := tx.MutateWallet(b.ID, func(x *Wallet) error {
+			x.DrainTo = a.Address
+			return nil
+		})
+		return err
+	})
+	if !errors.Is(err, ErrDrainCycle) {
+		t.Fatalf("err = %v, want ErrDrainCycle", err)
+	}
+}
+
+func TestDrainChainRefusesSelfReference(t *testing.T) {
+	s := open(t)
+	w := seedWallet(t, s, "cust-1", 0)
+	err := s.Update(func(tx *Tx) error {
+		_, err := tx.MutateWallet(w.ID, func(x *Wallet) error {
+			x.DrainTo = x.Address
+			return nil
+		})
+		return err
+	})
+	if !errors.Is(err, ErrDrainCycle) {
+		t.Fatalf("err = %v, want ErrDrainCycle", err)
+	}
+}
+
+func TestDrainChainRefusesTooManyHops(t *testing.T) {
+	s := open(t)
+	// A chain one hop longer than the limit, built from the far end backwards
+	// so each link is legal when it is written.
+	n := MaxDrainDepth + 2
+	prev := common.Address{}
+	for i := n; i >= 1; i-- {
+		at := addr(byte(0x80 + i))
+		w := Wallet{
+			ID: uuid.New(), Ref: string(rune('a' + i)), Kind: KindManaged,
+			Address: at, DrainTo: prev, Balance: new(big.Int), CreatedAt: time.Now().UTC(),
+		}
+		if err := s.Update(func(tx *Tx) error { return tx.PutWallet(w) }); err != nil {
+			t.Fatalf("link %d: %v", i, err)
+		}
+		prev = at
+	}
+	// Now ask the audit what it thinks of the head of that chain.
+	rep := verify(t, s)
+	if len(findingsOfKind(rep, "topology")) == 0 {
+		t.Fatalf("no topology finding for a %d-hop chain", n)
+	}
+}
+
+// A chain that ends at a wallet we do not manage is fine: somebody else's
+// address cannot point back at us.
+func TestDrainChainAcceptsAnExternalDestination(t *testing.T) {
+	s := open(t)
+	w := seedWallet(t, s, "cust-1", 0)
+	update(t, s, func(tx *Tx) error {
+		_, err := tx.MutateWallet(w.ID, func(x *Wallet) error {
+			x.DrainTo = addr(0xEE) // nothing we derived
+			return nil
+		})
+		return err
+	})
+	mustBeClean(t, verify(t, s))
 }
 
 func TestCreditAndDebit(t *testing.T) {
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x22, 0)
+	w := seedWallet(t, s, "cust-1", 0)
 
 	update(t, s, func(tx *Tx) error {
-		if _, err := tx.Credit(w.ID, wei(100)); err != nil {
+		if _, err := tx.Credit(w.ID, wei(500)); err != nil {
 			return err
 		}
-		if _, err := tx.Credit(w.ID, wei(50)); err != nil {
-			return err
-		}
-		got, underflow, err := tx.Debit(w.ID, wei(30))
+		_, err := tx.Credit(w.ID, wei(250))
+		return err
+	})
+	update(t, s, func(tx *Tx) error {
+		got, under, err := tx.Debit(w.ID, wei(300))
 		if err != nil {
 			return err
 		}
-		if underflow {
+		if under {
 			t.Fatal("unexpected underflow")
 		}
-		if got.Balance.Cmp(wei(120)) != 0 {
-			t.Fatalf("balance = %s, want 120", got.Balance)
+		if got.Balance.Int64() != 450 {
+			t.Fatalf("balance = %s, want 450", got.Balance)
 		}
 		return nil
 	})
 }
 
 func TestDebitUnderflowClampsAndReports(t *testing.T) {
-	// Underflow can only mean a bug in our own accounting. Aborting the block
-	// would wedge chain sync on a condition retrying cannot fix, so the store
-	// clamps and tells the caller, who logs loudly.
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x23, 10)
-
+	w := seedWallet(t, s, "cust-1", 0)
 	update(t, s, func(tx *Tx) error {
-		got, underflow, err := tx.Debit(w.ID, wei(25))
+		got, under, err := tx.Debit(w.ID, wei(10))
 		if err != nil {
 			return err
 		}
-		if !underflow {
-			t.Fatal("Debit did not report underflow")
+		if !under {
+			t.Fatal("underflow not reported")
 		}
 		if got.Balance.Sign() != 0 {
-			t.Fatalf("balance = %s, want clamped to 0", got.Balance)
+			t.Fatalf("balance = %s, want 0", got.Balance)
 		}
 		return nil
 	})
-}
-
-func TestReserveRefusesOverdraft(t *testing.T) {
-	// v1 had no balance check at all: an oversized withdrawal was only
-	// discovered when the transfer reverted, after the gas was spent.
-	s := open(t)
-	seedApp(t, s, "df", 100)
-
-	update(t, s, func(tx *Tx) error {
-		if _, err := tx.ReserveLedger("df", 60); err != nil {
-			return err
-		}
-		// 60 of 100 held; 50 more must not fit.
-		_, err := tx.ReserveLedger("df", 50)
-		if !errors.Is(err, ErrInsufficient) {
-			t.Fatalf("second ReserveLedger = %v, want ErrInsufficient", err)
-		}
-		a, _, err := tx.App("df")
-		if err != nil {
-			return err
-		}
-		if a.Reserved != 60 {
-			t.Fatalf("reserved = %d, want 60 (the refused reservation must not apply)", a.Reserved)
-		}
-		if a.Spendable() != 40 {
-			t.Fatalf("spendable = %d, want 40", a.Spendable())
-		}
-		return nil
-	})
-}
-
-func TestReleaseIsExactAndClamps(t *testing.T) {
-	s := open(t)
-	seedApp(t, s, "df", 100)
-
-	update(t, s, func(tx *Tx) error {
-		if _, err := tx.ReserveLedger("df", 40); err != nil {
-			return err
-		}
-		a, err := tx.ReleaseLedger("df", 40)
-		if err != nil {
-			return err
-		}
-		if a.Reserved != 0 {
-			t.Fatalf("reserved = %d, want 0", a.Reserved)
-		}
-		// Over-releasing should never happen (callers release the recorded
-		// figure) but must not produce a negative reservation if it does.
-		a, err = tx.ReleaseLedger("df", 10)
-		if err != nil {
-			return err
-		}
-		if a.Reserved != 0 {
-			t.Fatalf("reserved = %d after over-release, want 0", a.Reserved)
-		}
-		return nil
-	})
-}
-
-// TestDebitRefusesToOverdrawTheLedger guards the books directly: a debit larger
-// than the ledger can only be our own bug, and clamping it would hide the bug
-// while leaving the app credited for money that left.
-func TestDebitRefusesToOverdrawTheLedger(t *testing.T) {
-	s := open(t)
-	seedApp(t, s, "df", 100)
-	update(t, s, func(tx *Tx) error {
-		if _, err := tx.DebitLedger("df", 101); !errors.Is(err, ErrInsufficient) {
-			t.Fatalf("DebitLedger past the ledger = %v, want ErrInsufficient", err)
-		}
-		a, _, err := tx.App("df")
-		if err != nil {
-			return err
-		}
-		if a.Ledger != 100 {
-			t.Fatalf("ledger = %d after a refused debit, want 100", a.Ledger)
-		}
-		return nil
-	})
-}
-
-func TestSpendableNeverGoesNegative(t *testing.T) {
-	a := App{Ledger: 5, Reserved: 9}
-	if got := a.Spendable(); got != 0 {
-		t.Fatalf("Spendable = %d, want 0", got)
-	}
 }
 
 func TestClaimWalletIsExclusive(t *testing.T) {
-	// This is the enforcement point for "at most one live flow per wallet" —
-	// the invariant that stops a second deposit re-triggering activation.
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x24, 0)
+	w := seedWallet(t, s, "cust-1", 0)
 	first, second := uuid.New(), uuid.New()
 
 	update(t, s, func(tx *Tx) error {
-		if _, err := tx.ClaimWallet(w.ID, first); err != nil {
+		_, err := tx.ClaimWallet(w.ID, first)
+		return err
+	})
+	if err := s.Update(func(tx *Tx) error {
+		_, err := tx.ClaimWallet(w.ID, second)
+		return err
+	}); err == nil {
+		t.Fatal("a second flow claimed a busy wallet")
+	}
+	// Re-claiming by the same flow is idempotent, which is what makes a retried
+	// start harmless.
+	update(t, s, func(tx *Tx) error {
+		_, err := tx.ClaimWallet(w.ID, first)
+		return err
+	})
+	update(t, s, func(tx *Tx) error {
+		got, err := tx.ReleaseWallet(w.ID)
+		if err != nil {
 			return err
 		}
-		// Re-claiming by the same flow is idempotent...
-		if _, err := tx.ClaimWallet(w.ID, first); err != nil {
-			t.Fatalf("re-claim by the owner: %v", err)
-		}
-		// ...but a different flow must be refused.
-		if _, err := tx.ClaimWallet(w.ID, second); err == nil {
-			t.Fatal("second flow claimed an owned wallet")
-		}
-		if _, err := tx.ReleaseWallet(w.ID); err != nil {
-			return err
-		}
-		if _, err := tx.ClaimWallet(w.ID, second); err != nil {
-			t.Fatalf("claim after release: %v", err)
+		if !got.Idle() {
+			t.Fatal("wallet still busy after release")
 		}
 		return nil
 	})
@@ -257,76 +291,85 @@ func TestClaimWalletIsExclusive(t *testing.T) {
 
 func TestBackoff(t *testing.T) {
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x25, 0)
-	until := time.Now().Add(time.Minute).UTC().Truncate(time.Nanosecond)
+	w := seedWallet(t, s, "cust-1", 0)
+	deadline := time.Now().Add(time.Minute).UTC()
 
 	update(t, s, func(tx *Tx) error {
-		got, err := tx.BackOff(w.ID, until)
+		got, err := tx.BackOff(w.ID, deadline)
 		if err != nil {
 			return err
 		}
-		if got.FailedAttempts != 1 || !got.RetryAfter.Equal(until) {
-			t.Fatalf("backoff = (%d, %v), want (1, %v)", got.FailedAttempts, got.RetryAfter, until)
+		if got.FailedAttempts != 1 || !got.RetryAfter.Equal(deadline) {
+			t.Fatalf("attempts=%d retry=%v", got.FailedAttempts, got.RetryAfter)
 		}
-		if got, err = tx.BackOff(w.ID, until); err != nil {
-			return err
-		}
-		if got.FailedAttempts != 2 {
-			t.Fatalf("attempts = %d, want 2", got.FailedAttempts)
-		}
-		if got, err = tx.ClearBackoff(w.ID); err != nil {
+		return nil
+	})
+	update(t, s, func(tx *Tx) error {
+		got, err := tx.ClearBackoff(w.ID)
+		if err != nil {
 			return err
 		}
 		if got.FailedAttempts != 0 || !got.RetryAfter.IsZero() {
-			t.Fatalf("cleared backoff = (%d, %v)", got.FailedAttempts, got.RetryAfter)
+			t.Fatalf("backoff not cleared: %+v", got)
 		}
 		return nil
 	})
 }
 
-func TestDepositWalletsPaginateByRef(t *testing.T) {
+func TestWalletsPaginateByRef(t *testing.T) {
 	s := open(t)
-	seedApp(t, s, "df", 0)
 	for i, ref := range []string{"a", "b", "c", "d"} {
-		depositWallet(t, s, "df", ref, byte(0x30+i), 0)
+		seedWalletAt(t, s, ref, addr(byte(0x10+i)), common.Address{}, 0)
 	}
-	// Another app's wallets must not appear.
-	seedApp(t, s, "other", 0)
-	depositWallet(t, s, "other", "a", 0x40, 0)
+
+	var first, second []Wallet
+	if err := s.View(func(tx *Tx) error {
+		var err error
+		if first, err = tx.Wallets("", 2); err != nil {
+			return err
+		}
+		second, err = tx.Wallets(first[len(first)-1].Ref, 2)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := refs(first); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("first page = %v", got)
+	}
+	if got := refs(second); len(got) != 2 || got[0] != "c" || got[1] != "d" {
+		t.Fatalf("second page = %v", got)
+	}
+}
+
+// The master has no ref, so it must not appear in a listing the caller reads.
+func TestWalletListingExcludesTheMaster(t *testing.T) {
+	s := open(t)
+	seedWallet(t, s, "cust-1", 0)
+	update(t, s, func(tx *Tx) error {
+		return tx.PutWallet(Wallet{
+			ID: uuid.New(), Kind: KindMaster, Address: addr(0xFF),
+			Balance: new(big.Int), CreatedAt: time.Now().UTC(),
+		})
+	})
 
 	if err := s.View(func(tx *Tx) error {
-		page, err := tx.DepositWallets("df", "", 2)
+		list, err := tx.Wallets("", 0)
 		if err != nil {
 			return err
 		}
-		if len(page) != 2 || page[0].Ref != "a" || page[1].Ref != "b" {
-			t.Fatalf("first page = %v", refs(page))
-		}
-		next, err := tx.DepositWallets("df", page[len(page)-1].Ref, 2)
-		if err != nil {
-			return err
-		}
-		if len(next) != 2 || next[0].Ref != "c" || next[1].Ref != "d" {
-			t.Fatalf("second page = %v", refs(next))
-		}
-		last, err := tx.DepositWallets("df", "d", 2)
-		if err != nil {
-			return err
-		}
-		if len(last) != 0 {
-			t.Fatalf("page past the end = %v", refs(last))
+		if got := refs(list); len(got) != 1 || got[0] != "cust-1" {
+			t.Fatalf("listing = %v, want just cust-1", got)
 		}
 		return nil
 	}); err != nil {
-		t.Fatalf("View: %v", err)
+		t.Fatal(err)
 	}
 }
 
 func refs(ws []Wallet) []string {
-	out := make([]string, len(ws))
-	for i, w := range ws {
-		out[i] = w.Ref
+	out := make([]string, 0, len(ws))
+	for _, w := range ws {
+		out = append(out, w.Ref)
 	}
 	return out
 }

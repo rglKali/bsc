@@ -10,82 +10,81 @@ import (
 	"github.com/google/uuid"
 )
 
-var now = time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+var now = time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 
-func depositWallet(balance int64) store.Wallet {
+// proxy is a wallet that forwards what it receives: the drain candidate.
+func proxy(balance int64) store.Wallet {
 	return store.Wallet{
-		ID: uuid.New(), App: "df", Kind: store.KindDeposit, Ref: "cust-1",
-		Address: addr(0x20), Balance: big.NewInt(balance),
+		ID: uuid.New(), Ref: "cust-1", Kind: store.KindManaged,
+		Address: addr(1), DrainTo: addr(2), Active: true,
+		Balance: big.NewInt(balance),
 	}
 }
 
-func topWallet(balance int64) store.Wallet {
+// hot is a wallet that accumulates: the payout candidate.
+func hot(balance int64) store.Wallet {
 	return store.Wallet{
-		ID: uuid.New(), App: "df", Kind: store.KindTopLevel,
-		Address: addr(0x01), Balance: big.NewInt(balance),
+		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged,
+		Address: addr(2), Active: true, Balance: big.NewInt(balance),
 	}
 }
 
-func TestShouldDrainNeverTouchesATopLevelWallet(t *testing.T) {
-	// An app's top-level holds its money and also clears the threshold. An
-	// unscoped rule would keep trying to drain it to itself, forever.
-	top := topWallet(1_000_000)
-	if ShouldDrain(top, big.NewInt(1), now) {
-		t.Fatal("a top-level wallet was selected for draining")
+// The kind check became a DrainTo check, and it is load-bearing either way: a
+// wallet with nowhere to drain to would otherwise be told to move its balance
+// to itself, forever (§32).
+func TestShouldDrainNeverTouchesAnAccumulatingWallet(t *testing.T) {
+	w := hot(1_000)
+	if ShouldDrain(w, big.NewInt(1), now) {
+		t.Fatal("a wallet with no drain_to was told to drain")
 	}
 }
 
+func TestShouldDrainNeverTouchesTheMaster(t *testing.T) {
+	w := proxy(1_000)
+	w.Kind = store.KindMaster
+	if ShouldDrain(w, big.NewInt(1), now) {
+		t.Fatal("the master was told to drain")
+	}
+}
+
+// The threshold is pure gas economics — moving three cents costs more than
+// three cents — and decides only whether the move is worth paying for.
 func TestShouldDrainThreshold(t *testing.T) {
-	min := big.NewInt(100)
-	tests := map[string]struct {
+	threshold := big.NewInt(1_000)
+	cases := []struct {
 		balance int64
 		want    bool
 	}{
-		"empty":             {0, false},
-		"dust":              {1, false},
-		"just below":        {99, false},
-		"exactly at":        {100, true},
-		"comfortably above": {5_000, true},
+		{0, false},
+		{999, false},
+		{1_000, true},
+		{5_000, true},
 	}
-	for name, tc := range tests {
-		if got := ShouldDrain(depositWallet(tc.balance), min, now); got != tc.want {
-			t.Fatalf("%s (balance %d): got %v, want %v", name, tc.balance, got, tc.want)
+	for _, c := range cases {
+		if got := ShouldDrain(proxy(c.balance), threshold, now); got != c.want {
+			t.Fatalf("balance %d: ShouldDrain = %v, want %v", c.balance, got, c.want)
 		}
 	}
 }
 
-func TestShouldDrainAppliesToTheAggregateBalance(t *testing.T) {
-	// The threshold gates the wallet's total, not any single transfer, so dust
-	// that was too small to record still leaves with the next real deposit.
-	w := depositWallet(150) // e.g. three ignored 50-wei transfers
-	if !ShouldDrain(w, big.NewInt(100), now) {
-		t.Fatal("aggregated dust past the threshold was not drained")
-	}
-}
-
 func TestShouldDrainWaitsForABusyWallet(t *testing.T) {
-	// A deposit landing mid-drain must start nothing; the evaluation after the
-	// live flow terminates is what picks up the leftover.
-	w := depositWallet(1_000)
+	w := proxy(5_000)
 	w.Flow = uuid.New()
 	if ShouldDrain(w, big.NewInt(1), now) {
-		t.Fatal("a wallet already owned by a flow was selected again")
+		t.Fatal("a wallet already running a flow was given another")
 	}
 }
 
+// Without a backoff, a declarative rule plus a flow that can fail is a retry
+// loop that burns gas as fast as the chain produces blocks.
 func TestShouldDrainHonoursBackoff(t *testing.T) {
-	// Without this, a declarative rule plus a failing flow is a retry loop that
-	// burns gas as fast as the chain allows.
-	w := depositWallet(1_000)
+	w := proxy(5_000)
 	w.RetryAfter = now.Add(time.Minute)
 	if ShouldDrain(w, big.NewInt(1), now) {
-		t.Fatal("drained while still backing off")
+		t.Fatal("drained before the retry deadline")
 	}
-	if !ShouldDrain(w, big.NewInt(1), now.Add(time.Minute)) {
-		t.Fatal("did not drain once the backoff expired")
-	}
-	if !ShouldDrain(w, big.NewInt(1), now.Add(time.Hour)) {
-		t.Fatal("did not drain well after the backoff expired")
+	if !ShouldDrain(w, big.NewInt(1), now.Add(2*time.Minute)) {
+		t.Fatal("still backed off after the deadline passed")
 	}
 }
 
@@ -93,200 +92,80 @@ func TestRetryDelayGrowsAndCaps(t *testing.T) {
 	if got := RetryDelay(0); got != 0 {
 		t.Fatalf("RetryDelay(0) = %v, want 0", got)
 	}
-	first, second, third := RetryDelay(1), RetryDelay(2), RetryDelay(3)
-	if first != backoffBase {
-		t.Fatalf("RetryDelay(1) = %v, want %v", first, backoffBase)
+	if got := RetryDelay(1); got != backoffBase {
+		t.Fatalf("RetryDelay(1) = %v, want %v", got, backoffBase)
 	}
-	if second != 2*first || third != 4*first {
-		t.Fatalf("backoff does not double: %v, %v, %v", first, second, third)
+	if got := RetryDelay(2); got != 2*backoffBase {
+		t.Fatalf("RetryDelay(2) = %v, want %v", got, 2*backoffBase)
 	}
-	// A wallet that can never drain must keep retrying occasionally rather than
-	// hammering or giving up.
-	for _, attempts := range []uint32{20, 50, 1000} {
-		if got := RetryDelay(attempts); got != backoffMax {
-			t.Fatalf("RetryDelay(%d) = %v, want the cap %v", attempts, got, backoffMax)
-		}
+	// The cap matters as much as the growth: a wallet that can never drain must
+	// keep trying occasionally rather than hammering or giving up.
+	if got := RetryDelay(64); got != backoffMax {
+		t.Fatalf("RetryDelay(64) = %v, want the cap %v", got, backoffMax)
 	}
 }
 
 func TestShouldPay(t *testing.T) {
-	app := store.App{Slug: "df"}
-	top := topWallet(1_000)
-
-	if !ShouldPay(app, top, true, now) {
-		t.Fatal("an idle top-level with a pending withdrawal was not selected")
+	cases := map[string]struct {
+		wallet     store.Wallet
+		hasPending bool
+		want       bool
+	}{
+		"ready":              {hot(10_000), true, true},
+		"nothing pending":    {hot(10_000), false, false},
+		"paused":             {pausedHot(), true, false},
+		"busy":               {busyHot(), true, false},
+		"forwards elsewhere": {proxy(10_000), true, false},
+		"master":             {masterWallet(), true, false},
 	}
-	if ShouldPay(app, top, false, now) {
-		t.Fatal("selected with nothing pending")
-	}
-
-	busy := top
-	busy.Flow = uuid.New()
-	if ShouldPay(app, busy, true, now) {
-		t.Fatal("selected while another flow owns the wallet")
-	}
-
-	// Withdrawals for one app serialize, which is what keeps the reserve
-	// arithmetic obvious.
-	paused := store.App{Slug: "df", Paused: true}
-	if ShouldPay(paused, top, true, now) {
-		t.Fatal("a paused app was allowed to pay out")
-	}
-
-	if ShouldPay(app, depositWallet(1_000), true, now) {
-		t.Fatal("a deposit wallet was selected to pay out")
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := ShouldPay(c.wallet, c.hasPending, now); got != c.want {
+				t.Fatalf("ShouldPay = %v, want %v", got, c.want)
+			}
+		})
 	}
 }
 
-// A withdrawal has no failure state: a reverted payout stays pending for this
-// rule to pick up again (§28). Without the backoff gate that retry fires on
-// every evaluation, so a payout that always reverts would burn the master's gas
-// as fast as blocks arrive.
-func TestShouldPayWaitsOutTheBackoff(t *testing.T) {
-	app := store.App{Slug: "df"}
-	backedOff := topWallet(1_000)
-	backedOff.RetryAfter = now.Add(time.Minute)
+func pausedHot() store.Wallet {
+	w := hot(10_000)
+	w.Paused = true
+	return w
+}
 
-	if ShouldPay(app, backedOff, true, now) {
-		t.Fatal("re-signed a payout while the wallet was still backed off")
+func busyHot() store.Wallet {
+	w := hot(10_000)
+	w.Flow = uuid.New()
+	return w
+}
+
+func masterWallet() store.Wallet {
+	w := hot(10_000)
+	w.Kind = store.KindMaster
+	return w
+}
+
+// A withdrawal has no failure state: a reverted payout stays pending for this
+// rule to pick up again, so without the gate a payout that always reverts would
+// be re-signed on every evaluation (§28).
+func TestShouldPayWaitsOutTheBackoff(t *testing.T) {
+	w := hot(10_000)
+	w.RetryAfter = now.Add(time.Minute)
+	if ShouldPay(w, true, now) {
+		t.Fatal("paid before the retry deadline")
 	}
-	if !ShouldPay(app, backedOff, true, now.Add(2*time.Minute)) {
-		t.Fatal("the backoff never expired")
+	if !ShouldPay(w, true, now.Add(2*time.Minute)) {
+		t.Fatal("still backed off after the deadline passed")
 	}
 }
 
 func TestRulesTolerateNilAmounts(t *testing.T) {
-	// Records decoded from an older version can carry nil money; predicates
-	// must not panic on them.
-	var w store.Wallet
-	w.Kind = store.KindDeposit
+	w := proxy(0)
+	w.Balance = nil
 	if ShouldDrain(w, nil, now) {
-		t.Fatal("a zero wallet was selected for draining")
+		t.Fatal("a nil balance was treated as drainable")
 	}
-}
-
-func masterWallet(tokens int64) store.Wallet {
-	return store.Wallet{
-		ID: uuid.New(), Kind: store.KindMaster, Address: addr(0x01),
-		Balance: big.NewInt(tokens),
-	}
-}
-
-func TestShouldTopUpGas(t *testing.T) {
-	floor, amount := big.NewInt(100), big.NewInt(10)
-	master := masterWallet(50) // plenty of collected fees to trade
-
-	if !ShouldTopUpGas(master, big.NewInt(99), floor, amount, true, now) {
-		t.Fatal("did not top up below the floor")
-	}
-	if ShouldTopUpGas(master, big.NewInt(100), floor, amount, true, now) {
-		t.Fatal("topped up at the floor; only below it should trigger")
-	}
-	if ShouldTopUpGas(master, big.NewInt(1_000), floor, amount, true, now) {
-		t.Fatal("topped up with plenty of gas")
-	}
-}
-
-func TestGasTopUpIsOffUnlessEnabled(t *testing.T) {
-	// Swapping is the only thing the service does on its own initiative, so it
-	// stays off until an operator configures a router deliberately.
-	master := masterWallet(50)
-	if ShouldTopUpGas(master, big.NewInt(0), big.NewInt(100), big.NewInt(10), false, now) {
-		t.Fatal("swapped with swapping disabled")
-	}
-}
-
-func TestGasTopUpNeedsFeesToTrade(t *testing.T) {
-	// Trading more than we hold would simply revert and waste the gas we are
-	// short of in the first place.
-	poor := masterWallet(5)
-	if ShouldTopUpGas(poor, big.NewInt(0), big.NewInt(100), big.NewInt(10), true, now) {
-		t.Fatal("tried to swap 10 while holding 5")
-	}
-	if !ShouldTopUpGas(masterWallet(10), big.NewInt(0), big.NewInt(100), big.NewInt(10), true, now) {
-		t.Fatal("holding exactly the swap amount should be enough")
-	}
-}
-
-func TestGasTopUpHonoursTheCooldown(t *testing.T) {
-	// The bound that matters: a swap which succeeds but does not lift the
-	// balance above the floor must not re-fire and trade away every fee.
-	master := masterWallet(1_000)
-	master.RetryAfter = now.Add(time.Hour)
-	if ShouldTopUpGas(master, big.NewInt(0), big.NewInt(100), big.NewInt(10), true, now) {
-		t.Fatal("swapped during the cooldown")
-	}
-	if !ShouldTopUpGas(master, big.NewInt(0), big.NewInt(100), big.NewInt(10), true, now.Add(time.Hour)) {
-		t.Fatal("did not swap once the cooldown expired")
-	}
-}
-
-func TestGasTopUpOnlyEverTouchesTheMaster(t *testing.T) {
-	// An app's hot wallet also holds tokens. Trading those away would be
-	// spending an app's money on our gas.
-	app := store.Wallet{
-		ID: uuid.New(), App: "df", Kind: store.KindTopLevel, Address: addr(0x02),
-		Balance: big.NewInt(1_000_000),
-	}
-	if ShouldTopUpGas(app, big.NewInt(0), big.NewInt(100), big.NewInt(10), true, now) {
-		t.Fatal("selected an app's wallet for a gas swap")
-	}
-}
-
-func TestGasTopUpWaitsForABusyMaster(t *testing.T) {
-	master := masterWallet(1_000)
-	master.Flow = uuid.New()
-	if ShouldTopUpGas(master, big.NewInt(0), big.NewInt(100), big.NewInt(10), true, now) {
-		t.Fatal("started a swap while another flow owned the master")
-	}
-}
-
-// TestShouldSweepHouse covers the rule that collects everything nobody is owed.
-func TestShouldSweepHouse(t *testing.T) {
-	const min = 100
-	idle := topWallet(0)
-
-	if !ShouldSweepHouse(idle, big.NewInt(min), big.NewInt(min), false, now) {
-		t.Fatal("exactly at the threshold should sweep")
-	}
-	if ShouldSweepHouse(idle, big.NewInt(min-1), big.NewInt(min), false, now) {
-		t.Fatal("below the threshold should not spend a transaction")
-	}
-
-	// A queued payout is the more urgent use of a wallet that runs one flow at
-	// a time; the excess is ours and can wait.
-	if ShouldSweepHouse(idle, big.NewInt(min*10), big.NewInt(min), true, now) {
-		t.Fatal("swept while the app had a payout queued")
-	}
-
-	// Zero threshold means sweeping is off, not "sweep everything".
-	if ShouldSweepHouse(idle, big.NewInt(min*10), big.NewInt(0), false, now) {
-		t.Fatal("swept with sweeping disabled")
-	}
-
-	// Deposit wallets are drained wholesale by the drain rule; their excess
-	// arrives at the top-level wallet and is collected from there.
-	if ShouldSweepHouse(depositWallet(0), big.NewInt(min*10), big.NewInt(min), false, now) {
-		t.Fatal("house-swept a deposit wallet")
-	}
-
-	busy := topWallet(0)
-	busy.Flow = uuid.New()
-	if ShouldSweepHouse(busy, big.NewInt(min*10), big.NewInt(min), false, now) {
-		t.Fatal("swept a wallet another flow owns")
-	}
-
-	backedOff := topWallet(0)
-	backedOff.RetryAfter = now.Add(time.Minute)
-	if ShouldSweepHouse(backedOff, big.NewInt(min*10), big.NewInt(min), false, now) {
-		t.Fatal("swept during a backoff")
-	}
-}
-
-// TestShouldSweepHouseIgnoresAShortfall: a negative excess means we hold less
-// than we owe. Sweeping is the last thing to do about that.
-func TestShouldSweepHouseIgnoresAShortfall(t *testing.T) {
-	if ShouldSweepHouse(topWallet(0), big.NewInt(-500), big.NewInt(100), false, now) {
-		t.Fatal("swept while insolvent")
+	if ShouldDrain(proxy(5), nil, now) != true {
+		t.Fatal("a nil threshold should not block a positive balance")
 	}
 }

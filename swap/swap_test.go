@@ -19,7 +19,9 @@ func TestSelectorsMatchTheRouterInterface(t *testing.T) {
 	// none at all, on a contract holding real funds.
 	for name, got := range map[string][]byte{
 		"getAmountsOut":         selGetAmountsOut,
+		"getAmountsIn":          selGetAmountsIn,
 		"swapExactTokensForETH": selSwapForETH,
+		"swapTokensForExactETH": selSwapForExact,
 	} {
 		if len(got) != 4 {
 			t.Fatalf("%s selector is %d bytes", name, len(got))
@@ -30,6 +32,12 @@ func TestSelectorsMatchTheRouterInterface(t *testing.T) {
 	}
 	if hex.EncodeToString(selSwapForETH) != "18cbafe5" {
 		t.Fatalf("swapExactTokensForETH selector = %s, want 18cbafe5", hex.EncodeToString(selSwapForETH))
+	}
+	if hex.EncodeToString(selGetAmountsIn) != "1f00ca74" {
+		t.Fatalf("getAmountsIn selector = %s, want 1f00ca74", hex.EncodeToString(selGetAmountsIn))
+	}
+	if hex.EncodeToString(selSwapForExact) != "4a25d94a" {
+		t.Fatalf("swapTokensForExactETH selector = %s, want 4a25d94a", hex.EncodeToString(selSwapForExact))
 	}
 	if hex.EncodeToString(selWrapped) != "ad5c4648" {
 		t.Fatalf("WETH selector = %s, want ad5c4648", hex.EncodeToString(selWrapped))
@@ -178,5 +186,87 @@ func TestKnownRoutersAreDistinctAndNonZero(t *testing.T) {
 	}
 	if PancakeV2Mainnet == PancakeV2Testnet {
 		t.Fatal("mainnet and testnet routers are the same address")
+	}
+}
+
+// The exact-output call is the mirror of the exact-input one, and its argument
+// order is the thing most easily got wrong: the amount the caller wants comes
+// first, the ceiling on what it will spend second.
+func TestPackSwapForExactLayout(t *testing.T) {
+	data := PackSwapTokensForExactETH(
+		big.NewInt(9), big.NewInt(11), []common.Address{tokenA, tokenB}, to, big.NewInt(1234))
+	if want := 4 + 32*6 + 32*2; len(data) != want {
+		t.Fatalf("length = %d, want %d", len(data), want)
+	}
+	args := data[4:]
+	checks := []struct {
+		name string
+		at   int
+		want *big.Int
+	}{
+		{"amountOut", 0, big.NewInt(9)},
+		{"amountInMax", 32, big.NewInt(11)},
+		{"path offset", 64, big.NewInt(160)},
+		{"deadline", 128, big.NewInt(1234)},
+		{"path length", 160, big.NewInt(2)},
+	}
+	for _, c := range checks {
+		if got := new(big.Int).SetBytes(args[c.at : c.at+32]); got.Cmp(c.want) != 0 {
+			t.Fatalf("%s = %s, want %s", c.name, got, c.want)
+		}
+	}
+	if got := common.BytesToAddress(args[96+12 : 128]); got != to {
+		t.Fatalf("recipient = %s, want %s", got.Hex(), to.Hex())
+	}
+}
+
+func TestPackGetAmountsInLayout(t *testing.T) {
+	data := PackGetAmountsIn(big.NewInt(7), []common.Address{tokenA, tokenB})
+	if want := 4 + 32*3 + 32*2; len(data) != want {
+		t.Fatalf("length = %d, want %d", len(data), want)
+	}
+	args := data[4:]
+	if got := new(big.Int).SetBytes(args[:32]); got.Cmp(big.NewInt(7)) != 0 {
+		t.Fatalf("amountOut = %s, want 7", got)
+	}
+	if got := new(big.Int).SetBytes(args[32:64]); got.Cmp(big.NewInt(64)) != 0 {
+		t.Fatalf("path offset = %s, want 64", got)
+	}
+}
+
+// MaxIn rounds the other way from MinOut, and for the same reason: slack has to
+// fall on the caller's side whichever direction the trade runs.
+func TestMaxIn(t *testing.T) {
+	cases := []struct {
+		expected int64
+		bps      uint32
+		want     int64
+	}{
+		{1_000, 0, 1_000},
+		{1_000, 100, 1_010},        // 1% more
+		{1_000, 10_000 - 1, 2_000}, // just under 2x, rounded up
+		{3, 100, 4},                // rounds up, never down
+	}
+	for _, c := range cases {
+		got, err := MaxIn(big.NewInt(c.expected), c.bps)
+		if err != nil {
+			t.Fatalf("MaxIn(%d, %d): %v", c.expected, c.bps, err)
+		}
+		if got.Int64() != c.want {
+			t.Fatalf("MaxIn(%d, %d) = %s, want %d", c.expected, c.bps, got, c.want)
+		}
+	}
+	// A ceiling below the quote would be a bound the trade cannot meet.
+	got, _ := MaxIn(big.NewInt(1_000), 100)
+	if got.Cmp(big.NewInt(1_000)) < 0 {
+		t.Fatalf("MaxIn returned %s, below the quote", got)
+	}
+	for _, bad := range []struct {
+		v   *big.Int
+		bps uint32
+	}{{nil, 100}, {big.NewInt(0), 100}, {big.NewInt(-1), 100}, {big.NewInt(10), 10_000}} {
+		if _, err := MaxIn(bad.v, bad.bps); err == nil {
+			t.Fatalf("MaxIn(%v, %d) accepted", bad.v, bad.bps)
+		}
 	}
 }

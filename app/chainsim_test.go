@@ -53,6 +53,25 @@ func newChainSim(token common.Address) *chainSim {
 	}
 }
 
+// bnbOf is an address's native balance, for asserting that something did or did
+// not cost gas.
+func (c *chainSim) bnbOf(a common.Address) *big.Int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if v, ok := c.bnb[a]; ok {
+		return new(big.Int).Set(v)
+	}
+	return new(big.Int)
+}
+
+// height is the current sealed head, used by tests to count how many blocks a
+// piece of work took.
+func (c *chainSim) height() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.head
+}
+
 // --- the watcher's view ---
 
 func (c *chainSim) Finalized(context.Context) (uint64, error) {

@@ -9,7 +9,7 @@
 <body>
 <header>
   <h1>bsc <span class="tag">dashboard</span></h1>
-  <p class="sub">Local operator surface. No authentication — anyone who can load this page can move every app's money.</p>
+  <p class="sub">Local operator surface. No authentication — anyone who can load this page can move every wallet's money.</p>
 </header>
 
 <section class="strip" id="strip">
@@ -25,51 +25,51 @@
 
 <section class="strip addresses">
   <div class="stat wide">
-    <span class="label">master — pays all gas, signs everything</span>
+    <span class="label">master — pays all gas, signs everything. Nothing refills it: run <code>bsc swap</code></span>
     <span class="value" id="s-master">—</span>
-  </div>
-  <div class="stat wide" id="s-collector-stat">
-    <span class="label">fee collector</span>
-    <span class="value" id="s-collector">—</span>
   </div>
 </section>
 
 <main>
   <section class="panel">
     <div class="panel-head">
-      <h2>Apps</h2>
-      <form class="row" id="register-form">
-        <input id="register-slug" placeholder="new-app-slug" size="16" required>
-        <button>Register</button>
+      <h2>Wallets</h2>
+      <form class="row" id="create-form">
+        <input id="create-ref" placeholder="ref (e.g. acme:cust-1)" size="18" required>
+        <input id="create-drain" placeholder="drain to 0x… (blank = accumulates)" size="24">
+        <label class="check" title="Activate now instead of on first use. Costs one funding transfer and one approve — only for a wallet you know will be used."><input id="create-prewarm" type="checkbox"> prewarm</label>
+        <button>Create</button>
       </form>
     </div>
-    <p class="hint">Balances are the ledger, in cents. Custody and excess are the chain-side truth
-      behind them — the wallet also holds the house's fees and dust, which is why the two differ.</p>
+    <p class="hint">A wallet with a <em>drain to</em> forwards everything it receives once the amount is
+      worth the gas. One without keeps it, and withdrawals are paid from it. Balances are the token's own
+      base units — what the chain says the address holds, and the only balance this service has.
+      Creating one spends nothing: a wallet is funded and approved on its first real movement, not up front.</p>
     <table>
       <thead><tr>
-        <th>App</th><th>Hot wallet</th><th class="num">Available</th><th class="num">Reserved</th>
-        <th class="num">Pending</th><th class="num">Total</th><th class="num">Excess</th>
-        <th class="num">Addrs</th><th>Fee</th><th></th>
+        <th>Ref</th><th>Address</th><th>Drains to</th><th class="num">Balance</th>
+        <th class="num">Committed</th><th class="num">Deposits</th><th></th>
       </tr></thead>
-      <tbody id="apps-body"></tbody>
+      <tbody id="wallets-body"></tbody>
     </table>
   </section>
 
   <section class="panel" id="detail" hidden>
     <div class="panel-head">
-      <h2>App <code id="d-slug"></code></h2>
+      <h2>Wallet <code id="d-ref"></code></h2>
       <button class="ghost" id="d-close">close</button>
     </div>
 
     <div class="detail-grid">
       <div>
-        <h3>New deposit address</h3>
-        <form class="row" id="addr-form">
-          <input id="addr-ref" placeholder="your ref (e.g. cust-1)" required>
-          <button>Create</button>
+        <h3>Retarget</h3>
+        <form class="row" id="drain-form">
+          <input id="drain-to" placeholder="0x destination (blank to clear)" size="26">
+          <button>Set drain to</button>
         </form>
-        <p class="status" id="addr-status"></p>
-        <table class="mini"><thead><tr><th>Ref</th><th>Address</th></tr></thead><tbody id="addrs-body"></tbody></table>
+        <p class="status" id="drain-status"></p>
+        <p class="hint">Refused if it would form a cycle: A forwarding to B forwarding back to A would
+          move the same money round and round, succeeding every hop.</p>
       </div>
 
       <div>
@@ -77,14 +77,16 @@
         <form id="wd-form">
           <div class="row wrap">
             <input id="wd-dest" placeholder="0x destination" size="26" required>
-            <label>cents <input id="wd-amount" type="number" min="1" value="100" required></label>
-            <label class="check"><input id="wd-deduct" type="checkbox"> deduct fee</label>
+            <input id="wd-amount" placeholder="amount in base units" size="22" required>
+            <input id="wd-fee" placeholder="fee (optional)" size="14">
             <button>Send</button>
           </div>
         </form>
         <p class="status" id="wd-status"></p>
-        <p class="hint">Quoted against the app's own fee policy before it is created. A refusal here
-          is the whole error path: once accepted, a withdrawal has no failure state.</p>
+        <p class="hint">Only from a wallet that accumulates, and only up to what it holds less what it
+          has already promised. A refusal here is the whole error path: once accepted, a withdrawal has
+          no failure state. A fee becomes a second debit to the master — accepted together with the
+          payout, but settling on its own.</p>
       </div>
     </div>
 
@@ -93,10 +95,10 @@
       <button class="tab" data-tab="withdrawals">Withdrawals</button>
     </div>
     <div class="tab-body" id="tab-deposits">
-      <table><thead><tr><th>Ref</th><th class="num">Amount</th><th>Status</th><th>From</th><th>Tx</th><th>When</th></tr></thead><tbody id="deposits-body"></tbody></table>
+      <table><thead><tr><th class="num">Amount</th><th>Status</th><th>From</th><th>Tx</th><th>Swept by</th><th>When</th></tr></thead><tbody id="deposits-body"></tbody></table>
     </div>
     <div class="tab-body" id="tab-withdrawals" hidden>
-      <table><thead><tr><th>Destination</th><th class="num">Payout</th><th class="num">Fee</th><th>Status</th><th class="num">Attempts</th><th>Tx</th><th>Last error</th></tr></thead><tbody id="withdrawals-body"></tbody></table>
+      <table><thead><tr><th>Reason</th><th>Destination</th><th class="num">Amount</th><th>Status</th><th class="num">Attempts</th><th>Tx</th><th>Last error</th></tr></thead><tbody id="withdrawals-body"></tbody></table>
     </div>
   </section>
 
@@ -105,7 +107,7 @@
       <h2>Flows</h2>
       <span class="hint">Work the service believes it owes. A wedged one shows up here long before it shows up in a balance.</span>
     </div>
-    <table><thead><tr><th>Kind</th><th>State</th><th>App</th><th>Wallet</th><th class="num">Attempt</th><th>Retry after</th><th>Tx</th><th>Error</th></tr></thead><tbody id="flows-body"></tbody></table>
+    <table><thead><tr><th>Kind</th><th>State</th><th>Wallet</th><th>Address</th><th class="num">Attempt</th><th>Retry after</th><th>Tx</th><th>Error</th></tr></thead><tbody id="flows-body"></tbody></table>
     <p class="status" id="flows-empty">Nothing in flight.</p>
   </section>
 </main>

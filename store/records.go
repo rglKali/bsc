@@ -10,40 +10,44 @@ import (
 	"github.com/google/uuid"
 )
 
-// Record versions. Bump one only when appending a field, and read the new field
-// under `if v >= N` in that record's decoder — never renumber or reorder.
+// Record versions. Every record carries one, so a field can be added by
+// appending it and reading it under `if v >= N` — never by renumbering or
+// reordering what is already there.
+//
+// Nothing has been deployed, so nothing yet reads a version other than 1. The
+// byte is kept because it can only be added cheaply *before* there is data:
+// afterwards, giving records a version is itself a migration.
 const (
-	vApp        = 1
 	vWallet     = 1
 	vFlow       = 1
 	vTxRef      = 1
 	vSend       = 1
 	vDeposit    = 1
-	vWithdrawal = 2 // +Attempts
+	vWithdrawal = 1
 )
 
-// WalletKind separates an app's single hot wallet from the deposit addresses
-// that drain into it. The distinction is load-bearing, not cosmetic: the drain
-// invariant applies only to deposit wallets, since an unscoped rule would try
-// to drain a top-level wallet to itself forever (§4).
+// WalletKind separates the wallets bsc derives for callers from the one it
+// derives for itself.
+//
+// It used to carry the topology as well — a top-level hot wallet and the
+// deposit addresses that drained into it — which baked a two-level shape into
+// the type system. The shape is now a field: a wallet with a DrainTo forwards,
+// a wallet without one accumulates, and any wallet can be either (§32).
 type WalletKind uint8
 
 const (
-	KindTopLevel WalletKind = 1
-	KindDeposit  WalletKind = 2
+	KindManaged WalletKind = 1
 	// KindMaster is the gas-paying wallet itself. It is recorded so its token
-	// balance — the fees it collects — is tracked like any other, and so a gas
-	// top-up can own it the way every other flow owns a wallet. Its key comes
-	// from the master secret directly, not from HMAC derivation.
-	KindMaster WalletKind = 3
+	// balance is tracked like any other, and so a gas top-up can own it the way
+	// every other flow owns a wallet. Its key comes from the master secret
+	// directly, not from HMAC derivation.
+	KindMaster WalletKind = 2
 )
 
 func (k WalletKind) String() string {
 	switch k {
-	case KindTopLevel:
-		return "top_level"
-	case KindDeposit:
-		return "deposit"
+	case KindManaged:
+		return "managed"
 	case KindMaster:
 		return "master"
 	}
@@ -51,34 +55,28 @@ func (k WalletKind) String() string {
 }
 
 // FlowKind is which pipeline a flow is running.
+//
+// There are two, and one of them does no work: a transfer moves tokens out of a
+// wallet, and a prewarm only activates one.
+//
+// A drain and a payout used to be separate kinds running byte-identical state
+// machines, differing solely in whether the amount was carried or read from the
+// chain at signing — which is a property of the flow's Amount, not a property
+// worth a type. Collapsing them is the same move §42 made on the records: one
+// mechanism, and the reason attached rather than baked into it (§46).
 type FlowKind uint8
 
 const (
-	FlowDrain      FlowKind = 1 // deposit wallet -> its app's top-level
-	FlowWithdrawal FlowKind = 2 // top-level -> a destination
-	FlowPrewarm    FlowKind = 4 // activate a wallet off the hot path
-	FlowGasTopUp   FlowKind = 5 // swap collected fees back into gas
-	// FlowHouseSweep moves what a wallet holds beyond its app's ledger — fees,
-	// sub-cent dust, and anything else that arrived without being owed to
-	// anybody — to the collector. It replaces the fee sweep: with the ledger as
-	// the authority there is no separate fee to chase, only an excess (§25).
-	FlowHouseSweep FlowKind = 6
-	// 3 was FlowFeeSweep, twice: first as its own flow, then as a state of the
-	// withdrawal that earned it. Not reused.
+	FlowTransfer FlowKind = 1 // move tokens out of a wallet
+	FlowPrewarm  FlowKind = 2 // activate a wallet off the hot path
 )
 
 func (k FlowKind) String() string {
 	switch k {
-	case FlowDrain:
-		return "drain"
-	case FlowWithdrawal:
-		return "withdrawal"
+	case FlowTransfer:
+		return "transfer"
 	case FlowPrewarm:
 		return "prewarm"
-	case FlowGasTopUp:
-		return "gas_topup"
-	case FlowHouseSweep:
-		return "house_sweep"
 	}
 	return "unknown"
 }
@@ -87,28 +85,21 @@ func (k FlowKind) String() string {
 // is the funding/approving prefix of whichever flow needed an inactive wallet —
 // and every kind shares one terminal vocabulary, so "prewarm reached active" is
 // simply StateDone.
-//
-// A withdrawal ends at its payout. It used to carry on into a fee-collection
-// state, which the ledger made unnecessary: the fee is collected by not
-// crediting it, so a withdrawal is one transfer again (§24).
 type FlowState uint8
 
+// The terminal states are the highest values, which is what IsTerminal reads.
+// Keep it that way when adding one.
 const (
-	StateFunding         FlowState = 1 // send BNB for the approve, then wait
-	StateApproving       FlowState = 2 // approve the master, then wait
-	StateSweeping        FlowState = 3 // move the wallet's whole balance
-	StatePaying          FlowState = 4 // move an exact amount to a destination
-	StateApprovingRouter FlowState = 6 // let the swap router spend the master's tokens
-	StateSwapping        FlowState = 7 // trade tokens for native gas
-	StateSweepingHouse   FlowState = 8 // move the wallet's excess over the ledger
-	StateDone            FlowState = 10
-	// 5 was StateCollecting, when a withdrawal collected its own fee.
-	StateFailed FlowState = 11
+	StateFunding   FlowState = 1 // send BNB for the approve, then wait
+	StateApproving FlowState = 2 // approve the master, then wait
+	StateMoving    FlowState = 3 // move tokens out: an exact amount, or all of them
+	StateDone      FlowState = 4
+	StateFailed    FlowState = 5
 )
 
 // IsTerminal reports whether the flow is finished and its record may be
 // deleted. Anything worth keeping must be copied onto the withdrawal or deposit
-// record in the same transaction (§3).
+// record in the same transaction.
 func (s FlowState) IsTerminal() bool { return s >= StateDone }
 
 func (s FlowState) String() string {
@@ -117,16 +108,8 @@ func (s FlowState) String() string {
 		return "funding"
 	case StateApproving:
 		return "approving"
-	case StateSweeping:
-		return "sweeping"
-	case StatePaying:
-		return "paying"
-	case StateApprovingRouter:
-		return "approving_router"
-	case StateSwapping:
-		return "swapping"
-	case StateSweepingHouse:
-		return "sweeping_house"
+	case StateMoving:
+		return "moving"
 	case StateDone:
 		return "done"
 	case StateFailed:
@@ -135,220 +118,163 @@ func (s FlowState) String() string {
 	return "unknown"
 }
 
-// DepositStatus is the app-visible lifecycle of money arriving, and it has
-// exactly two states because the app only ever needs one distinction: can I
-// spend this yet. `pending` is money we have seen and owe you; `credited` is
-// money sitting in the wallet payouts are drawn from.
+// DepositStatus is the caller-visible lifecycle of money arriving.
 //
-// Crediting is a status rather than a feed entry because one drain can credit
-// several deposits at once (§9). The on-chain machinery that gets it there —
-// funding, approving, draining — is not a state an app is shown (§27).
+// It names where the money physically is, which is the only thing bsc can
+// honestly report now that it keeps no ledger. `received` means it is sitting
+// on the wallet it was sent to; `forwarded` means a drain moved it on to that
+// wallet's DrainTo and it is no longer here.
+//
+// A deposit to a wallet with no DrainTo stays `received` forever. That is not
+// an unfinished state — the money is exactly where it was meant to land, and
+// there is nothing further for bsc to do with it (§34).
 //
 // The stored values are frozen: they are a packed field in every deposit record.
 type DepositStatus uint8
 
 const (
-	DepositPending  DepositStatus = 1 // recorded from a finalized block, not yet drained
-	DepositCredited DepositStatus = 2 // its drain landed; the funds are withdrawable
+	DepositReceived  DepositStatus = 1
+	DepositForwarded DepositStatus = 2
 )
 
 func (s DepositStatus) String() string {
 	switch s {
-	case DepositPending:
-		return "pending"
-	case DepositCredited:
-		return "credited"
+	case DepositReceived:
+		return "received"
+	case DepositForwarded:
+		return "forwarded"
 	}
 	return "unknown"
 }
 
-// WithdrawalStatus is the app-visible lifecycle of money leaving, and it mirrors
-// DepositStatus: one non-terminal state and one terminal one, named for what
-// happened to the ledger rather than for what happened on the chain.
+// DebitReason says why money left a wallet.
+//
+// Every outgoing movement bsc makes is the same operation — the master moving a
+// managed wallet's tokens somewhere — differing only in who decided it and where
+// it went. Recording them as one kind of thing with a reason attached is cheaper
+// than three vocabularies, and it is what lets a caller reconcile a wallet as
+// credits and debits with nothing left over (§42).
+//
+// The reason is metadata. It changes nothing about how the transfer is built,
+// signed or retried; it exists so that whoever keeps the books can tell what a
+// movement meant without bsc having to know.
+type DebitReason uint8
+
+const (
+	// ReasonPayout is what a caller asked for: an amount, to an address it
+	// named. It begins as a promise and counts against the wallet until it
+	// settles.
+	ReasonPayout DebitReason = 1
+	// ReasonDrain is bsc forwarding a wallet to its DrainTo. It is recorded when
+	// the transfer is observed, so it is born terminal and never counts as a
+	// commitment — nobody is waiting on it and it cannot be refused.
+	ReasonDrain DebitReason = 2
+	// ReasonFee accompanies a payout, to the wallet that pays for gas. The
+	// caller decides the number; bsc only routes it (§43).
+	ReasonFee DebitReason = 3
+)
+
+func (r DebitReason) String() string {
+	switch r {
+	case ReasonPayout:
+		return "payout"
+	case ReasonDrain:
+		return "drain"
+	case ReasonFee:
+		return "fee"
+	}
+	return "unknown"
+}
+
+// WithdrawalStatus is the caller-visible lifecycle of money leaving.
 //
 // **There is no failure state.** A request that cannot be honoured is refused
-// synchronously at creation — bad address, below the minimum, not enough
-// balance — so it never becomes a record at all. Anything that goes wrong after
-// that is ours, not the app's: a reverted payout backs the wallet off and the
-// withdrawal stays `pending` for the rules to retry (§28). The app is therefore
-// never handed a terminal state it has to compensate for.
-//
-// There is no `partial` either: fees accrue off-chain and sweep in batch, so a
-// withdrawal is exactly one transfer and cannot half-succeed (§7).
-//
-// The stored values are frozen: they are a packed field in every withdrawal
-// record. 2 and 4 were `pending` (never written) and `failed` (retired in §28).
+// synchronously at creation — bad address, zero amount, more than the wallet
+// holds — so it never becomes a record at all. Anything that goes wrong after
+// that is ours: a reverted payout backs the wallet off and the withdrawal stays
+// `pending` for the rules to retry. The caller is therefore never handed a
+// terminal state it has to compensate for (§28, which survives the rewrite).
 type WithdrawalStatus uint8
 
 const (
-	WithdrawalPending WithdrawalStatus = 1 // accepted and reserved, not yet settled
-	WithdrawalDebited WithdrawalStatus = 3 // the payout landed and the ledger is charged
-
-	// withdrawalFailed is retired and never written. It is kept because `log/`
-	// is kept forever: a database written before §28 can still hold one, and a
-	// value this binary did not recognise would read as "unknown", fall out of
-	// IsTerminal, and so be counted in the outstanding set the old binary had
-	// already removed it from — which `Verify` would then report as a broken
-	// index. Decoding it honestly costs one case and keeps old records true.
-	withdrawalFailed WithdrawalStatus = 4
+	WithdrawalPending   WithdrawalStatus = 1 // accepted, not yet on-chain
+	WithdrawalConfirmed WithdrawalStatus = 2 // the transfer reached finality
 )
 
-func (s WithdrawalStatus) IsTerminal() bool {
-	return s == WithdrawalDebited || s == withdrawalFailed
-}
+func (s WithdrawalStatus) IsTerminal() bool { return s == WithdrawalConfirmed }
 
 func (s WithdrawalStatus) String() string {
 	switch s {
 	case WithdrawalPending:
 		return "pending"
-	case WithdrawalDebited:
-		return "debited"
-	case withdrawalFailed:
-		return "failed" // legacy only; nothing reaches this state any more
+	case WithdrawalConfirmed:
+		return "confirmed"
 	}
 	return "unknown"
 }
 
-// FeePolicy is an app's withdrawal-fee configuration: a business fee charged to
-// the app's own users, unrelated to gas (§7). v2.0 implements Flat and Min;
-// BPS and MaxFee are carried so a percentage fee later needs no migration, and
-// are rejected while non-zero.
+// Wallet is any derived wallet. ID is the derivation handle — the private key
+// is HMAC(master, ID) — so losing these records loses the ability to address
+// funds.
 //
-// Every field is in cents. A fee that was not a whole number of cents would put
-// a fraction into the ledger and cost it the exactness the whole design rests
-// on, so the unit itself makes that impossible.
-type FeePolicy struct {
-	Flat   money.Cents // flat charge per withdrawal
-	Min    money.Cents // reject withdrawals below this; also the brake on spam
-	BPS    uint32      // reserved: basis points of `amount`
-	MaxFee money.Cents // reserved: cap on a percentage fee
-}
-
-// Zero reports a policy that charges nothing.
-func (p FeePolicy) Zero() bool { return p.Flat == 0 && p.BPS == 0 }
-
-func (p *FeePolicy) encode(e *enc) {
-	e.i64(int64(p.Flat))
-	e.i64(int64(p.Min))
-	e.u32(p.BPS)
-	e.i64(int64(p.MaxFee))
-}
-
-func (p *FeePolicy) decode(d *dec) {
-	p.Flat = money.Cents(d.i64())
-	p.Min = money.Cents(d.i64())
-	p.BPS = d.u32()
-	p.MaxFee = money.Cents(d.i64())
-}
-
-// App is a caller. Registration is public and idempotent; apps configure
-// themselves; a slug identifies them and there are no API keys (§6).
-type App struct {
-	Slug   string
-	Wallet uuid.UUID // its top-level hot wallet
-	Fee    FeePolicy
-
-	// Ledger is what this app is owed, in cents, and it is the only authority
-	// on what the app may spend. It is credited when a deposit's drain lands —
-	// not when the deposit is seen — because money still sitting in a deposit
-	// address cannot be paid out of the hot wallet (§22).
-	//
-	// It is materialised for O(1) reads but fully recomputable from log/:
-	// credited deposits less settled withdrawals. That is the difference from
-	// the balance it replaces, which no amount of log-reading could reproduce.
-	Ledger money.Cents
-
-	// Reserved is held by open withdrawals — payout plus fee, one figure now
-	// that the fee no longer leaves separately. Spendable is Ledger-Reserved.
-	Reserved money.Cents
-
-	Paused    bool
-	CreatedAt time.Time
-	UpdatedAt time.Time
-}
-
-// Spendable is what the app may commit to a new withdrawal.
-func (a *App) Spendable() money.Cents {
-	if a.Reserved > a.Ledger {
-		return 0
-	}
-	return a.Ledger - a.Reserved
-}
-
-func (a *App) encode() ([]byte, error) {
-	e := &enc{}
-	e.u8(vApp)
-	e.str(a.Slug)
-	e.id(a.Wallet)
-	a.Fee.encode(e)
-	e.i64(int64(a.Ledger))
-	e.i64(int64(a.Reserved))
-	e.boolean(a.Paused)
-	e.stamp(a.CreatedAt)
-	e.stamp(a.UpdatedAt)
-	return e.b, e.err
-}
-
-func decodeApp(b []byte) (App, error) {
-	d := newDec(b)
-	_ = d.u8()
-	var a App
-	a.Slug = d.str()
-	a.Wallet = d.id()
-	a.Fee.decode(d)
-	a.Ledger = money.Cents(d.i64())
-	a.Reserved = money.Cents(d.i64())
-	a.Paused = d.boolean()
-	a.CreatedAt = d.stamp()
-	a.UpdatedAt = d.stamp()
-	return a, d.done()
-}
-
-// Wallet is any derived wallet: an app's top-level or one of its deposit
-// addresses. ID is the derivation handle — the private key is HMAC(master, ID)
-// — so losing these records loses the ability to address funds.
+// DrainTo is the whole topology. Empty means this wallet accumulates: deposits
+// stay on it and withdrawals are paid from it. Set means this wallet forwards:
+// everything that lands is swept to that address once it is worth the gas, and
+// no withdrawal may be paid from it. A wallet cannot do both, because the two
+// behaviours contradict each other — one keeps the balance, the other empties
+// it (§32).
 //
-// Flow is the one live flow that owns this wallet, or the zero UUID when idle.
-// Holding a pointer rather than duplicating the flow's state keeps exactly one
-// place a state can be wrong, and makes "is this wallet busy?" a field read (§4).
+// The destination need not be a wallet bsc manages. When it is, the chain of
+// DrainTo references is checked for cycles at write time, since A→B→A would
+// otherwise burn the master's gas as fast as blocks arrive (§35).
 type Wallet struct {
 	ID      uuid.UUID
-	App     string
+	Ref     string // the caller's handle for this wallet; unique across the service
 	Kind    WalletKind
-	Ref     string // app-supplied handle; deposit wallets only
 	Address common.Address
-	Active  bool // has approved the master for MaxUint256
+	DrainTo common.Address // zero = this wallet accumulates
+	Active  bool           // has approved the master for MaxUint256
 
-	// Balance is custody: the wei this address actually holds, as observed from
-	// the chain. It is deliberately *not* what the app may spend — that is the
-	// app's ledger, in cents. One wallet holds an app's money, the house's fees
-	// and sub-cent dust in a single number, and no amount of arithmetic on it
-	// can say whose is whose (§22).
+	// Balance is custody in the token's base units: what this address actually
+	// holds, accumulated from every Transfer the watcher observed. With the
+	// ledger gone this is the only balance in the service, and it means exactly
+	// what the chain means by it.
 	Balance *big.Int
+
+	// Paused blocks withdrawals from this wallet. Drains are unaffected: those
+	// are the topology doing what it was configured to do, not a caller
+	// spending.
+	Paused bool
 
 	Flow           uuid.UUID
 	FailedAttempts uint32
 	RetryAfter     time.Time
 	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // Idle reports that no flow currently owns this wallet.
 func (w *Wallet) Idle() bool { return w.Flow == uuid.Nil }
 
+// Proxies reports that this wallet forwards what it receives.
+func (w *Wallet) Proxies() bool { return w.DrainTo != (common.Address{}) }
+
 func (w *Wallet) encode() ([]byte, error) {
 	e := &enc{}
 	e.u8(vWallet)
 	e.id(w.ID)
-	e.str(w.App)
-	e.u8(uint8(w.Kind))
 	e.str(w.Ref)
+	e.u8(uint8(w.Kind))
 	e.addr(w.Address)
+	e.addr(w.DrainTo)
 	e.boolean(w.Active)
 	e.wei(w.Balance)
+	e.boolean(w.Paused)
 	e.id(w.Flow)
 	e.u32(w.FailedAttempts)
 	e.stamp(w.RetryAfter)
 	e.stamp(w.CreatedAt)
+	e.stamp(w.UpdatedAt)
 	return e.b, e.err
 }
 
@@ -357,31 +283,38 @@ func decodeWallet(b []byte) (Wallet, error) {
 	_ = d.u8()
 	var w Wallet
 	w.ID = d.id()
-	w.App = d.str()
-	w.Kind = WalletKind(d.u8())
 	w.Ref = d.str()
+	w.Kind = WalletKind(d.u8())
 	w.Address = d.addr()
+	w.DrainTo = d.addr()
 	w.Active = d.boolean()
 	w.Balance = d.wei()
+	w.Paused = d.boolean()
 	w.Flow = d.id()
 	w.FailedAttempts = d.u32()
 	w.RetryAfter = d.stamp()
 	w.CreatedAt = d.stamp()
+	w.UpdatedAt = d.stamp()
 	return w, d.done()
 }
 
 // Flow is one pipeline instance. Its state *is* the instruction to the sender —
 // StateFunding means "the funding transfer still needs to go out" — so there is
 // no separate intent to persist and a crash between the state committing and
-// the transaction being built re-derives the same work (§4).
+// the transaction being built re-derives the same work.
+//
+// Amount and Withdrawal move together and are the whole difference between the
+// two things a transfer can be: set, and this flow is paying an exact amount on
+// behalf of a withdrawal record; unset, and it is sweeping the wallet to its
+// DrainTo. flow.Begin enforces that pairing, so settlement can read it as a
+// fact rather than a guess (§46).
 type Flow struct {
 	ID         uuid.UUID
 	Kind       FlowKind
 	State      FlowState
 	Wallet     uuid.UUID
-	App        string
-	Withdrawal uuid.UUID // set for FlowWithdrawal
-	Amount     *big.Int  // zero on a sweep: the amount is read from the chain
+	Withdrawal uuid.UUID // the withdrawal this transfer pays, when it pays one
+	Amount     *big.Int  // zero on a drain: the amount is read from the chain
 	To         common.Address
 	Tx         common.Hash // the transaction this flow is waiting on, if any
 	Attempt    uint32
@@ -393,6 +326,25 @@ type Flow struct {
 // Waiting reports that a transaction is in flight for this flow.
 func (f *Flow) Waiting() bool { return f.Tx != (common.Hash{}) }
 
+// Pays reports that this flow is serving a caller's withdrawal rather than
+// sweeping. It is the one bit that used to be a whole flow kind, and it is an
+// invariant rather than a heuristic: Begin refuses a transfer whose amount and
+// withdrawal id disagree.
+func (f *Flow) Pays() bool { return f.Withdrawal != uuid.Nil }
+
+// Label is what a flow is doing, for logs, metrics and the dashboard. It uses
+// the same words a debit's reason does, so one movement reads the same whether
+// you are watching it happen or reading what happened (§42, §46).
+func (f *Flow) Label() string {
+	if f.Kind != FlowTransfer {
+		return f.Kind.String()
+	}
+	if f.Pays() {
+		return "payout"
+	}
+	return "drain"
+}
+
 func (f *Flow) encode() ([]byte, error) {
 	e := &enc{}
 	e.u8(vFlow)
@@ -400,7 +352,6 @@ func (f *Flow) encode() ([]byte, error) {
 	e.u8(uint8(f.Kind))
 	e.u8(uint8(f.State))
 	e.id(f.Wallet)
-	e.str(f.App)
 	e.id(f.Withdrawal)
 	e.wei(f.Amount)
 	e.addr(f.To)
@@ -420,7 +371,6 @@ func decodeFlow(b []byte) (Flow, error) {
 	f.Kind = FlowKind(d.u8())
 	f.State = FlowState(d.u8())
 	f.Wallet = d.id()
-	f.App = d.str()
 	f.Withdrawal = d.id()
 	f.Amount = d.wei()
 	f.To = d.addr()
@@ -462,7 +412,7 @@ func decodeTxRef(b []byte) (TxRef, error) {
 
 // Send is the signed-transaction journal, written before the transaction is
 // broadcast. On restart the raw bytes are re-broadcast unchanged — same hash,
-// idempotent on-chain — rather than a second transaction being signed (§4).
+// idempotent on-chain — rather than a second transaction being signed.
 type Send struct {
 	Flow      uuid.UUID
 	Signer    common.Address
@@ -497,48 +447,41 @@ func decodeSend(b []byte) (Send, error) {
 	return s, d.done()
 }
 
-// Deposit is a recorded incoming transfer, and one ledger entry: Cents is the
-// credit the app receives when this deposit's drain lands.
+// Deposit is a recorded incoming transfer: one Transfer log that paid a wallet
+// bsc manages.
 //
-// Both units are kept. AmountWei is what the chain says arrived and is what an
-// operator compares against a block explorer; Cents is what the app was
-// actually credited, floored. The difference is house dust, and storing both
-// makes "the explorer says 10.007 and your API says 1000" a lookup rather than
-// an investigation (§23).
-//
-// Transfers too small to be worth a whole cent get no record at all: there is
-// no ledger entry to write, and an entry of zero would be a feed item that
-// changed nothing.
+// Amount is the chain's own figure, unscaled and unrounded. There is no second
+// unit beside it and no floor applied to it, so there is no dust — the number
+// here is the number on the block explorer (§36).
 type Deposit struct {
-	Wallet    uuid.UUID
-	App       string
-	Block     uint64
-	LogIndex  uint32
-	TxHash    common.Hash
-	From      common.Address
-	AmountWei *big.Int    // what arrived on-chain
-	Cents     money.Cents // what the app is credited, floored
-	Status    DepositStatus
-	DrainTx   common.Hash // the sweep that credited it
+	Wallet   uuid.UUID
+	Block    uint64
+	LogIndex uint32
+	TxHash   common.Hash
+	From     common.Address
+	Amount   *big.Int
+	Status   DepositStatus
+	// SweptBy is the debit that carried this deposit onward, set when a drain
+	// lands. It points at a withdrawal record rather than at a bare hash, so a
+	// credit and the debit that consumed it are two ends of one link (§42).
+	SweptBy   uuid.UUID
 	CreatedAt time.Time
 }
 
-// Cursor is this deposit's position in the app's feed.
+// Cursor is this deposit's position in the feed.
 func (dp *Deposit) Cursor() Cursor { return Cursor{Block: dp.Block, LogIndex: dp.LogIndex} }
 
 func (dp *Deposit) encode() ([]byte, error) {
 	e := &enc{}
 	e.u8(vDeposit)
 	e.id(dp.Wallet)
-	e.str(dp.App)
 	e.u64(dp.Block)
 	e.u32(dp.LogIndex)
 	e.hash(dp.TxHash)
 	e.addr(dp.From)
-	e.wei(dp.AmountWei)
-	e.i64(int64(dp.Cents))
+	e.wei(dp.Amount)
 	e.u8(uint8(dp.Status))
-	e.hash(dp.DrainTx)
+	e.id(dp.SweptBy)
 	e.stamp(dp.CreatedAt)
 	return e.b, e.err
 }
@@ -548,104 +491,100 @@ func decodeDeposit(b []byte) (Deposit, error) {
 	_ = d.u8()
 	var dp Deposit
 	dp.Wallet = d.id()
-	dp.App = d.str()
 	dp.Block = d.u64()
 	dp.LogIndex = d.u32()
 	dp.TxHash = d.hash()
 	dp.From = d.addr()
-	dp.AmountWei = d.wei()
-	dp.Cents = money.Cents(d.i64())
+	dp.Amount = d.wei()
 	dp.Status = DepositStatus(d.u8())
-	dp.DrainTx = d.hash()
+	dp.SweptBy = d.id()
 	dp.CreatedAt = d.stamp()
 	return dp, d.done()
 }
 
-// Withdrawal is an app-initiated payout, and one ledger entry: Debit is what
-// leaves the app's ledger when it settles.
+// Withdrawal is money leaving a managed wallet — a debit.
 //
-// There is a single reservation now, not two. The fee no longer leaves in a
-// transfer of its own — it is collected by simply not crediting it to the app —
-// so payout and fee have the same lifetime and are held as one figure, released
-// together when the payout confirms or fails (§24).
+// Every outgoing movement is this record: a payout the caller asked for, the fee
+// that accompanied it, and a drain bsc decided to make. Reason says which. That
+// is the whole of the "drain" concept now — it is a debit with a reason, linked
+// to the credits it carried (§42) — and the whole of the fee (§43).
 //
-// Fee and FeeSnapshot together keep history explicable once an app edits its
-// policy, and storing the reserved figure rather than recomputing it makes the
-// release exact across a policy change.
+// There is no fee on it. A fee is a charge somebody levies on somebody else,
+// which needs to know who they are, and bsc does not. A caller that wants to
+// take a dollar asks for a payout a dollar smaller and moves the remainder with
+// a second withdrawal of its own (§33).
 type Withdrawal struct {
 	ID          uuid.UUID
-	App         string
+	Wallet      uuid.UUID // the wallet it is paid from
+	Reason      DebitReason
 	Destination common.Address
-	Amount      money.Cents // what the app asked for
-	Fee         money.Cents // charged, per the policy at request time
-	Payout      money.Cents // what the destination receives, on-chain
-	Debit       money.Cents // payout + fee: what this record reserves and then spends
-	DeductFee   bool
-	Status      WithdrawalStatus
-	TxHash      common.Hash
+
+	// PartOf links a fee to the payout it accompanies. The two are separate
+	// records that settle independently — two transfers cannot be made atomic
+	// without a contract — so this is what says they were asked for together
+	// (§43).
+	PartOf uuid.UUID
+	Amount *big.Int
+	Status WithdrawalStatus
+	TxHash common.Hash
+
+	// Block is the finalized block the transfer landed in, set when the
+	// withdrawal confirms. It is the feed's ordering: a caller polls settled
+	// debits the same way it polls deposits.
+	Block uint64
 	// Error and Attempts are diagnostics, never a verdict: a withdrawal has no
 	// failure state, so these describe a request still being retried (§28).
 	Error          string
 	Attempts       uint32
 	IdempotencyKey string
-	FeeSnapshot    FeePolicy
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
+
+// Settled is this withdrawal's position in the finalized-debit feed. It is only
+// meaningful once the withdrawal is terminal.
+func (wd *Withdrawal) Settled() Settled { return Settled{Block: wd.Block, ID: wd.ID} }
 
 func (wd *Withdrawal) encode() ([]byte, error) {
 	e := &enc{}
 	e.u8(vWithdrawal)
 	e.id(wd.ID)
-	e.str(wd.App)
+	e.id(wd.Wallet)
+	e.u8(uint8(wd.Reason))
+	e.id(wd.PartOf)
 	e.addr(wd.Destination)
-	e.i64(int64(wd.Amount))
-	e.i64(int64(wd.Fee))
-	e.i64(int64(wd.Payout))
-	e.i64(int64(wd.Debit))
-	e.boolean(wd.DeductFee)
+	e.wei(wd.Amount)
 	e.u8(uint8(wd.Status))
 	e.hash(wd.TxHash)
+	e.u64(wd.Block)
 	e.str(wd.Error)
+	e.u32(wd.Attempts)
 	e.str(wd.IdempotencyKey)
-	wd.FeeSnapshot.encode(e)
 	e.stamp(wd.CreatedAt)
 	e.stamp(wd.UpdatedAt)
-	e.u32(wd.Attempts) // v2
 	return e.b, e.err
 }
 
 func decodeWithdrawal(b []byte) (Withdrawal, error) {
 	d := newDec(b)
-	v := d.u8()
+	_ = d.u8()
 	var wd Withdrawal
 	wd.ID = d.id()
-	wd.App = d.str()
+	wd.Wallet = d.id()
+	wd.Reason = DebitReason(d.u8())
+	wd.PartOf = d.id()
 	wd.Destination = d.addr()
-	wd.Amount = money.Cents(d.i64())
-	wd.Fee = money.Cents(d.i64())
-	wd.Payout = money.Cents(d.i64())
-	wd.Debit = money.Cents(d.i64())
-	wd.DeductFee = d.boolean()
+	wd.Amount = d.wei()
 	wd.Status = WithdrawalStatus(d.u8())
 	wd.TxHash = d.hash()
+	wd.Block = d.u64()
 	wd.Error = d.str()
+	wd.Attempts = d.u32()
 	wd.IdempotencyKey = d.str()
-	wd.FeeSnapshot.decode(d)
 	wd.CreatedAt = d.stamp()
 	wd.UpdatedAt = d.stamp()
-	if v >= 2 {
-		wd.Attempts = d.u32()
-	}
 	return wd, d.done()
 }
 
 // orZero makes a nil amount usable without nil-checking money everywhere.
-func orZero(v *big.Int) *big.Int {
-	if v == nil {
-		return new(big.Int)
-	}
-	return v
-}
-
-// FeePolicy is an app's
+func orZero(v *big.Int) *big.Int { return money.OrZero(v) }

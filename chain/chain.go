@@ -134,6 +134,19 @@ func (c *Client) BlockReceipts(ctx context.Context, block uint64) ([]*types.Rece
 
 // --- reads and writes the signing path needs ---
 
+// Receipt returns one transaction's receipt, or nil when it is not yet mined.
+//
+// The watcher never needs this — it reads whole blocks — but an attended
+// operator command does: `bsc swap` has to know its approve landed before it
+// builds the trade that depends on it.
+func (c *Client) Receipt(ctx context.Context, hash common.Hash) (*types.Receipt, error) {
+	var rc *types.Receipt
+	if err := c.call(ctx, &rc, "eth_getTransactionReceipt", hash); err != nil {
+		return nil, fmt.Errorf("chain: receipt %s: %w", hash.Hex(), err)
+	}
+	return rc, nil
+}
+
 // Nonce returns the next nonce for addr, counting pending transactions. The
 // chain is deliberately the authority here rather than a locally persisted
 // counter: the operator holds the master secret and signs by hand for gas

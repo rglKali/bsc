@@ -1,10 +1,11 @@
 // bsc dashboard.
 //
-// Two sources, deliberately: /ui/state is the operator read model (wei, flows,
-// solvency — everything §27 keeps away from apps), and /v1/apps/... is the real
-// app contract. The sandbox halves of this page drive that contract exactly as
-// an integrating service would, so what you see work here is what an app gets.
-// Nothing on this page has a private door into the service.
+// Two sources, deliberately: /ui/state is the operator read model (flows,
+// commitments, activity — everything the caller contract does not need), and
+// /v1/wallets/... is the real contract. The sandbox halves of this page drive
+// that contract exactly as an integrating service would, so what you see work
+// here is what a caller gets. Nothing on this page has a private door into the
+// service.
 //
 // The third source is /metrics, for the two gauges that are not in the store:
 // the master's native and token balances. A dry master stops every pipeline, so
@@ -13,30 +14,22 @@
 const $ = (id) => document.getElementById(id);
 const POLL_MS = 2000;
 
-let selected = null;      // slug of the open detail panel
+let selected = null;      // ref of the open detail panel
 let detailTab = 'deposits';
 
 // ---------- formatting ----------
 
-// Cents arrive as decimal strings and must stay that way: they are int64 and a
-// JSON number would have been a float. Parsing one into a Number to divide by
-// 100 would reintroduce exactly the bug the wire format exists to prevent, so
-// the split is done on the string.
-function money(cents) {
-  const s = String(cents ?? '0');
-  const neg = s.startsWith('-');
-  const digits = (neg ? s.slice(1) : s).padStart(3, '0');
-  const whole = digits.slice(0, -2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  const frac = digits.slice(-2);
-  return `${neg ? '-' : ''}${whole}<span class="cents">.${frac}</span>`;
-}
-
-// Wei is only ever shown, never computed on, so BigInt-to-fixed is enough.
+// Amounts arrive as decimal strings of the token's own base units and must stay
+// that way: a uint256 does not survive a JSON number, and parsing one into a
+// Number to divide would reintroduce exactly the bug the wire format exists to
+// prevent. BigInt divides it instead.
+//
+// Amounts are only ever shown, never computed on, so BigInt-to-fixed is enough.
 //
 // The decimals fall back to 18 when they are zero as well as when they are
 // absent: the service reads them from the token itself and a database that has
 // not met its chain yet reports 0, which would render every balance as a raw
-// wei integer rather than an amount.
+// integer rather than an amount.
 function token(wei, decimals) {
   if (wei === undefined || wei === null) return '—';
   let v;
@@ -69,7 +62,7 @@ const ago = (iso) => {
 };
 
 // The explorer is the one place the page sends you off-box, and it is also the
-// only reason a tx hash is on the app contract at all. An unknown chain gets no
+// only reason a tx hash is on the caller contract at all. An unknown chain gets no
 // link rather than a wrong one — a bscscan URL for a chain that is not BSC would
 // silently show somebody else's transaction.
 function explorer(chainID) {
@@ -106,7 +99,7 @@ function addrCell(addr, chainID, { short: abbreviate = false } = {}) {
 document.addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-copy]');
   if (!btn) return;
-  e.stopPropagation(); // never let a copy also select the app row
+  e.stopPropagation(); // never let a copy also select the wallet row
   try {
     await navigator.clipboard.writeText(btn.dataset.copy);
     btn.textContent = 'copied';
@@ -190,39 +183,35 @@ function renderStrip(state, gauges) {
     ? '—' : String(gauges.inFlight);
 
   $('s-master').innerHTML = addrCell(svc.master, svc.chain_id);
-  // An unset collector means the master collects, which is the default and
-  // worth saying rather than showing the same address twice.
-  $('s-collector').innerHTML = svc.collector
-    ? addrCell(svc.collector, svc.chain_id)
-    : '<span class="zero">the master</span>';
 }
 
-// ---------- apps ----------
+// ---------- wallets ----------
 
-function renderApps(state) {
-  const body = $('apps-body');
-  if (!state.apps.length) {
-    body.innerHTML = '<tr><td colspan="10" class="zero">No apps yet — register one above.</td></tr>';
+function renderWallets(state) {
+  const body = $('wallets-body');
+  if (!state.wallets.length) {
+    body.innerHTML = '<tr><td colspan="7" class="zero">No wallets yet — create one above.</td></tr>';
     return;
   }
-  body.innerHTML = state.apps.map((a) => {
-    const b = a.balance;
-    // A negative excess is the one finding that nothing self-corrects: the
-    // wallet holds less than the app is owed.
-    const excess = a.solvent
-      ? `<span class="zero">${esc(token(a.excess_wei, state.service.decimals))}</span>`
-      : `<span style="color:var(--bad)">${esc(token(a.excess_wei, state.service.decimals))} short</span>`;
-    return `<tr class="clickable${selected === a.slug ? ' selected' : ''}" data-slug="${esc(a.slug)}">
-      <td>${esc(a.slug)} ${a.paused ? pill('paused') : ''}</td>
-      <td>${addrCell(a.address, state.service.chain_id)}</td>
-      <td class="num money">${money(b.available_cents)}</td>
-      <td class="num money">${money(b.reserved_cents)}</td>
-      <td class="num money">${money(b.pending_cents)}</td>
-      <td class="num money">${money(b.total_cents)}</td>
-      <td class="num">${excess}</td>
-      <td class="num">${a.addresses}</td>
-      <td>${money(a.fee.flat_cents)}</td>
-      <td><button class="ghost tiny" data-pause="${esc(a.slug)}">${a.paused ? 'resume' : 'pause'}</button></td>
+  const dec = state.service.decimals;
+  body.innerHTML = state.wallets.map((w) => {
+    // A wallet either forwards what it receives or keeps it. Saying which is
+    // the single most useful thing on the row: it decides whether a balance
+    // sitting there is waiting to move or waiting to be spent.
+    const target = w.drain_to
+      ? addrCell(w.drain_to, state.service.chain_id, { short: true })
+      : '<span class="zero">accumulates</span>';
+    const committed = w.committed && w.committed !== '0'
+      ? esc(token(w.committed, dec))
+      : '<span class="zero">—</span>';
+    return `<tr class="clickable${selected === w.ref ? ' selected' : ''}" data-ref="${esc(w.ref)}">
+      <td>${esc(w.ref)} ${w.paused ? pill('paused') : ''}${w.busy ? pill('busy') : ''}</td>
+      <td>${addrCell(w.address, state.service.chain_id, { short: true })}</td>
+      <td>${target}</td>
+      <td class="num">${esc(token(w.balance, dec))}</td>
+      <td class="num">${committed}</td>
+      <td class="num">${w.deposits}</td>
+      <td><button class="ghost tiny" data-pause="${esc(w.ref)}">${w.paused ? 'resume' : 'pause'}</button></td>
     </tr>`;
   }).join('');
 }
@@ -233,8 +222,8 @@ function renderFlows(state) {
   body.innerHTML = state.flows.map((f) => `<tr>
     <td>${esc(f.kind)}</td>
     <td>${pill(f.state)}</td>
-    <td>${esc(f.app)}</td>
-    <td>${f.address ? addrCell(f.address, state.service.chain_id, { short: true }) : esc(short(f.wallet, 8, 6))}</td>
+    <td>${esc(f.ref || short(f.wallet, 8, 6))}</td>
+    <td>${f.address ? addrCell(f.address, state.service.chain_id, { short: true }) : '<span class="zero">—</span>'}</td>
     <td class="num">${f.attempt}</td>
     <td>${f.retry_after ? esc(ago(f.retry_after).replace(' ago', '')) : '<span class="zero">—</span>'}</td>
     <td>${txLink(f.tx_hash, state.service.chain_id)}</td>
@@ -244,39 +233,37 @@ function renderFlows(state) {
 
 // ---------- the detail panel ----------
 
-async function renderDetail(chainID) {
+async function renderDetail(state) {
   if (!selected) { $('detail').hidden = true; return; }
+  const chainID = state.service.chain_id;
+  const dec = state.service.decimals;
   $('detail').hidden = false;
-  $('d-slug').textContent = selected;
+  $('d-ref').textContent = selected;
 
-  const [addrs, deposits, withdrawals] = await Promise.all([
-    api('GET', `/v1/apps/${encodeURIComponent(selected)}/addresses?limit=100`),
-    api('GET', `/v1/apps/${encodeURIComponent(selected)}/deposits?limit=50`),
-    api('GET', `/v1/apps/${encodeURIComponent(selected)}/withdrawals?status=all&limit=50`),
+  const ref = encodeURIComponent(selected);
+  const [deposits, withdrawals] = await Promise.all([
+    api('GET', `/v1/wallets/${ref}/deposits?limit=50`),
+    api('GET', `/v1/wallets/${ref}/withdrawals?status=all&limit=50`),
   ]);
 
-  $('addrs-body').innerHTML = (addrs.addresses || []).map((a) =>
-    `<tr><td>${esc(a.ref)}</td><td>${addrCell(a.address, chainID)}</td></tr>`).join('')
-    || '<tr><td colspan="2" class="zero">none yet</td></tr>';
-
   $('deposits-body').innerHTML = (deposits.deposits || []).map((d) => `<tr>
-    <td>${esc(d.ref)}</td>
-    <td class="num money">${money(d.amount_cents)}</td>
+    <td class="num">${esc(token(d.amount, dec))}</td>
     <td>${pill(d.status)}</td>
     <td>${addrCell(d.from, chainID, { short: true })}</td>
     <td>${txLink(d.tx_hash, chainID)}</td>
+    <td>${txLink(d.swept_tx, chainID)}</td>
     <td>${esc(ago(d.created_at))}</td>
   </tr>`).join('') || '<tr><td colspan="6" class="zero">nothing has arrived yet</td></tr>';
 
   $('withdrawals-body').innerHTML = (withdrawals.withdrawals || []).map((w) => `<tr>
-    <td>${addrCell(w.destination, chainID, { short: true })}</td>
-    <td class="num money">${money(w.payout_cents)}</td>
-    <td class="num money">${money(w.fee_cents)}</td>
+    <td>${pill(w.reason)}</td>
+    <td>${addrCell(w.to, chainID, { short: true })}</td>
+    <td class="num">${esc(token(w.amount, dec))}</td>
     <td>${pill(w.status)}</td>
     <td class="num">${w.attempts > 3 ? `<span style="color:var(--warn)">${w.attempts}</span>` : w.attempts}</td>
     <td>${txLink(w.tx_hash, chainID)}</td>
     <td class="err">${esc(w.last_error || '')}</td>
-  </tr>`).join('') || '<tr><td colspan="7" class="zero">none yet</td></tr>';
+  </tr>`).join('') || '<tr><td colspan="6" class="zero">none yet</td></tr>';
 }
 
 // ---------- the poll loop ----------
@@ -289,9 +276,9 @@ async function poll() {
   try {
     const [state, gauges] = await Promise.all([api('GET', '/ui/state'), masterGauges()]);
     renderStrip(state, gauges);
-    renderApps(state);
+    renderWallets(state);
     renderFlows(state);
-    await renderDetail(state.service.chain_id);
+    await renderDetail(state);
     $('tick').textContent = `v${state.service.version} · refreshed ${new Date().toLocaleTimeString()}`;
     $('tick').className = 'hint';
   } catch (err) {
@@ -304,76 +291,82 @@ async function poll() {
 
 // ---------- actions ----------
 
-$('register-form').addEventListener('submit', async (e) => {
+$('create-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const slug = $('register-slug').value.trim();
-  if (!slug) return;
+  const ref = $('create-ref').value.trim();
+  if (!ref) return;
+  const drainTo = $('create-drain').value.trim();
+  // Prewarming is opt-in on purpose: activating a wallet costs the master one
+  // funding transfer and one approve, and most of an address book may never
+  // receive anything.
+  const body = {};
+  if (drainTo) body.drain_to = drainTo;
+  if ($('create-prewarm').checked) body.prewarm = true;
   try {
-    await api('PUT', `/v1/apps/${encodeURIComponent(slug)}`, {});
-    $('register-slug').value = '';
-    selected = slug;
+    await api('PUT', `/v1/wallets/${encodeURIComponent(ref)}`, body);
+    $('create-ref').value = '';
+    $('create-drain').value = '';
+    $('create-prewarm').checked = false;
+    selected = ref;
     await poll();
   } catch (err) {
-    alert(`register: ${err.message}`);
+    alert(`create: ${err.message}`);
   }
 });
 
-$('apps-body').addEventListener('click', async (e) => {
+$('wallets-body').addEventListener('click', async (e) => {
   const pause = e.target.closest('[data-pause]');
   if (pause) {
     e.stopPropagation();
-    const slug = pause.dataset.pause;
+    const ref = pause.dataset.pause;
     const wasPaused = pause.textContent.trim() === 'resume';
     try {
-      await api('PUT', `/v1/apps/${encodeURIComponent(slug)}`, { paused: !wasPaused });
+      await api('PATCH', `/v1/wallets/${encodeURIComponent(ref)}`, { paused: !wasPaused });
       await poll();
     } catch (err) {
       alert(`pause: ${err.message}`);
     }
     return;
   }
-  const row = e.target.closest('[data-slug]');
+  const row = e.target.closest('[data-ref]');
   if (row) {
-    selected = selected === row.dataset.slug ? null : row.dataset.slug;
+    selected = selected === row.dataset.ref ? null : row.dataset.ref;
     poll();
   }
 });
 
 $('d-close').addEventListener('click', () => { selected = null; $('detail').hidden = true; });
 
-$('addr-form').addEventListener('submit', async (e) => {
+// Retargeting is the one piece of configuration a wallet has. An empty field
+// clears it, which is how a forwarding wallet is turned back into one that
+// accumulates — and the API refuses a cycle rather than accepting a topology
+// that would spend gas forever.
+$('drain-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const ref = $('addr-ref').value.trim();
-  if (!ref || !selected) return;
+  if (!selected) return;
+  const drainTo = $('drain-to').value.trim();
   try {
-    const made = await api('POST', `/v1/apps/${encodeURIComponent(selected)}/addresses`, { ref });
-    $('addr-ref').value = '';
-    say($('addr-status'), `${made.ref} → ${made.address}`, 'ok');
+    const w = await api('PATCH', `/v1/wallets/${encodeURIComponent(selected)}`, { drain_to: drainTo });
+    say($('drain-status'), w.drain_to ? `forwards to ${w.drain_to}` : 'accumulates', 'ok');
     await poll();
   } catch (err) {
-    say($('addr-status'), err.message, 'bad');
+    say($('drain-status'), err.message, 'bad');
   }
 });
 
 $('wd-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   if (!selected) return;
-  const amount = String($('wd-amount').value);
-  const deductFee = $('wd-deduct').checked;
-  // The two endpoints take different bodies and the API rejects unknown fields
-  // on purpose, so a misspelling in an integrator's payload is an error rather
-  // than a silently ignored setting. Pricing needs no destination; only the
-  // payout does. Sending one body to both is exactly the mistake that strictness
-  // is there to catch, and it caught this one.
-  const quoteBody = { amount_cents: amount, deduct_fee: deductFee };
-  const createBody = { ...quoteBody, destination: $('wd-dest').value.trim() };
+  // Amounts are the token's own base units, as a decimal string. A fee, if
+  // given, becomes a second debit to the master — bsc decides nothing about it
+  // beyond where it goes (§43).
+  const body = { to: $('wd-dest').value.trim(), amount: String($('wd-amount').value).trim() };
+  const fee = String($('wd-fee').value).trim();
+  if (fee) body.fee = fee;
   try {
-    // Quote first, so the fee is shown against the same policy the create will
-    // use. A refusal here is the whole error path for a withdrawal (§28).
-    const q = await api('POST', `/v1/apps/${encodeURIComponent(selected)}/withdrawals/quote`, quoteBody);
-    const wd = await api('POST', `/v1/apps/${encodeURIComponent(selected)}/withdrawals`, createBody);
-    say($('wd-status'),
-      `${wd.status} — payout ${q.payout_cents}c, fee ${q.fee_cents}c, debits ${q.debit_cents}c`, 'ok');
+    const made = await api('POST', `/v1/wallets/${encodeURIComponent(selected)}/withdrawals`, body);
+    const note = made.fee ? ` (+ ${made.fee.amount} fee)` : '';
+    say($('wd-status'), `${made.payout.status} — ${made.payout.amount} to ${made.payout.to}${note}`, 'ok');
     await poll();
   } catch (err) {
     say($('wd-status'), err.message, 'bad');

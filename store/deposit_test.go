@@ -4,34 +4,31 @@ import (
 	"testing"
 	"time"
 
-	"bsc/money"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/google/uuid"
 )
 
-// putDeposit records a deposit for w at (block, logIndex) and asserts creation.
 func putDeposit(t *testing.T, s *Store, w Wallet, block uint64, logIndex uint32, txb byte, amount int64) Deposit {
 	t.Helper()
 	d := Deposit{
-		Wallet: w.ID, App: w.App, Block: block, LogIndex: logIndex, TxHash: hash(txb),
-		From: addr(0xF0), AmountWei: wei(amount), Cents: money.Cents(amount), Status: DepositPending, CreatedAt: time.Now().UTC(),
+		Wallet: w.ID, Block: block, LogIndex: logIndex, TxHash: hash(txb),
+		From: addr(0xF0), Amount: wei(amount), Status: DepositReceived,
+		CreatedAt: time.Now().UTC(),
 	}
 	update(t, s, func(tx *Tx) error {
-		created, err := tx.PutDeposit(d)
-		if err != nil {
-			return err
-		}
-		if !created {
-			t.Fatalf("deposit %d-%d already existed", block, logIndex)
-		}
-		return nil
+		_, err := tx.PutDeposit(d)
+		return err
 	})
 	return d
 }
 
+// Dedup is a property of the key — tx hash ++ log index — so a reprocessed
+// block writes nothing rather than needing a uniqueness check somebody could
+// forget.
 func TestDepositDedupIsAPropertyOfTheKey(t *testing.T) {
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x50, 0)
-	d := putDeposit(t, s, w, 100, 0, 0x01, 5)
+	w := seedWallet(t, s, "cust-1", 0)
+	d := putDeposit(t, s, w, 10, 0, 0xAA, 500)
 
 	update(t, s, func(tx *Tx) error {
 		created, err := tx.PutDeposit(d)
@@ -39,240 +36,210 @@ func TestDepositDedupIsAPropertyOfTheKey(t *testing.T) {
 			return err
 		}
 		if created {
-			t.Fatal("re-recording the same transfer reported creation")
+			t.Fatal("the same transfer was recorded twice")
 		}
 		return nil
 	})
-
-	// A reprocessed block must not duplicate the feed either.
-	if err := s.View(func(tx *Tx) error {
-		got, _, err := tx.DepositsSince("df", Cursor{}, 0)
-		if err != nil {
-			return err
-		}
-		if len(got) != 1 {
-			t.Fatalf("feed has %d entries after a replay, want 1", len(got))
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("View: %v", err)
+	if rep := verify(t, s); rep.Deposits != 1 {
+		t.Fatalf("deposits = %d, want 1", rep.Deposits)
 	}
 }
 
 func TestTwoTransfersInOneTransactionAreDistinctDeposits(t *testing.T) {
-	// Same tx hash, different log index: the exact case that motivated keying
-	// deposits on (hash, log_index) rather than the hash alone.
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x51, 0)
+	w := seedWallet(t, s, "cust-1", 0)
+	putDeposit(t, s, w, 10, 0, 0xAA, 500)
+	putDeposit(t, s, w, 10, 1, 0xAA, 700)
 
-	putDeposit(t, s, w, 100, 3, 0x02, 5)
-	putDeposit(t, s, w, 100, 7, 0x02, 6)
-
-	if err := s.View(func(tx *Tx) error {
-		got, next, err := tx.DepositsSince("df", Cursor{}, 0)
-		if err != nil {
-			return err
-		}
-		if len(got) != 2 {
-			t.Fatalf("got %d deposits, want 2", len(got))
-		}
-		if got[0].LogIndex != 3 || got[1].LogIndex != 7 {
-			t.Fatalf("log indexes = %d,%d; want 3,7 in order", got[0].LogIndex, got[1].LogIndex)
-		}
-		if next != (Cursor{Block: 100, LogIndex: 7}) {
-			t.Fatalf("next cursor = %v", next)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("View: %v", err)
+	rep := verify(t, s)
+	mustBeClean(t, rep)
+	if rep.Deposits != 2 {
+		t.Fatalf("deposits = %d, want 2", rep.Deposits)
 	}
 }
 
 func TestDepositFeedIsOrderedAndPaginates(t *testing.T) {
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x52, 0)
+	w := seedWallet(t, s, "cust-1", 0)
+	// Written out of order on purpose: the index, not the write order, decides.
+	putDeposit(t, s, w, 30, 0, 0xC3, 3)
+	putDeposit(t, s, w, 10, 0, 0xC1, 1)
+	putDeposit(t, s, w, 20, 0, 0xC2, 2)
 
-	// Insert out of order to prove the index, not the insertion sequence, is
-	// what orders the feed.
-	putDeposit(t, s, w, 300, 1, 0x13, 3)
-	putDeposit(t, s, w, 100, 5, 0x11, 1)
-	putDeposit(t, s, w, 200, 0, 0x12, 2)
+	var page1, page2 []Deposit
+	var cursor Cursor
+	if err := s.View(func(tx *Tx) error {
+		var err error
+		if page1, cursor, err = tx.DepositsSince(Cursor{}, 2); err != nil {
+			return err
+		}
+		page2, _, err = tx.DepositsSince(cursor, 2)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := blocks(page1); len(got) != 2 || got[0] != 10 || got[1] != 20 {
+		t.Fatalf("page 1 = %v, want [10 20]", got)
+	}
+	if got := blocks(page2); len(got) != 1 || got[0] != 30 {
+		t.Fatalf("page 2 = %v, want [30]", got)
+	}
+}
+
+// The feed is global now. Splitting it per app was a tenancy boundary bsc no
+// longer draws (§37).
+func TestDepositFeedSpansEveryWallet(t *testing.T) {
+	s := open(t)
+	a := seedWalletAt(t, s, "a", addr(0x21), common.Address{}, 0)
+	b := seedWalletAt(t, s, "b", addr(0x22), common.Address{}, 0)
+	putDeposit(t, s, a, 10, 0, 0xA1, 1)
+	putDeposit(t, s, b, 11, 0, 0xB1, 2)
 
 	if err := s.View(func(tx *Tx) error {
-		all, _, err := tx.DepositsSince("df", Cursor{}, 0)
+		all, _, err := tx.DepositsSince(Cursor{}, 0)
 		if err != nil {
 			return err
 		}
-		wantBlocks := []uint64{100, 200, 300}
-		for i, d := range all {
-			if d.Block != wantBlocks[i] {
-				t.Fatalf("feed order = %v, want %v", blocks(all), wantBlocks)
-			}
+		if len(all) != 2 {
+			t.Fatalf("feed = %d deposits, want 2", len(all))
 		}
-
-		// Page through one at a time, carrying the cursor.
-		var seen []uint64
-		cur := Cursor{}
-		for {
-			page, next, err := tx.DepositsSince("df", cur, 1)
-			if err != nil {
-				return err
-			}
-			if len(page) == 0 {
-				break
-			}
-			seen = append(seen, page[0].Block)
-			if next == cur {
-				t.Fatalf("cursor did not advance past %v", cur)
-			}
-			cur = next
+		one, err := tx.WalletDeposits(a.ID, 0)
+		if err != nil {
+			return err
 		}
-		if len(seen) != 3 || seen[0] != 100 || seen[2] != 300 {
-			t.Fatalf("paged blocks = %v", seen)
+		if len(one) != 1 || one[0].Wallet != a.ID {
+			t.Fatalf("per-wallet view = %d deposits", len(one))
 		}
 		return nil
 	}); err != nil {
-		t.Fatalf("View: %v", err)
+		t.Fatal(err)
 	}
 }
 
 func TestDepositCursorIsStableWhenNothingIsNew(t *testing.T) {
-	// An app that keeps passing its cursor back must never lose its place.
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x53, 0)
-	putDeposit(t, s, w, 100, 0, 0x21, 1)
+	w := seedWallet(t, s, "cust-1", 0)
+	putDeposit(t, s, w, 10, 0, 0xAA, 500)
 
 	if err := s.View(func(tx *Tx) error {
-		_, next, err := tx.DepositsSince("df", Cursor{}, 0)
+		_, first, err := tx.DepositsSince(Cursor{}, 0)
 		if err != nil {
 			return err
 		}
-		got, again, err := tx.DepositsSince("df", next, 0)
+		empty, second, err := tx.DepositsSince(first, 0)
 		if err != nil {
 			return err
 		}
-		if len(got) != 0 {
-			t.Fatalf("got %d deposits past the end", len(got))
+		if len(empty) != 0 {
+			t.Fatalf("got %d deposits past the end", len(empty))
 		}
-		if again != next {
-			t.Fatalf("cursor moved on an empty read: %v -> %v", next, again)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("View: %v", err)
-	}
-}
-
-func TestDepositFeedIsPerApp(t *testing.T) {
-	s := open(t)
-	seedApp(t, s, "df", 0)
-	seedApp(t, s, "lkr:acme", 0)
-	a := depositWallet(t, s, "df", "cust-1", 0x54, 0)
-	b := depositWallet(t, s, "lkr:acme", "cust-1", 0x55, 0)
-	putDeposit(t, s, a, 100, 0, 0x31, 1)
-	putDeposit(t, s, b, 101, 0, 0x32, 2)
-
-	if err := s.View(func(tx *Tx) error {
-		for _, tc := range []struct {
-			slug  string
-			block uint64
-		}{{"df", 100}, {"lkr:acme", 101}} {
-			got, _, err := tx.DepositsSince(tc.slug, Cursor{}, 0)
-			if err != nil {
-				return err
-			}
-			if len(got) != 1 || got[0].Block != tc.block {
-				t.Fatalf("%s feed = %v, want just block %d", tc.slug, blocks(got), tc.block)
-			}
+		if second != first {
+			t.Fatalf("cursor moved from %v to %v with nothing new", first, second)
 		}
 		return nil
 	}); err != nil {
-		t.Fatalf("View: %v", err)
+		t.Fatal(err)
 	}
 }
 
-func TestOneSweepCreditsEveryOpenDepositOnTheWallet(t *testing.T) {
-	// A drain moves the whole balance, so one sweep credits several deposits at
-	// once — which is precisely why crediting is a status on the record and not
-	// an entry in the feed keyed on the sweep's log position.
+// One drain moves the whole balance, so it forwards every deposit waiting on
+// the wallet at once — which is why forwarding is a status on the record rather
+// than an entry in the feed.
+func TestOneDrainForwardsEveryOpenDepositOnTheWallet(t *testing.T) {
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x56, 0)
-	other := depositWallet(t, s, "df", "cust-2", 0x57, 0)
+	hot := seedWallet(t, s, "hot", 0)
+	p := seedProxy(t, s, "cust-1", hot.Address, 0)
+	putDeposit(t, s, p, 10, 0, 0xA1, 300)
+	putDeposit(t, s, p, 11, 0, 0xA2, 400)
 
-	putDeposit(t, s, w, 100, 0, 0x41, 1)
-	putDeposit(t, s, w, 101, 2, 0x42, 2)
-	putDeposit(t, s, other, 102, 0, 0x43, 3)
-
-	sweep := hash(0xAA)
+	debit := uuid.New()
 	update(t, s, func(tx *Tx) error {
-		n, cents, err := tx.CreditDeposits("df", w.ID, sweep)
+		// The debit has to exist: a credit naming one that does not is exactly
+		// what the audit looks for (§42).
+		if err := tx.PutWithdrawal(Withdrawal{
+			ID: debit, Wallet: p.ID, Reason: ReasonDrain, Destination: hot.Address,
+			Amount: wei(700), Status: WithdrawalConfirmed, TxHash: hash(0xDD),
+			Block: 12, CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
+		n, err := tx.ForwardDeposits(p.ID, debit)
 		if err != nil {
 			return err
 		}
 		if n != 2 {
-			t.Fatalf("credited %d deposits, want 2", n)
-		}
-		// The cents are what the caller must add to the app's ledger: one
-		// sweep, both deposits, one credit (§22).
-		if cents != 3 {
-			t.Fatalf("credited %d cents, want 1+2", cents)
+			t.Fatalf("forwarded %d, want 2", n)
 		}
 		return nil
 	})
 
 	if err := s.View(func(tx *Tx) error {
-		all, _, err := tx.DepositsSince("df", Cursor{}, 0)
+		open, err := tx.OpenDeposits(p.ID, 0)
+		if err != nil {
+			return err
+		}
+		if len(open) != 0 {
+			t.Fatalf("%d deposits still open after the drain", len(open))
+		}
+		all, err := tx.WalletDeposits(p.ID, 0)
 		if err != nil {
 			return err
 		}
 		for _, d := range all {
-			credited := d.Wallet == w.ID
-			if credited && (d.Status != DepositCredited || d.DrainTx != sweep) {
-				t.Fatalf("deposit %d-%d not credited: %s %s", d.Block, d.LogIndex, d.Status, d.DrainTx.Hex())
+			if d.Status != DepositForwarded || d.SweptBy != debit {
+				t.Fatalf("deposit %v not linked to the debit that carried it: %+v", d.Cursor(), d)
 			}
-			if !credited && d.Status != DepositPending {
-				t.Fatalf("other wallet's deposit was touched: %s", d.Status)
-			}
-		}
-		// Only the untouched wallet's deposit should remain open.
-		open, err := tx.OpenDeposits("df", 0)
-		if err != nil {
-			return err
-		}
-		if len(open) != 1 || open[0].Wallet != other.ID {
-			t.Fatalf("open set = %d entries, want just cust-2's", len(open))
 		}
 		return nil
 	}); err != nil {
-		t.Fatalf("View: %v", err)
+		t.Fatal(err)
 	}
+	mustBeClean(t, verify(t, s))
 }
 
-func TestCreditDepositsIsANoOpWhenNothingIsOpen(t *testing.T) {
+// A deposit on a wallet that accumulates has nowhere to go, so it must never
+// join the open set: nothing would ever take it back out (§34).
+func TestDepositsOnAnAccumulatingWalletAreNeverOpen(t *testing.T) {
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x58, 0)
+	w := seedWallet(t, s, "hot", 0)
+	putDeposit(t, s, w, 10, 0, 0xAA, 500)
 
-	update(t, s, func(tx *Tx) error {
-		n, cents, err := tx.CreditDeposits("df", w.ID, hash(1))
+	if err := s.View(func(tx *Tx) error {
+		open, err := tx.OpenDeposits(w.ID, 0)
 		if err != nil {
 			return err
 		}
-		if n != 0 || cents != 0 {
-			t.Fatalf("credited %d deposits / %d cents, want nothing", n, cents)
+		if len(open) != 0 {
+			t.Fatalf("%d open deposits on an accumulating wallet", len(open))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mustBeClean(t, verify(t, s))
+}
+
+func TestForwardDepositsIsANoOpWhenNothingIsOpen(t *testing.T) {
+	s := open(t)
+	hot := seedWallet(t, s, "hot", 0)
+	p := seedProxy(t, s, "cust-1", hot.Address, 0)
+
+	update(t, s, func(tx *Tx) error {
+		n, err := tx.ForwardDeposits(p.ID, uuid.New())
+		if err != nil {
+			return err
+		}
+		if n != 0 {
+			t.Fatalf("forwarded %d with nothing open", n)
 		}
 		return nil
 	})
 }
 
 func blocks(ds []Deposit) []uint64 {
-	out := make([]uint64, len(ds))
-	for i, d := range ds {
-		out[i] = d.Block
+	out := make([]uint64, 0, len(ds))
+	for _, d := range ds {
+		out = append(out, d.Block)
 	}
 	return out
 }

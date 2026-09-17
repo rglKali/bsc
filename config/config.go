@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"bsc/chain"
-	"bsc/money"
 	"bsc/swap"
 	"bsc/usdt"
 
@@ -64,31 +63,23 @@ type Config struct {
 	MaxLagBlocks  uint64        // chain.max_lag_blocks — refuse withdrawals past this
 
 	// DrainThreshold is pure gas economics: don't spend a transaction moving
-	// less than this. It says nothing about what an app is credited — a deposit
-	// worth a whole cent is always recorded, and shows as pending until its
-	// drain is worth running (§22).
+	// less than this. It decides only whether forwarding is worth paying for —
+	// the deposit is recorded either way.
 	DrainThreshold *big.Int // money.drain_threshold_wei
 
-	// HouseSweepMin is how much excess over an app's ledger — fees, sub-cent
-	// dust, stray transfers — is worth one transfer to collect. Zero disables
-	// sweeping, which is safe: the money is ours either way and simply
-	// accumulates in the wallet.
-	HouseSweepMin money.Cents // money.house_sweep_min_cents
+	// GasFloor is the native balance below which the master is reported as low,
+	// by /healthz, by `bsc check` and by the bsc_master_bnb_wei gauge. Nothing
+	// acts on it: refilling is an operator command now, and this is the number
+	// that says when to run it (§38).
+	GasFloor *big.Int // gas.floor_wei
 
-	DefaultFee   money.Cents // money.default_fee_cents — a new app's withdrawal fee
-	FeeCollector string      // money.fee_collector — empty means the master
-
-	// Gas top-up: swapping collected fees back into gas. On by default — a
-	// gateway that runs out of gas stops completely — but it is still the only
-	// thing the service does on its own initiative, so it is bounded on every
-	// side and can be turned off outright.
-	SwapEnabled  bool          // swap.enabled
+	// Swap settings for the `bsc swap` command. The running service never
+	// trades; these exist so the operator's command does not need four flags
+	// every time, and so the router can default from the chain (§38).
 	SwapRouter   string        // swap.router — a Uniswap-V2-style router; defaults per chain
 	SwapNative   string        // swap.wrapped_native — optional override; the router is asked otherwise
-	SwapAmount   *big.Int      // swap.amount_wei — tokens traded per top-up
-	GasFloor     *big.Int      // swap.gas_floor_wei — native balance below which a top-up is due
 	SwapSlippage uint32        // swap.slippage_bps
-	SwapCooldown time.Duration // swap.cooldown — minimum gap between attempts
+	SwapDeadline time.Duration // swap.deadline
 
 	FundingMultiplier float64       // gas.funding_multiplier — the only gas knobs
 	GasMultiplier     float64       // gas.price_multiplier
@@ -136,23 +127,18 @@ func New() *viper.Viper {
 	v.SetDefault("chain.backfill_batch", 100)
 	v.SetDefault("chain.max_lag_blocks", 200)
 	v.SetDefault("money.drain_threshold_wei", oneUSDT.String())
-	v.SetDefault("money.default_fee_cents", 100)     // $1.00
-	v.SetDefault("money.house_sweep_min_cents", 100) // $1.00 of excess is worth a transfer
-	v.SetDefault("money.fee_collector", "")
 	v.SetDefault("gas.funding_multiplier", 1.25)
 	v.SetDefault("gas.price_multiplier", 1.10)
 	v.SetDefault("gas.rebroadcast_after", 2*time.Minute)
 	v.SetDefault("gas.master_poll", 30*time.Second)
-	v.SetDefault("swap.enabled", true)
 	v.SetDefault("swap.router", "") // resolved from the chain the endpoint reports
 	v.SetDefault("swap.wrapped_native", "")
-	v.SetDefault("swap.amount_wei", new(big.Int).Mul(oneUSDT, big.NewInt(10)).String())
 	// A transfer costs well under a thousandth of a BNB, so this floor is a few
 	// hundred transactions of headroom — enough that a top-up has time to land
 	// before anything actually runs dry.
-	v.SetDefault("swap.gas_floor_wei", "50000000000000000") // 0.05
-	v.SetDefault("swap.slippage_bps", 100)                  // 1%
-	v.SetDefault("swap.cooldown", time.Hour)
+	v.SetDefault("gas.floor_wei", "50000000000000000") // 0.05
+	v.SetDefault("swap.slippage_bps", 100)             // 1%
+	v.SetDefault("swap.deadline", 2*time.Minute)
 	v.SetDefault("snapshot.dir", "")
 	v.SetDefault("snapshot.interval", time.Hour)
 	v.SetDefault("snapshot.keep", 24)
@@ -206,16 +192,14 @@ func Parse(v *viper.Viper) (Config, error) {
 		PollInterval:      v.GetDuration("chain.poll_interval"),
 		BackfillBatch:     v.GetInt("chain.backfill_batch"),
 		MaxLagBlocks:      v.GetUint64("chain.max_lag_blocks"),
-		FeeCollector:      v.GetString("money.fee_collector"),
 		FundingMultiplier: v.GetFloat64("gas.funding_multiplier"),
 		GasMultiplier:     v.GetFloat64("gas.price_multiplier"),
 		RebroadcastAfter:  v.GetDuration("gas.rebroadcast_after"),
 		MasterPoll:        v.GetDuration("gas.master_poll"),
-		SwapEnabled:       v.GetBool("swap.enabled"),
 		SwapRouter:        v.GetString("swap.router"),
 		SwapNative:        v.GetString("swap.wrapped_native"),
 		SwapSlippage:      uint32(v.GetUint64("swap.slippage_bps")),
-		SwapCooldown:      v.GetDuration("swap.cooldown"),
+		SwapDeadline:      v.GetDuration("swap.deadline"),
 		SnapshotDir:       v.GetString("snapshot.dir"),
 		SnapshotInterval:  v.GetDuration("snapshot.interval"),
 		SnapshotKeep:      v.GetInt("snapshot.keep"),
@@ -242,48 +226,28 @@ func Parse(v *viper.Viper) (Config, error) {
 		cfg.Token = common.HexToAddress(token)
 	}
 
-	if cfg.FeeCollector != "" && !common.IsHexAddress(cfg.FeeCollector) {
-		return Config{}, fmt.Errorf("money.fee_collector (%s) %q is not a hex address", EnvVar("money.fee_collector"), cfg.FeeCollector)
-	}
-
 	var err error
 	if cfg.DrainThreshold, err = wei(v, "money.drain_threshold_wei"); err != nil {
 		return Config{}, err
 	}
-	if cfg.SwapAmount, err = wei(v, "swap.amount_wei"); err != nil {
+	if cfg.GasFloor, err = wei(v, "gas.floor_wei"); err != nil {
 		return Config{}, err
 	}
-	if cfg.GasFloor, err = wei(v, "swap.gas_floor_wei"); err != nil {
-		return Config{}, err
+	// A router the operator did not name is resolved from the chain in
+	// ResolveChain; only an explicit one can be checked this early.
+	if cfg.SwapRouter != "" && !common.IsHexAddress(cfg.SwapRouter) {
+		return Config{}, fmt.Errorf("swap.router (%s) %q is not a hex address", EnvVar("swap.router"), cfg.SwapRouter)
 	}
-	if cfg.SwapEnabled {
-		// A router the operator did not name is resolved from the chain in
-		// ResolveChain; only an explicit one can be checked this early.
-		if cfg.SwapRouter != "" && !common.IsHexAddress(cfg.SwapRouter) {
-			return Config{}, fmt.Errorf("swap.router (%s) %q is not a hex address", EnvVar("swap.router"), cfg.SwapRouter)
-		}
-		// Normally unset: the router reports its own wrapped token, which cannot
-		// then disagree with it. Only validated when overridden.
-		if cfg.SwapNative != "" && !common.IsHexAddress(cfg.SwapNative) {
-			return Config{}, fmt.Errorf("swap.wrapped_native (%s) %q is not a hex address", EnvVar("swap.wrapped_native"), cfg.SwapNative)
-		}
-		if cfg.SwapAmount.Sign() <= 0 || cfg.GasFloor.Sign() <= 0 {
-			return Config{}, errors.New("swap.amount_wei and swap.gas_floor_wei must be positive when swapping is enabled")
-		}
-		if cfg.SwapSlippage >= 10_000 {
-			return Config{}, fmt.Errorf("swap.slippage_bps %d would accept any price at all", cfg.SwapSlippage)
-		}
-		if cfg.SwapCooldown <= 0 {
-			return Config{}, errors.New("swap.cooldown must be positive: it is what bounds a losing swap loop")
-		}
+	// Normally unset: the router reports its own wrapped token, which cannot
+	// then disagree with it. Only validated when overridden.
+	if cfg.SwapNative != "" && !common.IsHexAddress(cfg.SwapNative) {
+		return Config{}, fmt.Errorf("swap.wrapped_native (%s) %q is not a hex address", EnvVar("swap.wrapped_native"), cfg.SwapNative)
 	}
-	cfg.DefaultFee = money.Cents(v.GetInt64("money.default_fee_cents"))
-	cfg.HouseSweepMin = money.Cents(v.GetInt64("money.house_sweep_min_cents"))
-	if cfg.DefaultFee < 0 {
-		return Config{}, errors.New("money.default_fee_cents must not be negative")
+	if cfg.SwapSlippage >= 10_000 {
+		return Config{}, fmt.Errorf("swap.slippage_bps %d would accept any price at all", cfg.SwapSlippage)
 	}
-	if cfg.HouseSweepMin < 0 {
-		return Config{}, errors.New("money.house_sweep_min_cents must not be negative")
+	if cfg.SwapDeadline <= 0 {
+		return Config{}, errors.New("swap.deadline must be positive")
 	}
 
 	// The rate limit has to clear the block rate by a wide margin or the
@@ -348,7 +312,7 @@ func (c *Config) ResolveChain(chainID uint64) error {
 		}
 	}
 
-	if !c.SwapEnabled || c.SwapRouter != "" {
+	if c.SwapRouter != "" {
 		return nil
 	}
 	// Addresses verified against the explorer. An unknown chain is a hard error

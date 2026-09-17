@@ -29,7 +29,6 @@ import (
 	"bsc/app"
 	"bsc/chain"
 	"bsc/keys"
-	"bsc/money"
 	"bsc/sender"
 	"bsc/store"
 	"bsc/swap"
@@ -70,7 +69,7 @@ type harness struct {
 	wat   *watcher.Watcher
 	mux   *http.ServeMux
 
-	scale        money.Scale
+	decimals     uint8
 	rpcURL       string
 	master       common.Address
 	masterKey    keys.Key
@@ -229,15 +228,12 @@ func setup(t *testing.T, n needs) *harness {
 		swapAmount = n
 	}
 
-	// The ledger's unit follows the token itself, exactly as the service does at
-	// startup — asking the contract rather than assuming eighteen decimals.
+	// The token's decimals are read from the contract, exactly as the service
+	// does at startup. Nothing scales by them any more (§36) — they are the
+	// database's identity and what lets a log line render an amount.
 	decimals, err := rpc.TokenDecimals(ctx, token)
 	if err != nil {
 		t.Fatalf("token decimals: %v", err)
-	}
-	scale, err := money.NewScale(decimals)
-	if err != nil {
-		t.Fatalf("scale: %v", err)
 	}
 	if err := st.Update(func(tx *store.Tx) error {
 		return tx.SetMeta(store.Meta{ChainID: chainID, Token: token, Decimals: decimals})
@@ -246,8 +242,7 @@ func setup(t *testing.T, n needs) *harness {
 	}
 
 	snd, err := sender.New(st, rpc, ring, sender.Options{
-		ChainID: chainID, Token: token, FeeCollector: collector, Scale: scale,
-		Router: router, SlippageBPS: 300, // testnet pools are thin; allow 3%
+		ChainID: chainID, Token: token,
 		// Real finality is slower than the simulator's instant blocks; give a
 		// transaction a fair chance before re-broadcasting it.
 		RebroadcastAfter: 3 * time.Minute,
@@ -257,22 +252,18 @@ func setup(t *testing.T, n needs) *harness {
 	}
 	addrs := watcher.NewAddrSet()
 	wat := watcher.New(st, rpc, addrs, watcher.Options{
-		StartBlock: 0, // the current finalized head; never scan history
-		Poll:       2 * time.Second,
-		Scale:      scale, DrainThreshold: whole(1), HouseSweepMin: whole(1),
-		FeeCollector: collector,
-		Master:       master.Address, Token: token, Notify: snd.Notify,
+		StartBlock:     0, // the current finalized head; never scan history
+		Poll:           2 * time.Second,
+		DrainThreshold: whole(1),
+		Master:         master.Address, Token: token, Notify: snd.Notify,
 	})
-	srv := api.New(st, ring, addrs, wat, api.Options{
-		DefaultFee: store.FeePolicy{Flat: 100}, // $1.00
-		Notify:     snd.Notify,
-	})
+	srv := api.New(st, ring, addrs, wat, api.Options{Notify: snd.Notify})
 	mux := http.NewServeMux()
 	srv.Routes(mux)
 
 	h := &harness{
 		t: t, ctx: ctx, store: st, chain: rpc, ring: ring, snd: snd, wat: wat, mux: mux,
-		scale: scale, rpcURL: rpcURL, master: master.Address, masterKey: master, funder: funder, token: token,
+		decimals: decimals, rpcURL: rpcURL, master: master.Address, masterKey: master, funder: funder, token: token,
 		collector: collector, destination: destination,
 		router: router, swapAmount: swapAmount,
 		// Enough for the funder's handful of transfers, returned at the end.
@@ -375,6 +366,15 @@ func (h *harness) pump(what string, cond func() bool) {
 
 // audit runs the offline consistency check against a snapshot of the live
 // database, which is the only way to read it while the service holds the lock.
+// view runs a read transaction, for the handful of assertions that look at a
+// record rather than at the API.
+func (h *harness) view(fn func(*store.Tx) error) {
+	h.t.Helper()
+	if err := h.store.View(fn); err != nil {
+		h.t.Fatalf("View: %v", err)
+	}
+}
+
 func (h *harness) audit() (store.Report, error) {
 	h.t.Helper()
 	path := filepath.Join(h.t.TempDir(), "audit.db")
@@ -549,16 +549,17 @@ func (h *harness) recoverEverything() {
 		})
 	}
 	h.returnNative()
-	// Last, once every token the run can return has: whatever is still missing
-	// was converted into gas, so buy it back.
-	h.restoreTokens()
+	// Tokens a swap test traded away are not bought back. Trading is an
+	// operator action now (§38), and a teardown that quietly traded in the
+	// other direction would be the automation this design removed — at a price
+	// nobody looked at. The test logs what it sold; top the master up by hand.
 }
 
 // recoverDerived pulls tokens back out of the wallets the service derived
 // during the run.
 //
-// A failed run strands funds in them — a deposit that was swept into an app's
-// hot wallet but never paid out, say — and without this the next run's preflight
+// A failed run strands funds in them — a deposit forwarded into a treasury but
+// never paid out, say — and without this the next run's preflight
 // fails for want of tokens that are sitting right there. It works because of the
 // design's own property: the master holds an unlimited allowance on every
 // derived wallet, so it can pull the balance back *and* pay the gas, with no

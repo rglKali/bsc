@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"bsc/flow"
-	"bsc/money"
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -30,31 +29,16 @@ func wei(v int64) *big.Int { return big.NewInt(v) }
 
 var now = time.Now().UTC()
 
-// cfg values a cent at a wei, which is the truth for a two-decimal token and
-// keeps every figure in these tests readable as both.
-var scale = mustScale()
+var cfg = Config{DrainThreshold: wei(100)}
 
-func mustScale() money.Scale {
-	sc, err := money.NewScale(2)
-	if err != nil {
-		panic(err)
-	}
-	return sc
-}
-
-var cfg = Config{
-	Scale:          scale,
-	DrainThreshold: wei(100),
-	HouseSweepMin:  wei(100),
-	FeeCollector:   addr(0xFE),
-}
-
+// fixture is the two-wallet shape most tests need: one that forwards, one that
+// accumulates and can pay out. Under the old design these were an app's deposit
+// address and its top-level; now the difference is one field (§32).
 type fixture struct {
-	t   *testing.T
-	st  *store.Store
-	app store.App
-	top store.Wallet
-	dep store.Wallet
+	t     *testing.T
+	st    *store.Store
+	hot   store.Wallet // drain_to unset: accumulates, pays out
+	proxy store.Wallet // drain_to = hot: forwards
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -66,23 +50,19 @@ func newFixture(t *testing.T) *fixture {
 	t.Cleanup(func() { st.Close() })
 
 	f := &fixture{t: t, st: st}
-	f.top = store.Wallet{
-		ID: uuid.New(), App: "df", Kind: store.KindTopLevel, Address: addr(0x01),
+	f.hot = store.Wallet{
+		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged, Address: addr(0x01),
 		Active: true, Balance: new(big.Int), CreatedAt: now,
 	}
-	f.dep = store.Wallet{
-		ID: uuid.New(), App: "df", Kind: store.KindDeposit, Ref: "cust-1", Address: addr(0x02),
-		Active: true, Balance: new(big.Int), CreatedAt: now,
+	f.proxy = store.Wallet{
+		ID: uuid.New(), Ref: "cust-1", Kind: store.KindManaged, Address: addr(0x02),
+		DrainTo: f.hot.Address, Active: true, Balance: new(big.Int), CreatedAt: now,
 	}
-	f.app = store.App{Slug: "df", Wallet: f.top.ID, CreatedAt: now}
 	f.update(func(tx *store.Tx) error {
-		if err := tx.PutWallet(f.top); err != nil {
+		if err := tx.PutWallet(f.hot); err != nil {
 			return err
 		}
-		if err := tx.PutWallet(f.dep); err != nil {
-			return err
-		}
-		return tx.PutApp(f.app)
+		return tx.PutWallet(f.proxy)
 	})
 	return f
 }
@@ -96,460 +76,423 @@ func (f *fixture) update(fn func(*store.Tx) error) {
 
 func (f *fixture) wallet(id uuid.UUID) store.Wallet {
 	f.t.Helper()
-	var out store.Wallet
+	var w store.Wallet
 	if err := f.st.View(func(tx *store.Tx) error {
-		w, ok, err := tx.Wallet(id)
+		var ok bool
+		var err error
+		w, ok, err = tx.Wallet(id)
 		if err != nil || !ok {
-			f.t.Fatalf("wallet: ok=%v err=%v", ok, err)
+			f.t.Fatalf("wallet %s: ok=%v err=%v", id, ok, err)
 		}
-		out = w
 		return nil
 	}); err != nil {
-		f.t.Fatalf("View: %v", err)
+		f.t.Fatal(err)
 	}
-	return out
+	return w
 }
 
-func (f *fixture) flows() []store.Flow {
+func (f *fixture) withdrawal(id uuid.UUID) store.Withdrawal {
 	f.t.Helper()
-	var out []store.Flow
+	var wd store.Withdrawal
 	if err := f.st.View(func(tx *store.Tx) error {
-		return tx.EachFlow(func(fl store.Flow) error {
-			out = append(out, fl)
-			return nil
-		})
+		var ok bool
+		var err error
+		wd, ok, err = tx.Withdrawal(id)
+		if err != nil || !ok {
+			f.t.Fatalf("withdrawal %s: ok=%v err=%v", id, ok, err)
+		}
+		return nil
 	}); err != nil {
-		f.t.Fatalf("View: %v", err)
+		f.t.Fatal(err)
 	}
-	return out
-}
-
-// withdrawalFlow puts a withdrawal in flight at the given state.
-func (f *fixture) withdrawalFlow(wd store.Withdrawal, state store.FlowState) store.Flow {
-	f.t.Helper()
-	fl, err := flow.Begin(flow.Params{
-		Kind: store.FlowWithdrawal, Wallet: f.top.ID, App: "df",
-		To: wd.Destination, Amount: scale.Wei(wd.Payout), Withdrawal: wd.ID,
-		Active: true, Now: now,
-	})
-	if err != nil {
-		f.t.Fatalf("Begin: %v", err)
-	}
-	fl.State = state
-	fl.Tx = hash(0x71)
-	f.update(func(tx *store.Tx) error {
-		if err := tx.PutFlow(fl); err != nil {
-			return err
-		}
-		_, err := tx.ClaimWallet(f.top.ID, fl.ID)
-		return err
-	})
-	return fl
-}
-
-// chargedWithdrawal creates a queued withdrawal with payout and fee reserved as
-// one figure, exactly as the API does.
-func (f *fixture) chargedWithdrawal(payout, fee money.Cents) store.Withdrawal {
-	f.t.Helper()
-	wd := store.Withdrawal{
-		ID: uuid.New(), App: "df", Destination: addr(0xDD),
-		Amount: payout, Fee: fee, Payout: payout, Debit: payout + fee,
-		Status: store.WithdrawalPending, CreatedAt: now,
-	}
-	f.update(func(tx *store.Tx) error {
-		if err := tx.PutWithdrawal(wd); err != nil {
-			return err
-		}
-		_, err := tx.ReserveLedger("df", wd.Debit)
-		return err
-	})
 	return wd
 }
 
-// fund gives the app a ledger balance and the matching custody, the state every
-// money test starts from.
-func (f *fixture) fund(cents money.Cents) {
+// credit puts money on a wallet the way the watcher would, and records the
+// deposit that justifies it.
+func (f *fixture) credit(w store.Wallet, block uint64, logIndex uint32, amount int64) {
 	f.t.Helper()
 	f.update(func(tx *store.Tx) error {
-		if _, err := tx.Credit(f.top.ID, scale.Wei(cents)); err != nil {
-			return err
-		}
-		_, err := tx.CreditLedger("df", cents)
-		return err
-	})
-}
-
-// appState reads the app back, for asserting on its ledger.
-func (f *fixture) appState() store.App {
-	f.t.Helper()
-	var out store.App
-	if err := f.st.View(func(tx *store.Tx) error {
-		a, ok, err := tx.App("df")
-		if err != nil || !ok {
-			f.t.Fatalf("App: ok=%v err=%v", ok, err)
-		}
-		out = a
-		return nil
-	}); err != nil {
-		f.t.Fatalf("View: %v", err)
-	}
-	return out
-}
-
-// TestWithdrawalDebitsPayoutAndFeeTogether is the heart of the fee model: both
-// leave the ledger when the payout confirms, but only the payout moves on-chain.
-// The difference stays in the wallet as the house's (§24).
-func TestWithdrawalDebitsPayoutAndFeeTogether(t *testing.T) {
-	f := newFixture(t)
-	f.fund(1000)
-	wd := f.chargedWithdrawal(50, 1)
-	fl := f.withdrawalFlow(wd, store.StatePaying)
-
-	f.update(func(tx *store.Tx) error {
-		got, err := Advance(tx, fl, true, now)
-		if err != nil {
-			return err
-		}
-		if got.State != store.StateDone {
-			t.Fatalf("flow state = %s, want done: a withdrawal is one transfer", got.State)
-		}
-		return nil
-	})
-
-	if err := f.st.View(func(tx *store.Tx) error {
-		got, _, err := tx.Withdrawal(wd.ID)
-		if err != nil {
-			return err
-		}
-		if got.Status != store.WithdrawalDebited {
-			t.Fatalf("withdrawal = %s, want done as soon as the payout confirmed", got.Status)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("View: %v", err)
-	}
-
-	a := f.appState()
-	if a.Ledger != 949 {
-		t.Fatalf("ledger = %d, want 1000-50-1", a.Ledger)
-	}
-	if a.Reserved != 0 {
-		t.Fatalf("reserved = %d after settlement, want 0", a.Reserved)
-	}
-	// The fee never moved: custody still holds it, and it is now ours.
-	if got := f.wallet(f.top.ID).Balance; got.Cmp(wei(1000)) != 0 {
-		t.Fatalf("custody = %s; the engine must not move tokens itself", got)
-	}
-	if excess := scale.Excess(wei(1000), a.Ledger); excess.Cmp(wei(51)) != 0 {
-		t.Fatalf("house excess = %s, want the payout still to leave plus the fee", excess)
-	}
-}
-
-// TestFailedPayoutReleasesWithoutDebiting: a payout that reverted charges
-// nothing, fee included. The app gets its whole reservation back.
-// A reverted payout is ours to retry, not the app's to compensate for (§28).
-// The money stays reserved and the record stays pending: releasing the
-// reservation would hand back money the app has already committed, and a
-// terminal status would make an unmoved payout look settled.
-func TestRevertedPayoutStaysPendingAndKeepsItsReservation(t *testing.T) {
-	f := newFixture(t)
-	f.fund(1000)
-	wd := f.chargedWithdrawal(50, 3)
-	fl := f.withdrawalFlow(wd, store.StatePaying)
-
-	f.update(func(tx *store.Tx) error {
-		_, err := Advance(tx, fl, false, now)
-		return err
-	})
-
-	a := f.appState()
-	if a.Ledger != 1000 || a.Reserved != 53 {
-		t.Fatalf("ledger %d reserved %d, want 1000/53 — nothing debited, nothing released",
-			a.Ledger, a.Reserved)
-	}
-	if err := f.st.View(func(tx *store.Tx) error {
-		got, _, err := tx.Withdrawal(wd.ID)
-		if err != nil {
-			return err
-		}
-		if got.Status != store.WithdrawalPending {
-			t.Fatalf("withdrawal = %s, want it still pending for the retry", got.Status)
-		}
-		if got.Attempts != 1 {
-			t.Fatalf("attempts = %d, want the retry counted", got.Attempts)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("View: %v", err)
-	}
-
-	// And the wallet is backed off, which is what stops ShouldPay re-signing it
-	// on the very next evaluation.
-	if err := f.st.View(func(tx *store.Tx) error {
-		w, _, err := tx.Wallet(f.top.ID)
-		if err != nil {
-			return err
-		}
-		if !w.RetryAfter.After(now) {
-			t.Fatalf("RetryAfter = %v, want a backoff past %v", w.RetryAfter, now)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("View: %v", err)
-	}
-}
-
-// TestWithdrawalThatNeverPaidStaysQueued: a failure during activation has not
-// decided the request, so it stays queued for the rules to retry — behind a
-// backoff, or the retry is a loop that burns gas as fast as blocks arrive.
-func TestWithdrawalThatNeverPaidStaysQueued(t *testing.T) {
-	f := newFixture(t)
-	f.fund(1000)
-	wd := f.chargedWithdrawal(50, 1)
-	fl := f.withdrawalFlow(wd, store.StateApproving)
-
-	f.update(func(tx *store.Tx) error {
-		_, err := Advance(tx, fl, false, now)
-		return err
-	})
-
-	if err := f.st.View(func(tx *store.Tx) error {
-		got, _, err := tx.Withdrawal(wd.ID)
-		if err != nil {
-			return err
-		}
-		if got.Status != store.WithdrawalPending {
-			t.Fatalf("withdrawal = %s, want it still queued for a retry", got.Status)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("View: %v", err)
-	}
-	// Still reserved: the money is still committed to this request.
-	if a := f.appState(); a.Reserved != 51 {
-		t.Fatalf("reserved = %d, want the request still holding its money", a.Reserved)
-	}
-	w := f.wallet(f.top.ID)
-	if !w.Idle() {
-		t.Fatalf("wallet still held by %s", w.Flow)
-	}
-	if w.FailedAttempts == 0 || w.RetryAfter.IsZero() {
-		t.Fatal("a failed withdrawal left no backoff, so the rule will re-fire immediately")
-	}
-}
-
-// TestDrainCreditsTheLedgerOnlyWhenItLands: money in a deposit address cannot be
-// paid out of the hot wallet, so it is not spendable until the sweep confirms.
-func TestDrainCreditsTheLedgerOnlyWhenItLands(t *testing.T) {
-	f := newFixture(t)
-	f.update(func(tx *store.Tx) error {
-		if _, err := tx.Credit(f.dep.ID, wei(500)); err != nil {
+		if _, err := tx.Credit(w.ID, wei(amount)); err != nil {
 			return err
 		}
 		_, err := tx.PutDeposit(store.Deposit{
-			Wallet: f.dep.ID, App: "df", Block: 10, LogIndex: 0, TxHash: hash(0x51),
-			From: addr(0xF0), AmountWei: wei(500), Cents: 500,
-			Status: store.DepositPending, CreatedAt: now,
+			Wallet: w.ID, Block: block, LogIndex: logIndex, TxHash: hash(byte(logIndex + 1)),
+			From: addr(0xF0), Amount: wei(amount), Status: store.DepositReceived, CreatedAt: now,
 		})
 		return err
 	})
-	if a := f.appState(); a.Ledger != 0 {
-		t.Fatalf("ledger = %d before the drain landed, want 0", a.Ledger)
-	}
+}
 
-	fl, err := flow.Begin(flow.Params{
-		Kind: store.FlowDrain, Wallet: f.dep.ID, App: "df",
-		To: f.top.Address, Active: true, Now: now,
-	})
-	if err != nil {
-		t.Fatalf("Begin: %v", err)
+func (f *fixture) newWithdrawal(amount int64, createdAt time.Time) store.Withdrawal {
+	f.t.Helper()
+	wd := store.Withdrawal{
+		ID: uuid.New(), Wallet: f.hot.ID, Reason: store.ReasonPayout,
+		Destination: addr(0x99), Amount: wei(amount),
+		Status: store.WithdrawalPending, CreatedAt: createdAt, UpdatedAt: createdAt,
 	}
-	fl.State, fl.Tx = store.StateSweeping, hash(0x52)
+	f.update(func(tx *store.Tx) error { return tx.PutWithdrawal(wd) })
+	return wd
+}
+
+// start begins a flow and claims its wallet, then drives it to the state given.
+func (f *fixture) start(p flow.Params, state store.FlowState) store.Flow {
+	f.t.Helper()
+	var out store.Flow
 	f.update(func(tx *store.Tx) error {
+		fl, err := flow.Begin(p)
+		if err != nil {
+			return err
+		}
+		fl.State = state
+		fl.Tx = hash(0x77)
 		if err := tx.PutFlow(fl); err != nil {
 			return err
 		}
-		_, err := tx.ClaimWallet(f.dep.ID, fl.ID)
-		return err
+		if _, err := tx.ClaimWallet(fl.Wallet, fl.ID); err != nil {
+			return err
+		}
+		out = fl
+		return nil
 	})
-
-	f.update(func(tx *store.Tx) error {
-		_, err := Advance(tx, fl, true, now)
-		return err
-	})
-	if a := f.appState(); a.Ledger != 500 {
-		t.Fatalf("ledger = %d after the sweep landed, want 500", a.Ledger)
-	}
+	return out
 }
 
-// TestHouseSweepStartsOnlyOnTheExcess covers the rule that collects fees and
-// dust: it must see what the wallet holds beyond the ledger, and nothing more.
-func TestHouseSweepStartsOnlyOnTheExcess(t *testing.T) {
-	f := newFixture(t)
-	f.fund(1000) // custody 1000 wei, ledger 1000 cents — no excess
-
+func (f *fixture) advance(fl store.Flow, ok bool) store.Flow {
+	f.t.Helper()
+	var out store.Flow
 	f.update(func(tx *store.Tx) error {
-		started, err := EvaluateApp(tx, f.appState(), cfg, now)
+		var err error
+		out, err = Advance(tx, fl, 42, ok, now)
+		return err
+	})
+	return out
+}
+
+func (f *fixture) evaluate(w store.Wallet) bool {
+	f.t.Helper()
+	var started bool
+	f.update(func(tx *store.Tx) error {
+		var err error
+		started, err = EvaluateWallet(tx, w, cfg, now)
+		return err
+	})
+	return started
+}
+
+// --- drains ---
+
+// A drain that lands records a debit and links to it the credits it carried.
+// Nothing is credited anywhere: the records say where the money physically
+// went, and bsc has no opinion about who is owed it (§34, §42).
+func TestDrainRecordsADebitAndLinksItsCredits(t *testing.T) {
+	f := newFixture(t)
+	f.credit(f.proxy, 10, 0, 500)
+	f.credit(f.proxy, 10, 1, 300)
+
+	fl := f.start(flow.Params{
+		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: true, Now: now,
+	}, store.StateMoving)
+	fl.Amount = wei(800) // resolved when the sweep was signed
+	drain := fl.Tx
+	f.advance(fl, true)
+
+	if err := f.st.View(func(tx *store.Tx) error {
+		open, err := tx.OpenDeposits(f.proxy.ID, 0)
 		if err != nil {
 			return err
 		}
-		if started {
-			t.Fatal("swept an app whose wallet holds exactly what it is owed")
+		if len(open) != 0 {
+			t.Fatalf("%d deposits still open after the drain", len(open))
 		}
-		return nil
-	})
 
-	// A fee's worth arrives without anybody being credited for it.
-	f.update(func(tx *store.Tx) error {
-		_, err := tx.Credit(f.top.ID, wei(150))
-		return err
-	})
-	f.update(func(tx *store.Tx) error {
-		started, err := EvaluateApp(tx, f.appState(), cfg, now)
+		// The drain produced a debit, born terminal and on the settled feed.
+		settled, _, err := tx.SettledSince(store.Settled{}, 0)
 		if err != nil {
 			return err
 		}
-		if !started {
-			t.Fatal("excess above the threshold was not swept")
+		if len(settled) != 1 {
+			t.Fatalf("settled debits = %d, want the drain", len(settled))
+		}
+		debit := settled[0]
+		if debit.Reason != store.ReasonDrain || debit.Status != store.WithdrawalConfirmed {
+			t.Fatalf("debit = %+v, want a confirmed drain", debit)
+		}
+		if debit.TxHash != drain || debit.Amount.Cmp(wei(800)) != 0 || debit.Block != 42 {
+			t.Fatalf("debit = %+v, want the sweep's hash, amount and block", debit)
+		}
+
+		// And every credit it carried points back at it.
+		all, err := tx.WalletDeposits(f.proxy.ID, 0)
+		if err != nil {
+			return err
+		}
+		for _, d := range all {
+			if d.Status != store.DepositForwarded || d.SweptBy != debit.ID {
+				t.Fatalf("deposit not linked to the debit: %+v", d)
+			}
 		}
 		return nil
-	})
-
-	got := f.flows()
-	if len(got) != 1 || got[0].Kind != store.FlowHouseSweep {
-		t.Fatalf("flows = %+v, want one house sweep", got)
+	}); err != nil {
+		t.Fatal(err)
 	}
-	if got[0].To != cfg.FeeCollector {
-		t.Fatalf("sweeping to %s, want the collector", got[0].To.Hex())
-	}
-	// The amount is resolved at signing time, not fixed here.
-	if got[0].Amount != nil && got[0].Amount.Sign() != 0 {
-		t.Fatalf("house sweep fixed an amount of %s", got[0].Amount)
+	if got := f.wallet(f.proxy.ID); !got.Idle() {
+		t.Fatal("the wallet was not released")
 	}
 }
 
-// TestPayoutOutranksTheHouseSweep: one wallet runs one flow at a time, and the
-// app's money is the more urgent use of it.
-func TestPayoutOutranksTheHouseSweep(t *testing.T) {
+func TestFailedDrainBacksTheWalletOff(t *testing.T) {
 	f := newFixture(t)
-	f.fund(1000)
-	f.update(func(tx *store.Tx) error {
-		_, err := tx.Credit(f.top.ID, wei(5000)) // plenty of excess
-		return err
-	})
-	f.chargedWithdrawal(50, 1)
+	f.credit(f.proxy, 10, 0, 500)
+	fl := f.start(flow.Params{
+		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: true, Now: now,
+	}, store.StateMoving)
+	f.advance(fl, false)
 
-	f.update(func(tx *store.Tx) error {
-		_, err := EvaluateApp(tx, f.appState(), cfg, now)
-		return err
-	})
-	got := f.flows()
-	if len(got) != 1 || got[0].Kind != store.FlowWithdrawal {
-		t.Fatalf("flows = %+v, want the payout to go first", got)
+	got := f.wallet(f.proxy.ID)
+	if got.FailedAttempts != 1 {
+		t.Fatalf("attempts = %d, want 1", got.FailedAttempts)
+	}
+	if !got.RetryAfter.After(now) {
+		t.Fatal("no retry deadline was stamped")
+	}
+	if !got.Idle() {
+		t.Fatal("the wallet was not released")
+	}
+	// And the deposits stay open, so the next evaluation picks them up again.
+	if err := f.st.View(func(tx *store.Tx) error {
+		open, err := tx.OpenDeposits(f.proxy.ID, 0)
+		if err != nil {
+			return err
+		}
+		if len(open) != 1 {
+			t.Fatalf("open deposits = %d, want 1", len(open))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
+// --- withdrawals ---
+
+func TestConfirmedWithdrawalIsTerminalAndStopsBeingCommitted(t *testing.T) {
+	f := newFixture(t)
+	f.credit(f.hot, 10, 0, 1_000)
+	wd := f.newWithdrawal(400, now)
+
+	fl := f.start(flow.Params{
+		Kind: store.FlowTransfer, Wallet: f.hot.ID, To: wd.Destination,
+		Amount: wd.Amount, Withdrawal: wd.ID, Active: true, Now: now,
+	}, store.StateMoving)
+	f.advance(fl, true)
+
+	got := f.withdrawal(wd.ID)
+	if got.Status != store.WithdrawalConfirmed {
+		t.Fatalf("status = %s, want confirmed", got.Status)
+	}
+	if got.TxHash != fl.Tx {
+		t.Fatalf("tx hash = %s, want %s", got.TxHash.Hex(), fl.Tx.Hex())
+	}
+	if err := f.st.View(func(tx *store.Tx) error {
+		committed, err := tx.Committed(f.hot.ID)
+		if err != nil {
+			return err
+		}
+		if committed.Sign() != 0 {
+			t.Fatalf("committed = %s after settlement, want 0", committed)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A reverted payout is ours to retry, not the caller's to compensate for: the
+// record stays pending — and so stays committed against the wallet — while the
+// wallet backs off (§28).
+func TestRevertedPayoutStaysPendingAndKeepsItsCommitment(t *testing.T) {
+	f := newFixture(t)
+	f.credit(f.hot, 10, 0, 1_000)
+	wd := f.newWithdrawal(400, now)
+
+	fl := f.start(flow.Params{
+		Kind: store.FlowTransfer, Wallet: f.hot.ID, To: wd.Destination,
+		Amount: wd.Amount, Withdrawal: wd.ID, Active: true, Now: now,
+	}, store.StateMoving)
+	fl.Error = "execution reverted"
+	f.advance(fl, false)
+
+	got := f.withdrawal(wd.ID)
+	if got.Status != store.WithdrawalPending {
+		t.Fatalf("status = %s, want it to stay pending", got.Status)
+	}
+	if got.Attempts != 1 || got.Error == "" {
+		t.Fatalf("diagnostics not recorded: attempts=%d err=%q", got.Attempts, got.Error)
+	}
+	if err := f.st.View(func(tx *store.Tx) error {
+		committed, err := tx.Committed(f.hot.ID)
+		if err != nil {
+			return err
+		}
+		if committed.Int64() != 400 {
+			t.Fatalf("committed = %s, want the 400 still promised", committed)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if w := f.wallet(f.hot.ID); w.FailedAttempts != 1 {
+		t.Fatalf("wallet attempts = %d, want 1", w.FailedAttempts)
+	}
+}
+
+// A withdrawal whose funding or approve failed never reached its payout, so it
+// has not been decided either way.
+func TestWithdrawalThatNeverPaidStaysPending(t *testing.T) {
+	f := newFixture(t)
+	f.credit(f.hot, 10, 0, 1_000)
+	wd := f.newWithdrawal(400, now)
+
+	fl := f.start(flow.Params{
+		Kind: store.FlowTransfer, Wallet: f.hot.ID, To: wd.Destination,
+		Amount: wd.Amount, Withdrawal: wd.ID, Active: false, Now: now,
+	}, store.StateApproving)
+	f.advance(fl, false)
+
+	if got := f.withdrawal(wd.ID); got.Status != store.WithdrawalPending {
+		t.Fatalf("status = %s, want pending", got.Status)
+	}
+	if w := f.wallet(f.hot.ID); w.FailedAttempts != 1 {
+		t.Fatalf("wallet attempts = %d, want 1", w.FailedAttempts)
+	}
+}
+
+// --- the work rules ---
+
+func TestEvaluateStartsADrainOnAProxyWallet(t *testing.T) {
+	f := newFixture(t)
+	f.credit(f.proxy, 10, 0, 500)
+
+	if !f.evaluate(f.wallet(f.proxy.ID)) {
+		t.Fatal("no drain started for a funded proxy wallet")
+	}
+	w := f.wallet(f.proxy.ID)
+	if w.Idle() {
+		t.Fatal("the wallet was not claimed")
+	}
+	if err := f.st.View(func(tx *store.Tx) error {
+		fl, ok, err := tx.Flow(w.Flow)
+		if err != nil || !ok {
+			t.Fatalf("flow: ok=%v err=%v", ok, err)
+		}
+		if fl.Kind != store.FlowTransfer || fl.To != f.hot.Address {
+			t.Fatalf("flow = %+v, want a drain to the hot wallet", fl)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEvaluateStartsNoDrainBelowTheThreshold(t *testing.T) {
+	f := newFixture(t)
+	f.credit(f.proxy, 10, 0, 99) // threshold is 100
+
+	if f.evaluate(f.wallet(f.proxy.ID)) {
+		t.Fatal("a sub-threshold balance started a drain")
+	}
+}
+
+func TestEvaluateStartsAWithdrawalOnAHotWallet(t *testing.T) {
+	f := newFixture(t)
+	f.credit(f.hot, 10, 0, 1_000)
+	wd := f.newWithdrawal(400, now)
+
+	if !f.evaluate(f.wallet(f.hot.ID)) {
+		t.Fatal("no withdrawal started")
+	}
+	w := f.wallet(f.hot.ID)
+	if err := f.st.View(func(tx *store.Tx) error {
+		fl, ok, err := tx.Flow(w.Flow)
+		if err != nil || !ok {
+			t.Fatalf("flow: ok=%v err=%v", ok, err)
+		}
+		if fl.Kind != store.FlowTransfer || fl.Withdrawal != wd.ID {
+			t.Fatalf("flow = %+v, want the pending withdrawal", fl)
+		}
+		if fl.Amount.Cmp(wd.Amount) != 0 {
+			t.Fatalf("amount = %s, want %s", fl.Amount, wd.Amount)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Forwarding and paying out are mutually exclusive by construction, so a proxy
+// wallet is never a payout candidate whatever is pending against it.
+func TestEvaluateNeverPaysFromAProxyWallet(t *testing.T) {
+	f := newFixture(t)
+	f.credit(f.proxy, 10, 0, 50) // below the drain threshold, so no drain either
+	f.update(func(tx *store.Tx) error {
+		return tx.PutWithdrawal(store.Withdrawal{
+			ID: uuid.New(), Wallet: f.proxy.ID, Reason: store.ReasonPayout,
+			Destination: addr(0x99), Amount: wei(10),
+			Status: store.WithdrawalPending, CreatedAt: now,
+		})
+	})
+
+	if f.evaluate(f.wallet(f.proxy.ID)) {
+		t.Fatal("a payout was started from a forwarding wallet")
+	}
+}
+
+func TestEvaluateStartsNothingWhileTheWalletIsBusy(t *testing.T) {
+	f := newFixture(t)
+	f.credit(f.proxy, 10, 0, 500)
+	f.start(flow.Params{
+		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: true, Now: now,
+	}, store.StateMoving)
+
+	if f.evaluate(f.wallet(f.proxy.ID)) {
+		t.Fatal("a second flow started on a busy wallet")
+	}
+}
+
+// Oldest first, so a payout that keeps reverting cannot starve the queue behind
+// it forever.
 func TestOldestPendingWithdrawalGoesFirst(t *testing.T) {
 	f := newFixture(t)
-	var first uuid.UUID
-	f.update(func(tx *store.Tx) error {
-		if _, err := tx.CreditLedger("df", 1000); err != nil {
-			return err
-		}
-		if _, err := tx.Credit(f.top.ID, wei(1000)); err != nil {
-			return err
-		}
-		for i, age := range []time.Duration{-time.Minute, -time.Hour} {
-			wd := store.Withdrawal{
-				ID: uuid.New(), App: "df", Destination: addr(byte(0xD0 + i)),
-				Amount: 10, Payout: 10, Debit: 10,
-				Status: store.WithdrawalPending, CreatedAt: now.Add(age),
-			}
-			if age == -time.Hour {
-				first = wd.ID
-			}
-			if err := tx.PutWithdrawal(wd); err != nil {
-				return err
-			}
-			if _, err := tx.ReserveLedger("df", wd.Debit); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	f.credit(f.hot, 10, 0, 10_000)
+	older := f.newWithdrawal(100, now.Add(-time.Hour))
+	f.newWithdrawal(200, now)
 
-	f.update(func(tx *store.Tx) error {
-		_, err := EvaluateApp(tx, f.app, cfg, now)
-		return err
-	})
-
-	got := f.flows()
-	if len(got) != 1 || got[0].Withdrawal != first {
-		t.Fatalf("started %+v, want the oldest queued withdrawal %s", got, first)
+	if !f.evaluate(f.wallet(f.hot.ID)) {
+		t.Fatal("no withdrawal started")
 	}
-}
-
-func TestEvaluateAppStartsNothingWhileTheWalletIsBusy(t *testing.T) {
-	f := newFixture(t)
-	f.update(func(tx *store.Tx) error {
-		if _, err := tx.CreditLedger("df", 1000); err != nil {
-			return err
-		}
-		if _, err := tx.Credit(f.top.ID, wei(1000)); err != nil {
-			return err
-		}
-		wd := store.Withdrawal{
-			ID: uuid.New(), App: "df", Destination: addr(0xDD),
-			Amount: 10, Payout: 10, Debit: 10,
-			Status: store.WithdrawalPending, CreatedAt: now,
-		}
-		if err := tx.PutWithdrawal(wd); err != nil {
-			return err
-		}
-		if _, err := tx.ReserveLedger("df", wd.Debit); err != nil {
-			return err
-		}
-		_, err := tx.ClaimWallet(f.top.ID, uuid.New()) // something else owns it
-		return err
-	})
-
-	f.update(func(tx *store.Tx) error {
-		started, err := EvaluateApp(tx, f.app, cfg, now)
+	w := f.wallet(f.hot.ID)
+	if err := f.st.View(func(tx *store.Tx) error {
+		fl, _, err := tx.Flow(w.Flow)
 		if err != nil {
 			return err
 		}
-		if started {
-			t.Fatal("started work on a wallet another flow owns")
+		if fl.Withdrawal != older.ID {
+			t.Fatal("the newer withdrawal was started first")
 		}
 		return nil
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
+// Because the rules read current state rather than react to events, one sweep
+// converges whatever was missed while the process was down.
 func TestEvaluateAllConvergesAtStartup(t *testing.T) {
-	// The rules read current state rather than react to events, so one sweep
-	// picks up everything missed while the process was down.
 	f := newFixture(t)
-	f.update(func(tx *store.Tx) error {
-		if _, err := tx.Credit(f.dep.ID, wei(500)); err != nil { // deposit awaiting a drain
-			return err
-		}
-		if _, err := tx.CreditLedger("df", 1000); err != nil {
-			return err
-		}
-		if _, err := tx.Credit(f.top.ID, wei(1000)); err != nil {
-			return err
-		}
-		wd := store.Withdrawal{
-			ID: uuid.New(), App: "df", Destination: addr(0xDD),
-			Amount: 10, Payout: 10, Debit: 10,
-			Status: store.WithdrawalPending, CreatedAt: now,
-		}
-		if err := tx.PutWithdrawal(wd); err != nil {
-			return err
-		}
-		_, err := tx.ReserveLedger("df", wd.Debit)
-		return err
-	})
+	f.credit(f.proxy, 10, 0, 500)
+	f.credit(f.hot, 10, 1, 1_000)
+	f.newWithdrawal(400, now)
 
 	var started int
 	f.update(func(tx *store.Tx) error {
@@ -558,138 +501,106 @@ func TestEvaluateAllConvergesAtStartup(t *testing.T) {
 		return err
 	})
 	if started != 2 {
-		t.Fatalf("started %d flows, want a drain and a withdrawal", started)
+		t.Fatalf("EvaluateAll started %d flows, want 2 (a drain and a payout)", started)
 	}
-	kinds := map[store.FlowKind]bool{}
-	for _, fl := range f.flows() {
-		kinds[fl.Kind] = true
-	}
-	if !kinds[store.FlowDrain] || !kinds[store.FlowWithdrawal] {
-		t.Fatalf("kinds = %v", kinds)
+	p, h := f.wallet(f.proxy.ID), f.wallet(f.hot.ID)
+	if p.Idle() || h.Idle() {
+		t.Fatal("a wallet with work is still idle")
 	}
 }
 
 func TestAdvanceRefusesATerminalFlow(t *testing.T) {
 	f := newFixture(t)
-	fl := store.Flow{ID: uuid.New(), Kind: store.FlowDrain, State: store.StateDone, App: "df", Wallet: f.dep.ID}
+	fl := f.start(flow.Params{
+		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: true, Now: now,
+	}, store.StateMoving)
+	fl.State = store.StateDone
+
 	err := f.st.Update(func(tx *store.Tx) error {
-		_, err := Advance(tx, fl, true, now)
+		_, err := Advance(tx, fl, 42, true, now)
 		return err
 	})
 	if err == nil {
-		t.Fatal("advanced a finished flow")
+		t.Fatal("Advance accepted a terminal flow")
 	}
 }
 
-// masterFixture records the master wallet, which a gas top-up owns.
-func (f *fixture) master(tokens int64) store.Wallet {
-	f.t.Helper()
-	w := store.Wallet{
-		ID: uuid.New(), Kind: store.KindMaster, Address: addr(0x99),
-		Balance: wei(tokens), CreatedAt: now,
-	}
-	f.update(func(tx *store.Tx) error { return tx.PutWallet(w) })
-	return w
-}
-
-var gasCfg = Config{
-	Scale:          scale,
-	DrainThreshold: wei(100),
-	FeeCollector:   addr(0xFE),
-	SwapEnabled:    true,
-	SwapAmount:     wei(10),
-	GasFloor:       wei(100),
-	SwapCooldown:   time.Hour,
-}
-
-func TestEvaluateGasStartsATopUpAndArmsTheCooldown(t *testing.T) {
+// Leaving `approving` successfully is what makes a wallet active, whichever
+// flow happened to be the one that activated it.
+func TestApprovingMarksTheWalletActive(t *testing.T) {
 	f := newFixture(t)
-	m := f.master(50)
-
 	f.update(func(tx *store.Tx) error {
-		started, err := EvaluateGas(tx, gasCfg, m, wei(5), now) // well below the floor
-		if err != nil {
-			return err
-		}
-		if !started {
-			t.Fatal("no top-up started with the master nearly out of gas")
-		}
-		return nil
-	})
-
-	got := f.flows()
-	if len(got) != 1 || got[0].Kind != store.FlowGasTopUp {
-		t.Fatalf("flows = %+v", got)
-	}
-	if got[0].Amount.Cmp(wei(10)) != 0 {
-		t.Fatalf("swap amount = %s, want the configured 10", got[0].Amount)
-	}
-
-	// The cooldown is armed as the flow starts, not when it finishes, so a
-	// crash mid-swap cannot produce a burst of attempts on restart.
-	w := f.wallet(m.ID)
-	if !w.RetryAfter.After(now) {
-		t.Fatalf("cooldown not armed: %v", w.RetryAfter)
-	}
-	if !w.Idle() == false && w.Flow != got[0].ID {
-		t.Fatalf("master not claimed by the top-up")
-	}
-}
-
-func TestEvaluateGasDoesNothingWhenDisabled(t *testing.T) {
-	f := newFixture(t)
-	m := f.master(50)
-	off := gasCfg
-	off.SwapEnabled = false
-
-	f.update(func(tx *store.Tx) error {
-		started, err := EvaluateGas(tx, off, m, wei(0), now)
-		if err != nil {
-			return err
-		}
-		if started {
-			t.Fatal("swapped with swapping disabled")
-		}
-		return nil
-	})
-	if got := f.flows(); len(got) != 0 {
-		t.Fatalf("flows = %+v", got)
-	}
-}
-
-func TestEvaluateGasRespectsTheCooldownAcrossCalls(t *testing.T) {
-	// The bound that stops a losing swap from repeating until the fees are gone.
-	f := newFixture(t)
-	m := f.master(500)
-
-	f.update(func(tx *store.Tx) error {
-		_, err := EvaluateGas(tx, gasCfg, m, wei(0), now)
+		_, err := tx.SetActive(f.proxy.ID, false)
 		return err
 	})
-	// Finish the flow, leaving the master idle but still cooling down.
-	f.update(func(tx *store.Tx) error {
-		return tx.EachFlow(func(fl store.Flow) error { return tx.DeleteFlow(fl) })
-	})
+	fl := f.start(flow.Params{
+		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: false, Now: now,
+	}, store.StateApproving)
+	f.advance(fl, true)
 
-	reloaded := f.wallet(m.ID)
-	f.update(func(tx *store.Tx) error {
-		started, err := EvaluateGas(tx, gasCfg, reloaded, wei(0), now.Add(time.Minute))
+	if got := f.wallet(f.proxy.ID); !got.Active {
+		t.Fatal("the wallet was not marked active")
+	}
+}
+
+// A drain that needed no transaction — the sender found the wallet empty and
+// skipped — moved nothing, so there is nothing to observe and no debit.
+func TestSkippedDrainRecordsNoDebit(t *testing.T) {
+	f := newFixture(t)
+	fl := f.start(flow.Params{
+		Kind: store.FlowTransfer, Wallet: f.proxy.ID, To: f.hot.Address, Active: true, Now: now,
+	}, store.StateMoving)
+	fl.Tx = common.Hash{} // nothing was broadcast
+	f.advance(fl, true)
+
+	if err := f.st.View(func(tx *store.Tx) error {
+		settled, _, err := tx.SettledSince(store.Settled{}, 0)
 		if err != nil {
 			return err
 		}
-		if started {
-			t.Fatal("started a second swap inside the cooldown")
+		if len(settled) != 0 {
+			t.Fatalf("recorded %d debits for a drain that moved nothing", len(settled))
 		}
 		return nil
-	})
-	f.update(func(tx *store.Tx) error {
-		started, err := EvaluateGas(tx, gasCfg, reloaded, wei(0), now.Add(2*time.Hour))
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A confirmed payout joins the same feed the drain does, which is the point:
+// one feed of everything that left, whoever decided it (§42).
+func TestSettledFeedCarriesBothKinds(t *testing.T) {
+	f := newFixture(t)
+	f.credit(f.hot, 10, 0, 1_000)
+	wd := f.newWithdrawal(400, now)
+	fl := f.start(flow.Params{
+		Kind: store.FlowTransfer, Wallet: f.hot.ID, To: wd.Destination,
+		Amount: wd.Amount, Withdrawal: wd.ID, Active: true, Now: now,
+	}, store.StateMoving)
+	f.advance(fl, true)
+
+	if err := f.st.View(func(tx *store.Tx) error {
+		settled, cursor, err := tx.SettledSince(store.Settled{}, 0)
 		if err != nil {
 			return err
 		}
-		if !started {
-			t.Fatal("did not resume once the cooldown expired")
+		if len(settled) != 1 || settled[0].Reason != store.ReasonPayout {
+			t.Fatalf("settled = %+v, want the payout", settled)
+		}
+		if settled[0].Block != 42 {
+			t.Fatalf("block = %d, want the one it settled in", settled[0].Block)
+		}
+		// Passing the cursor back yields nothing new, so a caller that keeps
+		// passing it never loses its place.
+		again, next, err := tx.SettledSince(cursor, 0)
+		if err != nil {
+			return err
+		}
+		if len(again) != 0 || next != cursor {
+			t.Fatalf("cursor moved with nothing new: %v -> %v", cursor, next)
 		}
 		return nil
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -1,15 +1,16 @@
 // Package api serves bsc's only HTTP surface.
 //
-// An app is identified by a slug in the path and there is no authentication.
-// The service is loopback-only and every caller is a first-party service on the
-// same box, so API keys would buy nothing against that threat model except
-// ceremony: a hash table, a rotation endpoint, and a shown-once secret to store
-// somewhere. The slug is the same handle callers already configure.
+// The noun is a wallet. A caller asks for one, is told what arrived on it, and
+// asks for a payout from it — and that is the whole vocabulary. There is no app,
+// no balance split, no fee and no quote, because none of those are questions
+// about a chain: they are questions about who owes whom, and the service that
+// keeps those books sits above this one (§33).
 //
-// The same reasoning removes the need for an admin API. With slug addressing,
-// any local caller can already read any app, so this surface *is* the
-// operator's read surface; what is left for operators is /metrics, the logs,
-// and `bsc inspect` on a snapshot.
+// There is no authentication. bsc is loopback-only and its caller is a
+// first-party service on the same box, so API keys would buy nothing against
+// that threat model except ceremony. That also means there is no tenancy here:
+// any local caller can read every wallet, and keeping one caller's handles from
+// colliding with another's is the caller's job (§37).
 package api
 
 import (
@@ -21,6 +22,8 @@ import (
 	"time"
 
 	"bsc/keys"
+	"math/big"
+
 	"bsc/money"
 	"bsc/store"
 
@@ -43,12 +46,9 @@ type Addresses interface {
 // Options configure the server.
 type Options struct {
 	// MaxLagBlocks is how far behind the watcher may be before withdrawals are
-	// refused. Reserving against a stale balance could overdraw an app, and the
-	// only honest answer while catching up is "not yet".
+	// refused. Accepting one against a stale balance could overdraw a wallet,
+	// and the only honest answer while catching up is "not yet".
 	MaxLagBlocks uint64
-
-	// DefaultFee is applied to a newly registered app that names no policy.
-	DefaultFee store.FeePolicy
 
 	// Notify nudges the sender after work is created. Optional.
 	Notify func()
@@ -57,10 +57,6 @@ type Options struct {
 	// unless the operator asked for it: this listener has no authentication
 	// (§29).
 	UI bool
-
-	// FeeCollector is where the house's money lands, shown on the dashboard.
-	// Zero means the master pays and collects, which is also the default.
-	FeeCollector common.Address
 
 	// Health supplies what /healthz cannot derive for itself. The zero value
 	// simply makes the gas check a no-op.
@@ -98,29 +94,36 @@ func New(st *store.Store, ring *keys.Ring, addrs Addresses, sync Sync, opts Opti
 	}
 }
 
-// Routes mounts every endpoint. The app is always the first path element, so
-// nothing has to be threaded through a middleware.
+// Routes mounts every endpoint.
+//
+// A wallet is addressed by the ref its caller chose, and everything about that
+// wallet hangs off its own path: `PUT` to create it, `GET` to read it, `PATCH`
+// to reconfigure it, and its credits and debits underneath. The two collections
+// that are not about one wallet — the global feeds — sit at the top level.
+//
+// `PUT` rather than `POST` for creation because that is what it does: the ref
+// is the identifier, the caller supplies it, and calling twice is the same as
+// calling once. A `POST` to a collection would imply the server picks the name.
 func (s *Server) Routes(mux *http.ServeMux) {
-	mux.HandleFunc("PUT /v1/apps/{slug}", s.handle(s.putApp))
-	mux.HandleFunc("GET /v1/apps/{slug}", s.handle(s.getApp))
-	mux.HandleFunc("GET /v1/apps/{slug}/balance", s.handle(s.getBalance))
+	mux.HandleFunc("GET /v1/wallets", s.handle(s.listWallets))
+	mux.HandleFunc("PUT /v1/wallets/{ref}", s.handle(s.putWallet))
+	mux.HandleFunc("GET /v1/wallets/{ref}", s.handle(s.getWallet))
+	mux.HandleFunc("PATCH /v1/wallets/{ref}", s.handle(s.patchWallet))
 
-	// "addresses", not "wallets": a wallet is an internal record with a kind, a
-	// live flow and a wei balance. What an app asks for is an address for one of
-	// its own handles, and that is all it is given (§27).
-	mux.HandleFunc("POST /v1/apps/{slug}/addresses", s.handle(s.createDepositAddress))
-	mux.HandleFunc("GET /v1/apps/{slug}/addresses", s.handle(s.listDepositAddresses))
-	mux.HandleFunc("GET /v1/apps/{slug}/addresses/{ref}", s.handle(s.getDepositAddress))
+	mux.HandleFunc("GET /v1/wallets/{ref}/deposits", s.handle(s.listWalletDeposits))
+	mux.HandleFunc("POST /v1/wallets/{ref}/withdrawals", s.handle(s.createWithdrawal))
+	mux.HandleFunc("GET /v1/wallets/{ref}/withdrawals", s.handle(s.listWalletWithdrawals))
 
-	mux.HandleFunc("POST /v1/apps/{slug}/withdrawals/quote", s.handle(s.quoteWithdrawal))
-	mux.HandleFunc("POST /v1/apps/{slug}/withdrawals", s.handle(s.createWithdrawal))
-	mux.HandleFunc("GET /v1/apps/{slug}/withdrawals", s.handle(s.listWithdrawals))
-	mux.HandleFunc("GET /v1/apps/{slug}/withdrawals/{id}", s.handle(s.getWithdrawal))
-
-	mux.HandleFunc("GET /v1/apps/{slug}/deposits", s.handle(s.listDeposits))
+	// The two feeds. Both are observations of transfers that have settled, both
+	// are cursor-ordered, and a caller reconciles a wallet by walking them
+	// together — which is the whole reason a drain is a debit rather than a
+	// third kind of thing (§42).
+	mux.HandleFunc("GET /v1/deposits", s.handle(s.listDeposits))
+	mux.HandleFunc("GET /v1/withdrawals", s.handle(s.listWithdrawals))
+	mux.HandleFunc("GET /v1/withdrawals/{id}", s.handle(s.getWithdrawal))
 
 	// The dashboard and its read model, when the operator asked for them. They
-	// are mounted last and live outside /v1 entirely, so the app contract is
+	// are mounted last and live outside /v1 entirely, so the caller contract is
 	// unchanged whether this is on or off (§29).
 	if s.opts.UI {
 		s.mountUI(mux)
@@ -186,35 +189,52 @@ func decode(r *http.Request, into any) error {
 
 // --- shared helpers ---
 
-// app resolves the slug in the path, 404-ing when it is unknown.
-func (s *Server) app(tx *store.Tx, r *http.Request) (store.App, error) {
-	slug := r.PathValue("slug")
-	if err := store.ValidSlug(slug); err != nil {
-		return store.App{}, fail(http.StatusBadRequest, "bad_slug", "%v", err)
+// wallet resolves the ref in the path, 404-ing when it is unknown.
+func (s *Server) wallet(tx *store.Tx, r *http.Request) (store.Wallet, error) {
+	ref := r.PathValue("ref")
+	if err := store.ValidRef(ref); err != nil {
+		return store.Wallet{}, fail(http.StatusBadRequest, "bad_ref", "%v", err)
 	}
-	a, ok, err := tx.App(slug)
+	w, ok, err := tx.WalletByRef(ref)
 	if err != nil {
-		return store.App{}, err
+		return store.Wallet{}, err
 	}
 	if !ok {
-		return store.App{}, fail(http.StatusNotFound, "unknown_app", "app %q is not registered", slug)
+		return store.Wallet{}, fail(http.StatusNotFound, "unknown_wallet", "no wallet with ref %q", ref)
 	}
-	return a, nil
+	return w, nil
 }
 
-// amount parses a wei-denominated decimal string. Amounts exceed 2⁵³, so they
-// are strings on the wire and never JSON numbers.
-// cents reads a wire amount. Every amount crossing this API is a whole number
-// of cents as a decimal string — "150" is a dollar fifty. Nothing here is ever
-// a float, a decimal point, or a wei figure: the chain's unit stops at the edge
-// of the service, and an app that never learns it cannot get it wrong (§23).
-func cents(field, s string) (money.Cents, error) {
-	v, err := money.Parse(s)
+// amount reads a wire amount: the token's own base units as a decimal string.
+//
+// There is one unit now and it is the chain's. An amount here is the same
+// integer the token moves, so nothing is scaled, nothing is floored, and a
+// caller that wants dollars does that conversion in its own books where it
+// knows the exchange rate it means (§36).
+func amount(field, s string) (*big.Int, error) {
+	v, err := money.ParsePositive(s)
 	if err != nil {
-		return 0, fail(http.StatusBadRequest, "bad_amount",
-			"%s must be a whole number of cents, as a decimal string (got %q)", field, s)
+		return nil, fail(http.StatusBadRequest, "bad_amount",
+			"%s must be a positive whole number of base units, as a decimal string (got %q)", field, s)
 	}
 	return v, nil
+}
+
+// address parses and rejects the one destination a valid address can be while
+// still being unpayable. The token reverts on the zero address, so a payout to
+// it could never land however many times it was retried — and since a
+// withdrawal has no failure state, anything permanently unpayable has to be
+// caught here rather than settled into one afterwards (§28).
+func address(field, raw string) (common.Address, error) {
+	if !common.IsHexAddress(raw) {
+		return common.Address{}, fail(http.StatusBadRequest, "bad_"+field, "%s must be a hex address", field)
+	}
+	addr := common.HexToAddress(raw)
+	if addr == (common.Address{}) {
+		return common.Address{}, fail(http.StatusBadRequest, "bad_"+field,
+			"%s is the zero address, which cannot receive tokens", field)
+	}
+	return addr, nil
 }
 
 func stamp(t time.Time) string {
@@ -238,3 +258,7 @@ func hashStr(h common.Hash) string {
 type alwaysStale struct{}
 
 func (alwaysStale) Behind() uint64 { return ^uint64(0) }
+
+// isErr is errors.Is, kept short because the error mapping reads better as a
+// switch of one-line cases.
+func isErr(err, target error) bool { return errors.Is(err, target) }

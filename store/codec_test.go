@@ -61,7 +61,7 @@ func TestDecoderIgnoresTrailingBytesFromANewerVersion(t *testing.T) {
 	// The version-byte contract: an older binary reading a record written by a
 	// newer one must read the fields it knows and ignore the rest.
 	w := Wallet{
-		ID: uuid.New(), App: "df", Kind: KindDeposit, Ref: "cust-1",
+		ID: uuid.New(), Ref: "cust-1", Kind: KindManaged,
 		Address: addr(9), Balance: wei(5), CreatedAt: time.Now().UTC(),
 	}
 	b, err := w.encode()
@@ -140,31 +140,34 @@ func TestEveryRecordRoundTrips(t *testing.T) {
 	now := time.Now().UTC()
 	id, wid := uuid.New(), uuid.New()
 
-	t.Run("app", func(t *testing.T) {
-		in := App{
-			Slug: "df", Wallet: wid, Paused: true,
-			Fee:       FeePolicy{Flat: 100, Min: 500, BPS: 0},
-			Ledger:    12_345,
-			Reserved:  1_100,
-			CreatedAt: now, UpdatedAt: now,
+	t.Run("wallet", func(t *testing.T) {
+		in := Wallet{
+			ID: wid, Ref: "acme:cust-1", Kind: KindManaged, Address: addr(1),
+			DrainTo: addr(2), Active: true, Balance: wei(12_345), Paused: true,
+			Flow: id, FailedAttempts: 3, RetryAfter: now, CreatedAt: now, UpdatedAt: now,
 		}
 		b, err := in.encode()
 		if err != nil {
 			t.Fatal(err)
 		}
-		out, err := decodeApp(b)
+		out, err := decodeWallet(b)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if out.Slug != in.Slug || out.Wallet != in.Wallet || !out.Paused ||
-			out.Fee != in.Fee || out.Ledger != in.Ledger || out.Reserved != in.Reserved {
+		if out.Ref != in.Ref || out.Kind != in.Kind || out.Address != in.Address ||
+			out.DrainTo != in.DrainTo || !out.Active || !out.Paused ||
+			out.Balance.Cmp(in.Balance) != 0 || out.Flow != in.Flow ||
+			out.FailedAttempts != in.FailedAttempts {
 			t.Fatalf("got %+v want %+v", out, in)
+		}
+		if !out.Proxies() {
+			t.Fatal("a wallet with a DrainTo must report that it proxies")
 		}
 	})
 
 	t.Run("flow", func(t *testing.T) {
 		in := Flow{
-			ID: id, Kind: FlowWithdrawal, State: StatePaying, Wallet: wid, App: "df",
+			ID: id, Kind: FlowTransfer, State: StateMoving, Wallet: wid,
 			Withdrawal: uuid.New(), Amount: wei(77), To: addr(3), Tx: hash(4),
 			Attempt: 2, Error: "boom", CreatedAt: now, UpdatedAt: now,
 		}
@@ -214,8 +217,9 @@ func TestEveryRecordRoundTrips(t *testing.T) {
 
 	t.Run("deposit", func(t *testing.T) {
 		in := Deposit{
-			Wallet: wid, App: "df", Block: 48210577, LogIndex: 9, TxHash: hash(2),
-			From: addr(5), AmountWei: wei(1000), Cents: 1000, Status: DepositCredited, DrainTx: hash(3), CreatedAt: now,
+			Wallet: wid, Block: 48210577, LogIndex: 9, TxHash: hash(2),
+			From: addr(5), Amount: wei(1000), Status: DepositForwarded,
+			SweptBy: id, CreatedAt: now,
 		}
 		b, err := in.encode()
 		if err != nil {
@@ -225,19 +229,18 @@ func TestEveryRecordRoundTrips(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if out.Cursor() != in.Cursor() || out.AmountWei.Cmp(in.AmountWei) != 0 ||
-			out.Cents != in.Cents || out.Status != in.Status || out.DrainTx != in.DrainTx {
+		if out.Cursor() != in.Cursor() || out.Amount.Cmp(in.Amount) != 0 ||
+			out.Status != in.Status || out.SweptBy != in.SweptBy || out.From != in.From {
 			t.Fatalf("got %+v want %+v", out, in)
 		}
 	})
 
 	t.Run("withdrawal", func(t *testing.T) {
 		in := Withdrawal{
-			ID: id, App: "df", Destination: addr(6), Amount: 1000, Fee: 100,
-			Payout: 900, Debit: 1000, DeductFee: true, Status: WithdrawalPending,
-			TxHash: hash(8), IdempotencyKey: "k-1",
-			FeeSnapshot: FeePolicy{Flat: 100},
-			CreatedAt:   now, UpdatedAt: now,
+			ID: id, Wallet: wid, Reason: ReasonFee, PartOf: wid,
+			Destination: addr(6), Amount: wei(1000),
+			Status: WithdrawalConfirmed, TxHash: hash(8), Block: 4821,
+			Attempts: 4, IdempotencyKey: "k-1", CreatedAt: now, UpdatedAt: now,
 		}
 		b, err := in.encode()
 		if err != nil {
@@ -247,9 +250,10 @@ func TestEveryRecordRoundTrips(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if out.Payout != in.Payout || out.Debit != in.Debit ||
-			!out.DeductFee || out.IdempotencyKey != in.IdempotencyKey ||
-			out.FeeSnapshot != in.FeeSnapshot {
+		if out.Wallet != in.Wallet || out.Amount.Cmp(in.Amount) != 0 ||
+			out.Status != in.Status || out.Attempts != in.Attempts ||
+			out.IdempotencyKey != in.IdempotencyKey ||
+			out.Reason != in.Reason || out.PartOf != in.PartOf || out.Block != in.Block {
 			t.Fatalf("got %+v want %+v", out, in)
 		}
 	})

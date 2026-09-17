@@ -6,7 +6,7 @@
 #
 # THE ONE THING THAT MUST NOT GO IN THIS FILE IS master_secret. It signs every
 # transaction and holds an unlimited allowance on every wallet the service
-# derives, so whoever holds it can move every app's money. Keep it in a secrets
+# derives, so whoever holds it can move every wallet's money. Keep it in a secrets
 # manager and let systemd pass it in as BSC_MASTER_SECRET: the unit loads
 # /etc/bsc/bsc.env (0640 root:bsc), which holds that one value and nothing else.
 #
@@ -16,28 +16,29 @@
 # money on these numbers.
 #
 # Every setting is also addressable from the environment: the key path in upper
-# case with BSC_ in front, so swap.amount_wei is BSC_SWAP_AMOUNT_WEI. The
+# case with BSC_ in front, so swap.slippage_bps is BSC_SWAP_SLIPPAGE_BPS. The
 # environment beats this file, and a command-line flag beats both — which is how
 # you override one value during an incident without editing a reviewed file.
 #
-# Amounts named *_wei are integers in the token's own units, as strings. Amounts
-# named *_cents are whole cents. Durations are Go durations: 500ms, 2m, 1h.
+# Amounts named *_wei are integers in the token's own units, as strings. There is
+# no second unit: nothing is scaled and nothing is rounded. Durations are Go
+# durations: 500ms, 2m, 1h.
 
-# The only datastore: one bbolt file holding apps and their ledgers, wallets,
-# deposits and withdrawals. Losing it loses the wallet ids, and with them every
-# address ever derived — back it up (see snapshot, below).
+# The only datastore: one bbolt file holding wallets, deposits and withdrawals.
+# Losing it loses the wallet ids, and with them every address ever derived —
+# back it up (see snapshot, below).
 db_path: /var/lib/bsc/bsc.db
 
 # The only listener. There is no authentication and there never will be: every
-# caller is a first-party service on the same box and the app slug in the path
-# is identity, not a credential. Keep it on loopback and never put it behind a
-# public reverse proxy.
+# caller is a first-party service on the same box, and a ref in the path is a
+# name rather than a credential — any caller can read any wallet. Keep it on
+# loopback and never put it behind a public reverse proxy.
 http_addr: 127.0.0.1:8800
 
 # The local dashboard at /ui/, for driving the service by hand and watching it
 # work. Off by default, and that default is a security boundary rather than a
 # preference: the listener has no authentication, so anyone who can reach the
-# port can move every app's money. A laptop or a box only you can reach, and
+# port can move every wallet's money. A laptop or a box only you can reach, and
 # nowhere else.
 ui_enabled: false
 
@@ -76,34 +77,22 @@ chain:
 
   # Withdrawals are refused while the watcher is further behind than this (~90s
   # at current block times); reads keep working. Reserving against a stale
-  # balance could overdraw an app, and "not yet" is the honest answer.
+  # balance could overdraw a wallet, and "not yet" is the honest answer.
   max_lag_blocks: 200
 
 money:
-  # A newly registered app's withdrawal fee. The app may change its own
-  # afterwards — this is only the starting value.
-  default_fee_cents: 100
-
-  # Where the house's money lands. Empty means the master address.
-  fee_collector: ""
-
-  # How much a wallet must hold OVER its app's ledger — fees, sub-cent dust,
-  # stray transfers — before one transfer is worth collecting it. 0 disables
-  # sweeping entirely, which is safe: the money is still yours and simply
-  # accumulates in the app wallets.
-  house_sweep_min_cents: 100
-
   # Pure gas economics: do not spend a transaction moving less than this out of
-  # a deposit address. It has NO effect on what an app is credited — anything
-  # worth a whole cent is recorded the moment it arrives and shows as pending
-  # until the drain is worth running. Do not treat it as a minimum deposit.
+  # a forwarding wallet. It has NO effect on what is recorded — every incoming
+  # transfer becomes a deposit the moment it arrives, and a forwarding wallet
+  # simply holds it until moving it is worth paying for. Do not treat it as a
+  # minimum deposit.
   drain_threshold_wei: "1000000000000000000" # 1 USDT
 
 gas:
-  # Headroom over the estimated cost of activating a deposit wallet. Keep it
-  # modest: unused gas is refunded, so the surplus stays as dust in each
-  # address. These two multipliers are the ONLY gas knobs — amounts themselves
-  # are always estimated, never configured.
+  # Headroom over the estimated cost of activating a wallet. Keep it modest:
+  # unused gas is refunded, so the surplus stays as dust in each address. These
+  # two multipliers are the ONLY gas knobs — amounts themselves are always
+  # estimated, never configured.
   funding_multiplier: 1.25
   price_multiplier: 1.10
 
@@ -114,16 +103,21 @@ gas:
   # How often the master's native-balance gauge refreshes.
   master_poll: 30s
 
+  # Native balance below which the master is reported as low — by /healthz, by
+  # `bsc check`, and by the bsc_master_bnb_wei gauge you alert on.
+  #
+  # NOTHING REFILLS IT AUTOMATICALLY. The service used to sell tokens for gas on
+  # its own; it never trades now, so this is the number that tells a human to go
+  # and run `bsc swap`. Tokens do accumulate here — a withdrawal asked for with a
+  # `fee` writes a second debit to the master — but converting them is attended.
+  floor_wei: "50000000000000000" # 0.05
+
 swap:
-  # Trade collected fees back into native currency when the master runs low, so
-  # the fees withdrawals earn pay for the gas withdrawals cost. On by default —
-  # a gateway that runs out of gas stops completely — but it is the only thing
-  # the service does on its own initiative, so it is bounded on every side.
-  enabled: true
+  # Settings for the `bsc swap` command only. The running service never trades.
 
   # A Uniswap-V2-interface router. Defaults to the verified PancakeSwap V2
-  # deployment for whichever chain the endpoint reports; an unknown chain must
-  # name one here or set enabled: false.
+  # deployment for whichever chain the endpoint reports; on an unknown chain
+  # `bsc swap` refuses until one is named here.
   router: ""
 
   # Override only, for a fork whose router names the accessor something other
@@ -131,20 +125,12 @@ swap:
   # with itself.
   wrapped_native: ""
 
-  # Tokens traded per top-up.
-  amount_wei: "10000000000000000000" # 10 USDT
-
-  # Native balance below which a top-up is due. Well above the cost of the swap
-  # itself — below that, the master could not afford to rescue itself.
-  gas_floor_wei: "50000000000000000" # 0.05 BNB
-
   # Bound on the price, computed against the router's own quote. 10000 would
   # accept any price at all and is refused.
   slippage_bps: 100 # 1%
 
-  # Minimum gap between attempts. This is what stops a swap that does not lift
-  # the balance from trading away every fee it holds.
-  cooldown: 1h
+  # How long a swap transaction stays valid once signed.
+  deadline: 2m
 
 snapshot:
   # Periodic consistent copies of the whole database. EMPTY DISABLES BACKUP —

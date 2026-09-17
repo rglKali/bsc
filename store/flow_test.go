@@ -13,8 +13,7 @@ import (
 func startFlow(t *testing.T, s *Store, w Wallet, kind FlowKind, state FlowState) Flow {
 	t.Helper()
 	f := Flow{
-		ID: uuid.New(), Kind: kind, State: state, Wallet: w.ID, App: w.App,
-		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+		ID: uuid.New(), Kind: kind, State: state, Wallet: w.ID, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	update(t, s, func(tx *Tx) error {
 		if err := tx.PutFlow(f); err != nil {
@@ -28,16 +27,16 @@ func startFlow(t *testing.T, s *Store, w Wallet, kind FlowKind, state FlowState)
 
 func TestFlowRoundTripAndValidation(t *testing.T) {
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x60, 0)
-	f := startFlow(t, s, w, FlowDrain, StateFunding)
+	seedWallet(t, s, "hot", 0)
+	w := seedWalletAt(t, s, "cust-1", addr(0x60), common.Address{}, 0)
+	f := startFlow(t, s, w, FlowTransfer, StateFunding)
 
 	if err := s.View(func(tx *Tx) error {
 		got, ok, err := tx.Flow(f.ID)
 		if err != nil || !ok {
 			t.Fatalf("Flow: ok=%v err=%v", ok, err)
 		}
-		if got.Kind != FlowDrain || got.State != StateFunding || got.Wallet != w.ID {
+		if got.Kind != FlowTransfer || got.State != StateFunding || got.Wallet != w.ID {
 			t.Fatalf("got %+v", got)
 		}
 		return nil
@@ -46,14 +45,14 @@ func TestFlowRoundTripAndValidation(t *testing.T) {
 	}
 
 	if err := s.Update(func(tx *Tx) error {
-		return tx.PutFlow(Flow{App: "df"}) // no id
+		return tx.PutFlow(Flow{Wallet: uuid.New()}) // no id
 	}); err == nil {
 		t.Fatal("PutFlow accepted a flow with no id")
 	}
 	if err := s.Update(func(tx *Tx) error {
-		return tx.PutFlow(Flow{ID: uuid.New(), App: "BAD"})
+		return tx.PutFlow(Flow{ID: uuid.New()}) // no wallet
 	}); err == nil {
-		t.Fatal("PutFlow accepted an invalid slug")
+		t.Fatal("PutFlow accepted a flow with no wallet")
 	}
 }
 
@@ -62,9 +61,9 @@ func TestDeleteFlowReleasesItsWallet(t *testing.T) {
 	// declarative work rules — the mechanism that picks up a deposit which
 	// landed mid-drain.
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x61, 0)
-	f := startFlow(t, s, w, FlowDrain, StateSweeping)
+	seedWallet(t, s, "hot", 0)
+	w := seedWalletAt(t, s, "cust-1", addr(0x61), common.Address{}, 0)
+	f := startFlow(t, s, w, FlowTransfer, StateMoving)
 
 	update(t, s, func(tx *Tx) error {
 		got, _, err := tx.Wallet(w.ID)
@@ -97,12 +96,12 @@ func TestDeleteFlowReleasesItsWallet(t *testing.T) {
 
 func TestDeleteFlowLeavesAWalletOwnedBySomeoneElseAlone(t *testing.T) {
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x62, 0)
-	live := startFlow(t, s, w, FlowDrain, StateSweeping)
+	seedWallet(t, s, "hot", 0)
+	w := seedWalletAt(t, s, "cust-1", addr(0x62), common.Address{}, 0)
+	live := startFlow(t, s, w, FlowTransfer, StateMoving)
 
 	// A stale flow record naming the same wallet must not steal the release.
-	stale := Flow{ID: uuid.New(), Kind: FlowDrain, State: StateFailed, Wallet: w.ID, App: "df"}
+	stale := Flow{ID: uuid.New(), Kind: FlowTransfer, State: StateFailed, Wallet: w.ID}
 	update(t, s, func(tx *Tx) error {
 		if err := tx.PutFlow(stale); err != nil {
 			return err
@@ -128,9 +127,9 @@ func TestTxWatchlistIsTheConfirmationRouter(t *testing.T) {
 	// One structure serves as both the watcher's tx watchlist and the router
 	// from a confirmed receipt to its flow and journal entry.
 	s := open(t)
-	seedApp(t, s, "df", 0)
-	w := depositWallet(t, s, "df", "cust-1", 0x63, 0)
-	f := startFlow(t, s, w, FlowDrain, StateSweeping)
+	seedWallet(t, s, "hot", 0)
+	w := seedWalletAt(t, s, "cust-1", addr(0x63), common.Address{}, 0)
+	f := startFlow(t, s, w, FlowTransfer, StateMoving)
 	txh := hash(0x77)
 	ref := TxRef{Flow: f.ID, Signer: addr(0x01), Nonce: 12}
 
@@ -241,7 +240,7 @@ func TestMutateMissingFlow(t *testing.T) {
 }
 
 func TestFlowStateTerminality(t *testing.T) {
-	for _, s := range []FlowState{StateFunding, StateApproving, StateSweeping, StatePaying} {
+	for _, s := range []FlowState{StateFunding, StateApproving, StateMoving, StateMoving} {
 		if s.IsTerminal() {
 			t.Fatalf("%s reported terminal", s)
 		}

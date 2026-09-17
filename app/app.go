@@ -20,7 +20,6 @@ import (
 	"bsc/chain"
 	"bsc/config"
 	"bsc/keys"
-	"bsc/money"
 	"bsc/sender"
 	"bsc/store"
 	"bsc/watcher"
@@ -71,16 +70,13 @@ func Run(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 
-	// The unit the ledger counts in follows from the token itself. Asking it
-	// rather than configuring it means the scale cannot be set inconsistently
-	// with the contract every amount is denominated in (§23).
+	// The token's decimals are still read and recorded, even though no amount
+	// is scaled by them any more: they are what lets an operator — and `bsc
+	// check` — render a raw base-unit figure as something human. Recording them
+	// also keeps the database's identity complete (§36).
 	decimals, err := rpc.TokenDecimals(ctx, cfg.Token)
 	if err != nil {
 		return err
-	}
-	scale, err := money.NewScale(decimals)
-	if err != nil {
-		return fmt.Errorf("token %s: %w", cfg.Token.Hex(), err)
 	}
 	// Recorded once and checked on every later start. Every amount in this
 	// database is denominated by this token on this chain, and every wallet in
@@ -92,28 +88,18 @@ func Run(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 
-	// An unset collector means the operator's own master wallet.
-	collector := master.Address
-	if cfg.FeeCollector != "" {
-		collector = common.HexToAddress(cfg.FeeCollector)
-	}
-
-	// The master is recorded like any other wallet, so its collected fees are
-	// tracked and a gas top-up can own it the way every flow owns a wallet.
+	// The master is recorded like any other wallet so its token balance is
+	// tracked from the same Transfer logs as everything else — which is what
+	// lets `bsc check` report it without an extra call.
 	masterWallet, err := ensureMasterWallet(st, master.Address)
 	if err != nil {
 		return err
 	}
 
 	snd, err := sender.New(st, rpc, ring, sender.Options{
-		ChainID:       cfg.ChainID,
-		Token:         cfg.Token,
-		Scale:         scale,
-		FeeCollector:  collector,
-		Router:        addressOrZero(cfg.SwapRouter),
-		WrappedNative: addressOrZero(cfg.SwapNative), // empty: ask the router
+		ChainID: cfg.ChainID,
+		Token:   cfg.Token,
 
-		SlippageBPS:       cfg.SwapSlippage,
 		FundingMultiplier: cfg.FundingMultiplier,
 		GasMultiplier:     cfg.GasMultiplier,
 		RebroadcastAfter:  cfg.RebroadcastAfter,
@@ -128,15 +114,8 @@ func Run(ctx context.Context, cfg config.Config) error {
 		Poll:          cfg.PollInterval,
 		BackfillBatch: cfg.BackfillBatch,
 
-		Scale:          scale,
 		DrainThreshold: cfg.DrainThreshold,
-		HouseSweepMin:  scale.Wei(cfg.HouseSweepMin),
-		FeeCollector:   collector,
 		MasterWallet:   masterWallet.ID,
-		SwapEnabled:    cfg.SwapEnabled,
-		SwapAmount:     cfg.SwapAmount,
-		GasFloor:       cfg.GasFloor,
-		SwapCooldown:   cfg.SwapCooldown,
 		Master:         master.Address,
 		MasterPoll:     cfg.MasterPoll,
 		Token:          cfg.Token,
@@ -147,14 +126,11 @@ func Run(ctx context.Context, cfg config.Config) error {
 
 	srv := api.New(st, ring, addrs, wat, api.Options{
 		MaxLagBlocks: cfg.MaxLagBlocks,
-		DefaultFee:   store.FeePolicy{Flat: cfg.DefaultFee},
 		Notify:       snd.Notify,
 		UI:           cfg.UIEnabled,
-		FeeCollector: collector,
 		Health: api.Health{
-			MasterGas:  wat.MasterGas,
-			Floor:      cfg.GasFloor,
-			SwapAmount: swapAmountOrNil(cfg),
+			MasterGas: wat.MasterGas,
+			Floor:     cfg.GasFloor,
 		},
 	})
 
@@ -171,8 +147,8 @@ func Run(ctx context.Context, cfg config.Config) error {
 
 	log.Info("bsc starting",
 		"db", cfg.DBPath, "addr", cfg.HTTPAddr, "rpc", cfg.RPCURL,
-		"chain", chainID, "master", master.Address.Hex(), "collector", collector.Hex(),
-		"token", cfg.Token.Hex(), "decimals", decimals, "cent_wei", scale.CentWei(),
+		"chain", chainID, "master", master.Address.Hex(),
+		"token", cfg.Token.Hex(), "decimals", decimals,
 		"rate_limit", cfg.RPCRateLimit)
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -234,14 +210,4 @@ func ensureMasterWallet(st *store.Store, addr common.Address) (store.Wallet, err
 		return tx.PutWallet(out)
 	})
 	return out, err
-}
-
-// swapAmountOrNil is what a gas top-up would have to sell, or nil when there is
-// no top-up. The distinction is what lets /healthz tell a master that will
-// recover from one that will not.
-func swapAmountOrNil(cfg config.Config) *big.Int {
-	if !cfg.SwapEnabled {
-		return nil
-	}
-	return cfg.SwapAmount
 }

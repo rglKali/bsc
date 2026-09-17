@@ -2,339 +2,352 @@ package api
 
 import (
 	"net/http"
-	"strings"
 	"testing"
-
-	"bsc/store"
-
-	"github.com/google/uuid"
 )
 
 const dest = "0x00000000000000000000000000000000000000dd"
 
-func TestQuoteHasNoSideEffects(t *testing.T) {
+type withdrawalsPage struct {
+	Withdrawals []withdrawalView `json:"withdrawals"`
+	Cursor      string           `json:"cursor"`
+}
+
+func TestCreateWithdrawalCommitsAgainstCustody(t *testing.T) {
 	f := newFixture(t)
-	f.register("df") // default fee: 1 wei flat
+	f.wallet("hot")
+	f.credit("hot", 1_000)
 
-	var q quoteView
-	f.json(f.do("POST", "/v1/apps/df/withdrawals/quote", quoteBody{AmountCents: "10"}), http.StatusOK, &q)
-	if q.PayoutCents != "10" || q.DebitCents != "11" || q.FeeCents != "1" {
-		t.Fatalf("quote = %+v, want the fee charged on top", q)
+	var got createdView
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+		To: dest, Amount: "400",
+	}), http.StatusCreated, &got)
+
+	wd := got.Payout
+	if wd.Status != "pending" || wd.Amount != "400" || wd.Wallet != "hot" || wd.Reason != "payout" {
+		t.Fatalf("payout = %+v", wd)
 	}
-
-	f.json(f.do("POST", "/v1/apps/df/withdrawals/quote", quoteBody{AmountCents: "10", DeductFee: true}), http.StatusOK, &q)
-	if q.PayoutCents != "9" || q.DebitCents != "10" {
-		t.Fatalf("quote = %+v, want the fee deducted", q)
+	if got.Fee != nil {
+		t.Fatalf("a fee appeared without being asked for: %+v", got.Fee)
 	}
-
-	// Nothing was reserved and nothing queued.
-	var app appView
-	f.json(f.do("GET", "/v1/apps/df", nil), http.StatusOK, &app)
-	if app.Balance.ReservedCents != "0" {
-		t.Fatalf("quoting reserved %s", app.Balance.ReservedCents)
+	var w walletView
+	f.json(f.do("GET", "/v1/wallets/hot", nil), http.StatusOK, &w)
+	if w.Committed != "400" || w.Available != "600" {
+		t.Fatalf("wallet = %+v, want 400 committed and 600 available", w)
 	}
 }
 
-func TestQuoteEnforcesTheAppsMinimum(t *testing.T) {
+// The overdraft guard is the whole of what replaced the reservation ledger:
+// what is already promised, plus what is being asked for, against what the
+// chain says the wallet holds (§39).
+func TestWithdrawalRefusesToPromiseMoreThanIsHeld(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.json(f.do("PUT", "/v1/apps/df", appBody{Fee: &feeBody{FlatCents: "1", MinCents: "100"}}), http.StatusOK, nil)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
 
-	w := f.do("POST", "/v1/apps/df/withdrawals/quote", quoteBody{AmountCents: "99"})
-	if w.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d, want 422; body = %s", w.Code, w.Body.String())
-	}
-}
-
-func TestCreateWithdrawalReservesPayoutAndFeeSeparately(t *testing.T) {
-	// One reservation covers payout and fee. They leave the ledger together now
-	// that the fee never moves on its own, so the figure is the whole
-	// commitment and there is no second lifetime to track (§24).
-	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 1000)
-
-	var wd withdrawalView
-	f.json(f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{
-		Destination: dest, AmountCents: "100",
-	}), http.StatusCreated, &wd)
-
-	if wd.Status != "pending" || wd.PayoutCents != "100" || wd.FeeCents != "1" {
-		t.Fatalf("withdrawal = %+v", wd)
-	}
-
-	var app appView
-	f.json(f.do("GET", "/v1/apps/df", nil), http.StatusOK, &app)
-	if app.Balance.ReservedCents != "101" {
-		t.Fatalf("reserved = %s, want payout+fee", app.Balance.ReservedCents)
-	}
-	if app.Balance.AvailableCents != "899" {
-		t.Fatalf("available = %s, want 899", app.Balance.AvailableCents)
-	}
-	if f.notify == 0 {
-		t.Fatal("the sender was not nudged")
-	}
-}
-
-func TestWithdrawalRefusedWhenTheBalanceCannotCoverIt(t *testing.T) {
-	// v1 discovered this only when the transfer reverted on-chain, after the
-	// gas was spent.
-	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 50)
-
-	w := f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{Destination: dest, AmountCents: "100"})
-	if w.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d, want 422; body = %s", w.Code, w.Body.String())
-	}
-
-	// The refused request must leave nothing behind.
-	var app appView
-	f.json(f.do("GET", "/v1/apps/df", nil), http.StatusOK, &app)
-	if app.Balance.ReservedCents != "0" {
-		t.Fatalf("a refused withdrawal left state behind: %+v", app.Balance)
-	}
-	var list struct {
-		Withdrawals []withdrawalView `json:"withdrawals"`
-	}
-	f.json(f.do("GET", "/v1/apps/df/withdrawals", nil), http.StatusOK, &list)
-	if len(list.Withdrawals) != 0 {
-		t.Fatalf("a refused withdrawal was recorded: %+v", list.Withdrawals)
-	}
-}
-
-func TestFeeMustAlsoFitTheBalance(t *testing.T) {
-	// Exactly enough for the payout but not the fee must still be refused.
-	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 100)
-
-	if w := f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{Destination: dest, AmountCents: "100"}); w.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d, want 422", w.Code)
-	}
-	// Deducting the fee instead makes it fit.
-	if w := f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{Destination: dest, AmountCents: "100", DeductFee: true}); w.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201; body = %s", w.Code, w.Body.String())
-	}
-}
-
-func TestIdempotencyKeyReplaysRatherThanPayingTwice(t *testing.T) {
-	// Over HTTP a client retry after a timeout would otherwise double-pay; v1
-	// got this free from the broker's message-id dedup.
-	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 1000)
-
-	body := withdrawalBody{Destination: dest, AmountCents: "100", IdempotencyKey: "k-1"}
-	var first, second withdrawalView
-	f.json(f.do("POST", "/v1/apps/df/withdrawals", body), http.StatusCreated, &first)
-	f.json(f.do("POST", "/v1/apps/df/withdrawals", body), http.StatusOK, &second)
-
-	if first.ID != second.ID {
-		t.Fatalf("retry created a second withdrawal: %s vs %s", first.ID, second.ID)
-	}
-	var app appView
-	f.json(f.do("GET", "/v1/apps/df", nil), http.StatusOK, &app)
-	if app.Balance.ReservedCents != "101" {
-		t.Fatalf("reserved = %s, want a single reservation", app.Balance.ReservedCents)
-	}
-}
-
-func TestIdempotencyKeyReusedWithDifferentParametersConflicts(t *testing.T) {
-	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 1000)
-
-	f.json(f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{
-		Destination: dest, AmountCents: "100", IdempotencyKey: "k-1",
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+		To: dest, Amount: "700",
 	}), http.StatusCreated, nil)
 
-	w := f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{
-		Destination: dest, AmountCents: "200", IdempotencyKey: "k-1",
-	})
-	if w.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409; body = %s", w.Code, w.Body.String())
+	// 700 is already committed, so 400 more overdraws even though the balance
+	// alone would cover it.
+	w := f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{To: dest, Amount: "400"})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body = %s", w.Code, w.Body.String())
+	}
+
+	// And the refusal left nothing behind.
+	var list withdrawalsPage
+	f.json(f.do("GET", "/v1/wallets/hot/withdrawals?status=all", nil), http.StatusOK, &list)
+	if len(list.Withdrawals) != 1 {
+		t.Fatalf("withdrawals = %d, want only the accepted one", len(list.Withdrawals))
 	}
 }
 
-func TestWithdrawalsAreRefusedWhileTheChainIsStale(t *testing.T) {
-	// Balances are only current at the head. Reserving against a stale balance
-	// could overdraw an app, so the honest answer while catching up is "not yet".
+// Forwarding and paying out contradict each other — one empties the wallet, the
+// other spends from it — so a proxy wallet refuses payouts outright (§32).
+func TestWithdrawalRefusedFromAForwardingWallet(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 1000)
-	f.sync.behind = 5000
+	hot := f.wallet("hot")
+	f.proxy("cust-1", hot.Address)
+	f.credit("cust-1", 1_000)
 
-	w := f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{Destination: dest, AmountCents: "100"})
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503; body = %s", w.Code, w.Body.String())
+	w := f.do("POST", "/v1/wallets/cust-1/withdrawals", withdrawalBody{To: dest, Amount: "100"})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body = %s", w.Code, w.Body.String())
 	}
-
-	// Reads keep working while syncing; only spending is held back.
-	f.json(f.do("GET", "/v1/apps/df", nil), http.StatusOK, nil)
-	f.json(f.do("GET", "/v1/apps/df/deposits", nil), http.StatusOK, nil)
-
-	f.sync.behind = 0
-	f.json(f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{Destination: dest, AmountCents: "100"}),
-		http.StatusCreated, nil)
 }
 
-func TestPausedAppCannotPayOut(t *testing.T) {
+func TestWithdrawalRefusedFromAPausedWallet(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 1000)
-	paused := true
-	f.json(f.do("PUT", "/v1/apps/df", appBody{Paused: &paused}), http.StatusOK, nil)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
+	yes := true
+	f.json(f.do("PATCH", "/v1/wallets/hot", patchWalletBody{Paused: &yes}), http.StatusOK, nil)
 
-	if w := f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{Destination: dest, AmountCents: "100"}); w.Code != http.StatusForbidden {
+	w := f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{To: dest, Amount: "100"})
+	if w.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", w.Code)
 	}
 }
 
-func TestWithdrawalValidation(t *testing.T) {
+// A retry after a timeout replays the original instead of paying twice.
+func TestIdempotencyKeyReplaysTheOriginal(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 1000)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
 
-	tests := map[string]withdrawalBody{
-		"no destination":  {AmountCents: "100"},
-		"bad destination": {Destination: "not-an-address", AmountCents: "100"},
-		"no amount":       {Destination: dest},
-		"negative":        {Destination: dest, AmountCents: "-5"},
-		"not a number":    {Destination: dest, AmountCents: "abc"},
-		"fractional":      {Destination: dest, AmountCents: "1.5"},
+	body := withdrawalBody{To: dest, Amount: "100", IdempotencyKey: "order-4417"}
+	var first, second createdView
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", body), http.StatusCreated, &first)
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", body), http.StatusCreated, &second)
+	if first.Payout.ID != second.Payout.ID {
+		t.Fatalf("replay created a second withdrawal: %s vs %s", first.Payout.ID, second.Payout.ID)
 	}
-	for name, body := range tests {
-		if w := f.do("POST", "/v1/apps/df/withdrawals", body); w.Code != http.StatusBadRequest {
-			t.Fatalf("%s: status = %d, want 400", name, w.Code)
-		}
+
+	var list withdrawalsPage
+	f.json(f.do("GET", "/v1/wallets/hot/withdrawals?status=all", nil), http.StatusOK, &list)
+	if len(list.Withdrawals) != 1 {
+		t.Fatalf("withdrawals = %d, want 1", len(list.Withdrawals))
 	}
 }
 
-func TestWithdrawalsAreScopedToTheirApp(t *testing.T) {
-	// One app must not be able to read another's withdrawal by guessing an id.
+func TestIdempotencyKeyWithDifferentParametersConflicts(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.register("other")
-	f.credit("df", 1000)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
 
-	var wd withdrawalView
-	f.json(f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{Destination: dest, AmountCents: "100"}),
-		http.StatusCreated, &wd)
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+		To: dest, Amount: "100", IdempotencyKey: "k",
+	}), http.StatusCreated, nil)
 
-	f.json(f.do("GET", "/v1/apps/df/withdrawals/"+wd.ID, nil), http.StatusOK, nil)
-	if w := f.do("GET", "/v1/apps/other/withdrawals/"+wd.ID, nil); w.Code != http.StatusNotFound {
-		t.Fatalf("cross-app read: status %d, want 404", w.Code)
-	}
-	if w := f.do("GET", "/v1/apps/df/withdrawals/not-a-uuid", nil); w.Code != http.StatusBadRequest {
-		t.Fatalf("bad id: status %d, want 400", w.Code)
-	}
-	if w := f.do("GET", "/v1/apps/df/withdrawals/"+uuid.New().String(), nil); w.Code != http.StatusNotFound {
-		t.Fatalf("unknown id: status %d, want 404", w.Code)
+	w := f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+		To: dest, Amount: "200", IdempotencyKey: "k",
+	})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", w.Code)
 	}
 }
 
-func TestListWithdrawalsByStatus(t *testing.T) {
+// Balances are only current at the head, so accepting a payout against a stale
+// one could overdraw the wallet. Reads keep working throughout (§21).
+func TestWithdrawalsAreRefusedWhileSyncing(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 1000)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
+	f.sync.behind = 10_000
 
-	var open, settled withdrawalView
-	f.json(f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{Destination: dest, AmountCents: "100"}), http.StatusCreated, &open)
-	f.json(f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{Destination: dest, AmountCents: "200"}), http.StatusCreated, &settled)
+	w := f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{To: dest, Amount: "100"})
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if r := f.do("GET", "/v1/wallets/hot", nil); r.Code != http.StatusOK {
+		t.Fatalf("reads broke while syncing: %d", r.Code)
+	}
+}
 
-	// Settle one, as the watcher would.
-	if err := f.st.Update(func(tx *store.Tx) error {
-		_, err := tx.MutateWithdrawal(uuid.MustParse(settled.ID), func(w *store.Withdrawal) error {
-			w.Status = store.WithdrawalDebited
-			return nil
+func TestWithdrawalValidatesItsInputs(t *testing.T) {
+	f := newFixture(t)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
+
+	cases := map[string]withdrawalBody{
+		"bad destination": {To: "not-an-address", Amount: "100"},
+		"zero amount":     {To: dest, Amount: "0"},
+		"negative amount": {To: dest, Amount: "-5"},
+		"decimal amount":  {To: dest, Amount: "1.5"},
+		"empty amount":    {To: dest, Amount: ""},
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if w := f.do("POST", "/v1/wallets/hot/withdrawals", body); w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+			}
 		})
-		return err
-	}); err != nil {
-		t.Fatalf("settle: %v", err)
+	}
+}
+
+// The caller minted the ids, so it polls its own outstanding set and drops each
+// entry as it settles. Pending is the default because that is the set it polls.
+func TestWithdrawalListingDefaultsToPending(t *testing.T) {
+	f := newFixture(t)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
+	var created createdView
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+		To: dest, Amount: "100",
+	}), http.StatusCreated, &created)
+	wd := created.Payout
+
+	// A wallet's own listing defaults to what it still owes — the settled ones
+	// are on the feed, so what is worth asking a wallet is what is outstanding.
+	var list withdrawalsPage
+	f.json(f.do("GET", "/v1/wallets/hot/withdrawals", nil), http.StatusOK, &list)
+	if len(list.Withdrawals) != 1 {
+		t.Fatalf("pending = %d, want 1", len(list.Withdrawals))
+	}
+	f.json(f.do("GET", "/v1/wallets/hot/withdrawals?status=confirmed", nil), http.StatusOK, &list)
+	if len(list.Withdrawals) != 0 {
+		t.Fatalf("confirmed = %d, want 0", len(list.Withdrawals))
+	}
+	if w := f.do("GET", "/v1/wallets/hot/withdrawals?status=nonsense", nil); w.Code != http.StatusBadRequest {
+		t.Fatalf("bad status: %d, want 400", w.Code)
 	}
 
-	var list struct {
-		Withdrawals []withdrawalView `json:"withdrawals"`
-	}
-	f.json(f.do("GET", "/v1/apps/df/withdrawals", nil), http.StatusOK, &list)
-	if len(list.Withdrawals) != 1 || list.Withdrawals[0].ID != open.ID {
-		t.Fatalf("outstanding set = %+v, want just the pending one", list.Withdrawals)
-	}
-
-	f.json(f.do("GET", "/v1/apps/df/withdrawals?status=debited", nil), http.StatusOK, &list)
-	if len(list.Withdrawals) != 1 || list.Withdrawals[0].ID != settled.ID {
-		t.Fatalf("debited = %+v", list.Withdrawals)
+	// The settled feed holds only what has happened, so a pending payout is
+	// absent from it by construction (§42).
+	var feed withdrawalsPage
+	f.json(f.do("GET", "/v1/withdrawals", nil), http.StatusOK, &feed)
+	if len(feed.Withdrawals) != 0 {
+		t.Fatalf("the settled feed carries a pending payout: %+v", feed.Withdrawals)
 	}
 
-	f.json(f.do("GET", "/v1/apps/df/withdrawals?status=all", nil), http.StatusOK, &list)
+	var one withdrawalView
+	f.json(f.do("GET", "/v1/withdrawals/"+wd.ID, nil), http.StatusOK, &one)
+	if one.ID != wd.ID {
+		t.Fatalf("lookup = %s, want %s", one.ID, wd.ID)
+	}
+	if w := f.do("GET", "/v1/withdrawals/not-a-uuid", nil); w.Code != http.StatusBadRequest {
+		t.Fatalf("bad id: %d, want 400", w.Code)
+	}
+}
+
+// Creating work must nudge the sender rather than leave it to a tick.
+func TestCreatingAWithdrawalNotifiesTheSender(t *testing.T) {
+	f := newFixture(t)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
+	before := f.notify
+
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+		To: dest, Amount: "100",
+	}), http.StatusCreated, nil)
+	if f.notify <= before {
+		t.Fatal("the sender was not nudged")
+	}
+}
+
+// A fee is a second debit, asked for in the same call. bsc does not decide what
+// it is — the caller has already done that and is telling us a number — and all
+// bsc adds is that the two are accepted together and that it knows where to send
+// it (§43).
+func TestFeeBecomesASecondDebit(t *testing.T) {
+	f := newFixture(t)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
+
+	var got createdView
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+		To: dest, Amount: "400", Fee: "25",
+	}), http.StatusCreated, &got)
+
+	if got.Fee == nil {
+		t.Fatal("no fee record returned")
+	}
+	if got.Payout.Reason != "payout" || got.Fee.Reason != "fee" {
+		t.Fatalf("reasons = %q / %q", got.Payout.Reason, got.Fee.Reason)
+	}
+	if got.Fee.Amount != "25" || got.Fee.PartOf != got.Payout.ID {
+		t.Fatalf("fee = %+v, want 25 linked to the payout", got.Fee)
+	}
+	// It goes to the wallet that pays for gas, which is not a policy decision
+	// and so is not configurable.
+	master, _ := f.srv.ring.Master()
+	if got.Fee.To != master.Address.Hex() {
+		t.Fatalf("fee destination = %s, want the master %s", got.Fee.To, master.Address.Hex())
+	}
+
+	// Both are committed, so the wallet cannot spend what it has promised away.
+	var w walletView
+	f.json(f.do("GET", "/v1/wallets/hot", nil), http.StatusOK, &w)
+	if w.Committed != "425" || w.Available != "575" {
+		t.Fatalf("wallet = %+v, want 425 committed", w)
+	}
+}
+
+// Joint acceptance is the whole of what bsc adds over two separate calls: a
+// wallet can never end up having accepted the payout and refused the fee (§43).
+func TestPayoutAndFeeAreAcceptedTogetherOrNotAtAll(t *testing.T) {
+	f := newFixture(t)
+	f.wallet("hot")
+	f.credit("hot", 100)
+
+	// The payout alone would fit; with the fee it does not.
+	w := f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+		To: dest, Amount: "90", Fee: "25",
+	})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body = %s", w.Code, w.Body.String())
+	}
+
+	var list withdrawalsPage
+	f.json(f.do("GET", "/v1/wallets/hot/withdrawals?status=all", nil), http.StatusOK, &list)
+	if len(list.Withdrawals) != 0 {
+		t.Fatalf("a refused pair left records behind: %+v", list.Withdrawals)
+	}
+}
+
+// One request, one key: a retry replays both halves.
+func TestIdempotentReplayReturnsTheFeeToo(t *testing.T) {
+	f := newFixture(t)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
+
+	body := withdrawalBody{To: dest, Amount: "100", Fee: "10", IdempotencyKey: "k"}
+	var first, second createdView
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", body), http.StatusCreated, &first)
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", body), http.StatusCreated, &second)
+
+	if second.Fee == nil || first.Fee.ID != second.Fee.ID {
+		t.Fatalf("replay did not return the same fee: %+v vs %+v", first.Fee, second.Fee)
+	}
+	var list withdrawalsPage
+	f.json(f.do("GET", "/v1/wallets/hot/withdrawals?status=all", nil), http.StatusOK, &list)
 	if len(list.Withdrawals) != 2 {
-		t.Fatalf("all = %d entries", len(list.Withdrawals))
-	}
-
-	if w := f.do("GET", "/v1/apps/df/withdrawals?status=nonsense", nil); w.Code != http.StatusBadRequest {
-		t.Fatalf("bad status: %d", w.Code)
+		t.Fatalf("withdrawals = %d, want the payout and its fee once each", len(list.Withdrawals))
 	}
 }
 
-func TestFeeSnapshotSurvivesAPolicyChange(t *testing.T) {
-	// History has to stay explicable after an app edits its fee.
+func TestFeeIsValidatedLikeAnyAmount(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 1000)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
 
-	var wd withdrawalView
-	f.json(f.do("POST", "/v1/apps/df/withdrawals", withdrawalBody{Destination: dest, AmountCents: "100"}),
-		http.StatusCreated, &wd)
-	f.json(f.do("PUT", "/v1/apps/df", appBody{Fee: &feeBody{FlatCents: "999"}}), http.StatusOK, nil)
-
-	if err := f.st.View(func(tx *store.Tx) error {
-		got, _, err := tx.Withdrawal(uuid.MustParse(wd.ID))
-		if err != nil {
-			return err
-		}
-		if got.Fee != 1 {
-			t.Fatalf("charged fee changed to %d", got.Fee)
-		}
-		if got.FeeSnapshot.Flat != 1 {
-			t.Fatalf("snapshot = %d, want the policy at request time", got.FeeSnapshot.Flat)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("View: %v", err)
+	for name, fee := range map[string]string{
+		"zero":    "0",
+		"decimal": "1.5",
+		"words":   "ten",
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+				To: dest, Amount: "100", Fee: fee,
+			})
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("fee %q: status %d, want 400", fee, w.Code)
+			}
+		})
 	}
 }
 
-// Quoting and creating take different bodies, and the difference is load-
-// bearing: pricing depends only on the amount and the fee direction, so a quote
-// has no destination to give. Because the decoder rejects unknown fields — so an
-// integrator's misspelling is an error rather than a silently ignored setting —
-// sending one body to both endpoints is a 400, not a convenience.
-//
-// This is pinned because it is an inviting thing to "simplify". The dashboard
-// made exactly that mistake and the strictness caught it.
-func TestQuoteAndCreateTakeDifferentBodies(t *testing.T) {
+// The two settle independently — two transfers cannot be made atomic without a
+// contract — so the reason filter is how a caller separates them afterwards.
+func TestDebitsAreFilterableByReason(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 1000)
+	f.wallet("hot")
+	f.credit("hot", 1_000)
+	f.json(f.do("POST", "/v1/wallets/hot/withdrawals", withdrawalBody{
+		To: dest, Amount: "100", Fee: "10",
+	}), http.StatusCreated, nil)
 
-	// What each endpoint is actually given by a correct caller.
-	if w := f.do("POST", "/v1/apps/df/withdrawals/quote",
-		map[string]any{"amount_cents": "100", "deduct_fee": false}); w.Code != http.StatusOK {
-		t.Fatalf("quote: status %d, body %s", w.Code, w.Body)
+	var list withdrawalsPage
+	f.json(f.do("GET", "/v1/wallets/hot/withdrawals?status=all&reason=fee", nil), http.StatusOK, &list)
+	if len(list.Withdrawals) != 1 || list.Withdrawals[0].Reason != "fee" {
+		t.Fatalf("fee filter = %+v", list.Withdrawals)
 	}
-	if w := f.do("POST", "/v1/apps/df/withdrawals",
-		map[string]any{"amount_cents": "100", "deduct_fee": false, "destination": dest}); w.Code != http.StatusCreated {
-		t.Fatalf("create: status %d, body %s", w.Code, w.Body)
+	f.json(f.do("GET", "/v1/wallets/hot/withdrawals?status=all&reason=payout", nil), http.StatusOK, &list)
+	if len(list.Withdrawals) != 1 || list.Withdrawals[0].Reason != "payout" {
+		t.Fatalf("payout filter = %+v", list.Withdrawals)
 	}
-
-	// A create body sent to the quote endpoint is refused, naming the field.
-	w := f.do("POST", "/v1/apps/df/withdrawals/quote",
-		map[string]any{"amount_cents": "100", "deduct_fee": false, "destination": dest})
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("quote with a destination: status %d, want 400", w.Code)
-	}
-	if !strings.Contains(w.Body.String(), "destination") {
-		t.Fatalf("the refusal must name the offending field, got %s", w.Body)
+	if w := f.do("GET", "/v1/withdrawals?reason=nonsense", nil); w.Code != http.StatusBadRequest {
+		t.Fatalf("bad reason: %d, want 400", w.Code)
 	}
 }

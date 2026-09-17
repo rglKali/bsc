@@ -35,9 +35,8 @@ func uiFixture(t *testing.T) *fixture {
 		sync:  &fakeSync{},
 	}
 	f.srv = New(st, ring, f.addrs, f.sync, Options{
-		DefaultFee: store.FeePolicy{Flat: 1},
-		Notify:     func() { f.notify++ },
-		UI:         true,
+		Notify: func() { f.notify++ },
+		UI:     true,
 	})
 	f.mux = http.NewServeMux()
 	f.srv.Routes(f.mux)
@@ -46,7 +45,7 @@ func uiFixture(t *testing.T) *fixture {
 
 // Off by default is the security boundary, not a preference: this listener has
 // no authentication, so a dashboard that appeared without being asked for would
-// hand every app's money to whoever could reach the port (§29).
+// hand every wallet to whoever could reach the port (§29).
 func TestDashboardIsAbsentUnlessEnabled(t *testing.T) {
 	f := newFixture(t) // the default fixture, UI not set
 	for _, path := range []string{"/ui/", "/ui/state", "/ui/index.html"} {
@@ -73,9 +72,11 @@ func TestDashboardMountsWhenEnabled(t *testing.T) {
 // asserts the split rather than trusting it.
 func TestUIStateCarriesTheOperatorView(t *testing.T) {
 	f := uiFixture(t)
-	f.register("df")
-	f.credit("df", 1000)
-	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
+	var hot walletView
+	f.json(f.do("PUT", "/v1/wallets/"+"hot", createWalletBody{Prewarm: true}),
+		http.StatusCreated, &hot)
+	f.credit("hot", 1000)
+	f.proxy("cust-1", hot.Address)
 
 	var state struct {
 		Service struct {
@@ -83,17 +84,18 @@ func TestUIStateCarriesTheOperatorView(t *testing.T) {
 			MaxLagBlocks uint64 `json:"max_lag_blocks"`
 			Lagging      bool   `json:"lagging"`
 		} `json:"service"`
-		Apps []struct {
-			Slug       string      `json:"slug"`
-			Address    string      `json:"address"`
-			CustodyWei string      `json:"custody_wei"`
-			Solvent    bool        `json:"solvent"`
-			Addresses  int         `json:"addresses"`
-			Balance    balanceView `json:"balance"`
-		} `json:"apps"`
+		Wallets []struct {
+			Ref       string `json:"ref"`
+			Address   string `json:"address"`
+			DrainTo   string `json:"drain_to"`
+			Balance   string `json:"balance"`
+			Committed string `json:"committed"`
+			Busy      bool   `json:"busy"`
+		} `json:"wallets"`
 		Flows []struct {
 			Kind  string `json:"kind"`
 			State string `json:"state"`
+			Ref   string `json:"ref"`
 		} `json:"flows"`
 	}
 	f.json(f.do("GET", "/ui/state", nil), http.StatusOK, &state)
@@ -101,32 +103,39 @@ func TestUIStateCarriesTheOperatorView(t *testing.T) {
 	if state.Service.Version != buildinfo.Version {
 		t.Errorf("version = %q, want the build stamp %q", state.Service.Version, buildinfo.Version)
 	}
-	if len(state.Apps) != 1 || state.Apps[0].Slug != "df" {
-		t.Fatalf("apps = %+v", state.Apps)
+	if len(state.Wallets) != 2 {
+		t.Fatalf("wallets = %+v, want both", state.Wallets)
 	}
-	a := state.Apps[0]
-	if a.Address == "" || a.CustodyWei == "" || !a.Solvent {
-		t.Errorf("app view = %+v, want the chain-side truth alongside the ledger", a)
+	byRef := map[string]int{}
+	for i, w := range state.Wallets {
+		byRef[w.Ref] = i
 	}
-	if a.Addresses != 1 {
-		t.Errorf("addresses = %d, want the one just created", a.Addresses)
+	h := state.Wallets[byRef["hot"]]
+	if h.Address == "" || h.Balance != "1000" || h.DrainTo != "" {
+		t.Errorf("hot wallet = %+v, want custody and no drain target", h)
 	}
-	if a.Balance.AvailableCents != "1000" {
-		t.Errorf("available = %s, want the ledger", a.Balance.AvailableCents)
+	p := state.Wallets[byRef["cust-1"]]
+	if p.DrainTo != hot.Address {
+		t.Errorf("proxy drain_to = %q, want %s", p.DrainTo, hot.Address)
 	}
-	// Registering an app pre-warms its wallet, so there is real work to show.
+	// The treasury asked to be pre-warmed, so there is real work to show.
 	if len(state.Flows) == 0 {
 		t.Error("no flows: the operator view is blind to work in flight")
+	}
+	for _, fl := range state.Flows {
+		if fl.Ref == "" {
+			t.Errorf("flow %+v has no ref: an operator cannot tell which wallet it is", fl)
+		}
 	}
 }
 
 // The dashboard is additive. Turning it on must not change a single byte of
-// what an app sees, or the contract depends on an operator's config.
-func TestDashboardDoesNotChangeTheAppContract(t *testing.T) {
-	paths := []string{"/v1/apps/df", "/v1/apps/df/balance", "/v1/apps/df/deposits"}
+// what a caller sees, or the contract depends on an operator's config.
+func TestDashboardDoesNotChangeTheCallerContract(t *testing.T) {
+	paths := []string{"/v1/wallets/hot", "/v1/deposits", "/v1/withdrawals"}
 
 	body := func(f *fixture) map[string]string {
-		f.register("df")
+		f.wallet("hot")
 		out := map[string]string{}
 		for _, p := range paths {
 			w := f.do("GET", p, nil)
@@ -165,34 +174,27 @@ func TestUIStateNeverServesNullCollections(t *testing.T) {
 
 	var raw map[string]json.RawMessage
 	f.json(f.do("GET", "/ui/state", nil), http.StatusOK, &raw)
-	for _, key := range []string{"apps", "flows"} {
+	for _, key := range []string{"wallets", "flows"} {
 		if got := string(raw[key]); got != "[]" {
 			t.Errorf("%s = %s on a fresh service, want an empty array", key, got)
 		}
 	}
 }
 
-// The master pays for every transfer and signs everything, and the collector is
-// where the house's money ends up. Neither is derivable from anything else on
-// the page, and both are what an operator actually goes looking for — so the
-// read model carries them rather than leaving them to the logs.
-func TestUIStateNamesTheMasterAndCollector(t *testing.T) {
+// The master pays for every transfer and signs everything. It is not derivable
+// from anything else on the page and is what an operator actually goes looking
+// for, so the read model carries it rather than leaving it to the logs.
+func TestUIStateNamesTheMaster(t *testing.T) {
 	f := uiFixture(t)
 
 	var state struct {
 		Service struct {
-			Master    string `json:"master"`
-			Collector string `json:"collector"`
+			Master string `json:"master"`
 		} `json:"service"`
 	}
 	f.json(f.do("GET", "/ui/state", nil), http.StatusOK, &state)
 
 	if !common.IsHexAddress(state.Service.Master) {
 		t.Fatalf("master = %q, want the gas-paying address", state.Service.Master)
-	}
-	// This fixture leaves the collector unset, which means the master collects.
-	// Empty is how the page is told to say so, rather than repeating an address.
-	if state.Service.Collector != "" {
-		t.Fatalf("collector = %q, want empty when it is the master", state.Service.Collector)
 	}
 }

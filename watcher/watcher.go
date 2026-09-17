@@ -20,7 +20,6 @@ import (
 
 	"bsc/engine"
 	"bsc/metrics"
-	"bsc/money"
 	"bsc/store"
 	"bsc/usdt"
 
@@ -44,15 +43,9 @@ type Options struct {
 	// scan the chain from genesis.
 	StartBlock uint64
 
-	Poll          time.Duration // head poll interval once caught up
-	BackfillBatch int           // blocks per write transaction while catching up
-	// Scale converts the chain's wei into the ledger's cents. Required: a
-	// watcher that does not know the token's decimals cannot credit anything.
-	Scale money.Scale
-
-	DrainThreshold *big.Int // don't spend gas moving less than this
-	HouseSweepMin  *big.Int // excess over the ledger worth collecting; 0 disables
-	FeeCollector   common.Address
+	Poll           time.Duration // head poll interval once caught up
+	BackfillBatch  int           // blocks per write transaction while catching up
+	DrainThreshold *big.Int      // don't spend gas moving less than this
 
 	// Gas top-up, evaluated whenever the master balance is polled.
 	MasterWallet uuid.UUID
@@ -78,7 +71,6 @@ type Watcher struct {
 	log   *slog.Logger
 
 	token common.Address
-	scale money.Scale
 	cfg   engine.Config
 	opts  Options
 
@@ -125,9 +117,6 @@ func New(st *store.Store, ch Chain, addrs *AddrSet, opts Options) *Watcher {
 	if opts.DrainThreshold == nil {
 		opts.DrainThreshold = new(big.Int)
 	}
-	if opts.HouseSweepMin == nil {
-		opts.HouseSweepMin = new(big.Int)
-	}
 	if opts.Token == (common.Address{}) {
 		opts.Token = usdt.MainnetAddress
 	}
@@ -141,16 +130,8 @@ func New(st *store.Store, ch Chain, addrs *AddrSet, opts Options) *Watcher {
 		abi:   usdt.NewUsdt(),
 		log:   slog.Default().With("svc", "watcher"),
 		token: opts.Token,
-		scale: opts.Scale,
 		cfg: engine.Config{
-			Scale:          opts.Scale,
 			DrainThreshold: opts.DrainThreshold,
-			HouseSweepMin:  opts.HouseSweepMin,
-			FeeCollector:   opts.FeeCollector,
-			SwapEnabled:    opts.SwapEnabled,
-			SwapAmount:     opts.SwapAmount,
-			GasFloor:       opts.GasFloor,
-			SwapCooldown:   opts.SwapCooldown,
 		},
 		opts: opts,
 	}
@@ -292,7 +273,7 @@ func (w *Watcher) Step(ctx context.Context) (caughtUp bool, err error) {
 		// deliberately held back until we are current: starting a withdrawal
 		// from a stale balance could overdraw an app.
 		if caughtUp {
-			if err := w.evaluateApps(tx, now); err != nil {
+			if err := w.evaluatePending(tx, now); err != nil {
 				return err
 			}
 		}
@@ -348,21 +329,17 @@ func (w *Watcher) pollMaster(ctx context.Context) {
 		if err != nil || !ok {
 			return err
 		}
+		// The master's token balance comes free from the Transfer logs the
+		// watcher already applies, so tracking it needs no extra call. The
+		// native balance is the one quantity in the service that cannot be
+		// derived from logs — a manual gas top-up is a plain value transfer
+		// that emits nothing — which is why it is polled at all (§14).
+		//
+		// Nothing acts on either number any more. Trading tokens back into gas
+		// used to start here; it is an operator command now, and these two
+		// gauges are what tells the operator to run it (§38).
 		held, _ := new(big.Float).SetInt(orZero(master.Balance)).Float64()
 		metrics.MasterUSDT.Set(held)
-
-		if !w.opts.SwapEnabled {
-			return nil
-		}
-		started, err := engine.EvaluateGas(tx, w.cfg, master, bal, time.Now())
-		if err != nil {
-			return err
-		}
-		if started {
-			metrics.FlowsStarted.WithLabelValues(store.FlowGasTopUp.String()).Inc()
-			w.log.Warn("master gas is low; swapping collected fees",
-				"balance", bal, "floor", w.cfg.GasFloor, "swap", w.cfg.SwapAmount)
-		}
 		return nil
 	}); err != nil {
 		w.log.Error("master poll failed", "err", err)

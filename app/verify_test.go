@@ -41,15 +41,12 @@ func seed(t *testing.T, balance int64) (*store.Store, store.Wallet) {
 	t.Cleanup(func() { st.Close() })
 
 	top := store.Wallet{
-		ID: uuid.New(), App: "df", Kind: store.KindTopLevel,
+		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged,
 		Address: common.HexToAddress("0xabc"), Active: true,
 		Balance: big.NewInt(balance), CreatedAt: time.Now(),
 	}
 	if err := st.Update(func(tx *store.Tx) error {
-		if err := tx.PutWallet(top); err != nil {
-			return err
-		}
-		return tx.PutApp(store.App{Slug: "df", Wallet: top.ID, CreatedAt: time.Now()})
+		return tx.PutWallet(top)
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -69,27 +66,31 @@ func TestVerifyReadsASnapshotOfALockedDatabase(t *testing.T) {
 	if !rep.OK() {
 		t.Fatalf("clean database reported %v", rep.Findings)
 	}
-	if rep.Apps != 1 || rep.Wallets != 1 {
+	if rep.Wallets != 1 {
 		t.Fatalf("counts = %+v", rep)
 	}
 }
 
 func TestVerifyReportsInconsistency(t *testing.T) {
-	st, _ := seed(t, 100)
-	// A ledger balance with no deposit behind it — drift the offline audit can
-	// now see, which before the ledger it could not (§22).
+	st, top := seed(t, 100)
+	// A wallet promising more than it holds. With no ledger this is the
+	// solvency question, asked of the thing that actually holds the money (§40).
 	if err := st.Update(func(tx *store.Tx) error {
-		_, err := tx.CreditLedger("df", 25)
-		return err
+		return tx.PutWithdrawal(store.Withdrawal{
+			ID: uuid.New(), Wallet: top.ID, Reason: store.ReasonPayout,
+			Destination: common.HexToAddress("0xdd"),
+			Amount:      big.NewInt(500), Status: store.WithdrawalPending,
+			CreatedAt: time.Now(),
+		})
 	}); err != nil {
-		t.Fatalf("CreditLedger: %v", err)
+		t.Fatalf("seed withdrawal: %v", err)
 	}
 	rep, err := Verify(snapshotOf(t, st))
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
 	if rep.OK() {
-		t.Fatal("audit missed a ledger with nothing behind it")
+		t.Fatal("audit missed a wallet owing more than it holds")
 	}
 }
 

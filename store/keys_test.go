@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"github.com/google/uuid"
 	"sort"
 	"strings"
 	"testing"
@@ -96,45 +97,46 @@ func TestCursorNextCrossesBlockBoundary(t *testing.T) {
 
 func TestCursorRecoveryFromIndexKey(t *testing.T) {
 	want := Cursor{Block: 48210577, LogIndex: 9}
-	got, ok := cursorFromScoped(scoped("lkr:acme", want.Key()))
+	got, ok := cursorFromKey(want.Key())
 	if !ok || got != want {
-		t.Fatalf("cursorFromScoped = (%v, %v), want (%v, true)", got, ok, want)
+		t.Fatalf("cursorFromKey = (%v, %v), want (%v, true)", got, ok, want)
 	}
-	if _, ok := cursorFromScoped([]byte("no-separator")); ok {
-		t.Fatal("cursorFromScoped accepted a key with no separator")
-	}
-	if _, ok := cursorFromScoped(scoped("df", []byte{1, 2, 3})); ok {
-		t.Fatal("cursorFromScoped accepted a short suffix")
+	if _, ok := cursorFromKey([]byte("short")); ok {
+		t.Fatal("cursorFromKey accepted a key of the wrong width")
 	}
 }
 
-func TestValidSlug(t *testing.T) {
-	for _, ok := range []string{"df", "lkr:acme", "a-b_c", "x", "0"} {
-		if err := ValidSlug(ok); err != nil {
-			t.Fatalf("ValidSlug(%q) = %v, want nil", ok, err)
+func TestValidRef(t *testing.T) {
+	for _, ok := range []string{"df", "lkr:acme", "a-b_c", "dot.ref", "x", "0"} {
+		if err := ValidRef(ok); err != nil {
+			t.Fatalf("ValidRef(%q) = %v, want nil", ok, err)
 		}
 	}
-	long := make([]byte, 65)
+	long := make([]byte, MaxRef+1)
 	for i := range long {
 		long[i] = 'a'
 	}
-	for _, bad := range []string{"", "DF", "with space", "dot.slug", "slash/slug", "nul\x00slug", string(long)} {
-		if err := ValidSlug(bad); err == nil {
-			t.Fatalf("ValidSlug(%q) accepted", bad)
+	for _, bad := range []string{"", "DF", "with space", "slash/ref", "nul\x00ref", string(long)} {
+		if err := ValidRef(bad); err == nil {
+			t.Fatalf("ValidRef(%q) accepted", bad)
 		}
 	}
 }
 
-func TestScopedKeysCannotCollideAcrossApps(t *testing.T) {
-	// The separator is what keeps a variable-length slug unambiguous: without
-	// it, app "a" with ref "bc" and app "ab" with ref "c" would share a key.
-	a := scoped("a", []byte("bc"))
-	b := scoped("ab", []byte("c"))
-	if bytes.Equal(a, b) {
-		t.Fatalf("keys collide: %q == %q", a, b)
+// Every composite key is built from fixed-width parts now, so concatenation is
+// unambiguous without the separator the slug scoping needed (§32).
+func TestWalletScopedKeysAreFixedWidth(t *testing.T) {
+	a, b := uuid.New(), uuid.New()
+	ka := join(a[:], Cursor{Block: 1, LogIndex: 2}.Key())
+	kb := join(b[:], Cursor{Block: 1, LogIndex: 2}.Key())
+	if bytes.Equal(ka, kb) {
+		t.Fatal("two wallets produced the same index key")
 	}
-	if !bytes.HasPrefix(a, scopePrefix("a")) || bytes.HasPrefix(b, scopePrefix("a")) {
-		t.Fatalf("prefix scoping leaks between apps: %q %q", a, b)
+	if !bytes.HasPrefix(ka, walletPrefix(a)) || bytes.HasPrefix(ka, walletPrefix(b)) {
+		t.Fatal("wallet prefixes leak between wallets")
+	}
+	if len(ka) != 16+12 {
+		t.Fatalf("key width = %d, want 28", len(ka))
 	}
 }
 

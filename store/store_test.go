@@ -1,8 +1,6 @@
 package store
 
 import (
-	"bsc/money"
-
 	"bytes"
 	"math/big"
 	"os"
@@ -47,56 +45,51 @@ func hash(b byte) common.Hash {
 	return h
 }
 
-// seedApp creates an app holding `balance`, the shape every other test needs
-// before it can do anything interesting.
+// seedWallet creates an accumulating wallet holding `balance`, which is the
+// shape most other tests need before they can do anything interesting.
 //
-// The balance is seeded the way a real one arrives — a credited deposit — rather
-// than by writing a number onto the app. That is not ceremony: the ledger is
-// recomputed from the log by Verify, so a balance with no deposit behind it is
-// exactly the drift the audit exists to catch, and every test would start dirty
-// (§22).
-//
-// Tests count in whole cents and their wallets hold the same figure in wei,
-// which is the truth when a token has two decimals. Where the distinction
-// matters, the test says so explicitly.
-func seedApp(t *testing.T, s *Store, slug string, balance int64) (App, Wallet) {
+// The balance is seeded the way a real one arrives — a recorded deposit —
+// rather than by writing a number onto the wallet. Verify walks the deposit
+// records, so a balance with nothing behind it starts every test dirty.
+func seedWallet(t *testing.T, s *Store, ref string, balance int64) Wallet {
 	t.Helper()
-	top := Wallet{
-		ID: uuid.New(), App: slug, Kind: KindTopLevel, Address: addr(0x01),
-		Active: true, Balance: wei(balance), CreatedAt: time.Now().UTC(),
-	}
-	app := App{
-		Slug: slug, Wallet: top.ID,
-		Fee:       FeePolicy{Flat: 100},
-		Ledger:    money.Cents(balance),
-		CreatedAt: time.Now().UTC(),
+	return seedWalletAt(t, s, ref, addr(0x01), common.Address{}, balance)
+}
+
+// seedProxy creates a forwarding wallet: one whose deposits are owed onward to
+// drainTo rather than payable from it.
+func seedProxy(t *testing.T, s *Store, ref string, drainTo common.Address, balance int64) Wallet {
+	t.Helper()
+	return seedWalletAt(t, s, ref, addr(0x02), drainTo, balance)
+}
+
+func seedWalletAt(t *testing.T, s *Store, ref string, at, drainTo common.Address, balance int64) Wallet {
+	t.Helper()
+	w := Wallet{
+		ID: uuid.New(), Ref: ref, Kind: KindManaged, Address: at, DrainTo: drainTo,
+		Active: true, Balance: wei(balance),
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	update(t, s, func(tx *Tx) error {
-		if err := tx.PutWallet(top); err != nil {
-			return err
-		}
-		if err := tx.PutApp(app); err != nil {
+		if err := tx.PutWallet(w); err != nil {
 			return err
 		}
 		if balance == 0 {
 			return nil
 		}
-		// The deposit that justifies the ledger, already swept.
-		src := Wallet{
-			ID: uuid.New(), App: slug, Kind: KindDeposit, Ref: "seed", Address: addr(0x02),
-			Balance: new(big.Int), CreatedAt: time.Now().UTC(),
-		}
-		if err := tx.PutWallet(src); err != nil {
-			return err
-		}
+		// (block, log_index) is globally unique on a chain — a log index counts
+		// across every receipt in the block — so the cursor index needs no
+		// scoping. Seeded deposits have to respect that or they collide in a
+		// way a real chain never would.
 		_, err := tx.PutDeposit(Deposit{
-			Wallet: src.ID, App: slug, Block: 1, LogIndex: 0, TxHash: hash(0xEE),
-			From: addr(0xF0), AmountWei: wei(balance), Cents: money.Cents(balance),
-			Status: DepositCredited, DrainTx: hash(0xED), CreatedAt: time.Now().UTC(),
+			Wallet: w.ID, Block: 1, LogIndex: uint32(at[common.AddressLength-1]),
+			TxHash: hash(at[common.AddressLength-1]),
+			From:   addr(0xF0), Amount: wei(balance),
+			Status: DepositReceived, CreatedAt: time.Now().UTC(),
 		})
 		return err
 	})
-	return app, top
+	return w
 }
 
 func TestOpenIsIdempotentAndPersists(t *testing.T) {
@@ -167,7 +160,7 @@ func TestOpenRejectsFutureSchema(t *testing.T) {
 
 func TestSnapshotIsReadable(t *testing.T) {
 	s := open(t)
-	_, top := seedApp(t, s, "df", 500)
+	top := seedWallet(t, s, "hot", 500)
 
 	var buf bytes.Buffer
 	n, err := s.Snapshot(&buf)
@@ -207,7 +200,7 @@ func TestOpenReadOnlyReadsASnapshot(t *testing.T) {
 	// The live database is exclusively locked by the running service, which is
 	// exactly why inspection happens on snapshots.
 	s := open(t)
-	_, top := seedApp(t, s, "df", 1234)
+	top := seedWallet(t, s, "hot", 1234)
 
 	path := filepath.Join(t.TempDir(), "snap.db")
 	file, err := os.Create(path)

@@ -38,7 +38,7 @@ func (w *Watcher) apply(tx *store.Tx, block uint64, receipts []*types.Receipt, n
 	touched := make(map[uuid.UUID]struct{})
 
 	for _, rc := range receipts {
-		if err := w.confirm(tx, rc, now, touched); err != nil {
+		if err := w.confirm(tx, rc, block, now, touched); err != nil {
 			return err
 		}
 		for _, lg := range rc.Logs {
@@ -53,7 +53,7 @@ func (w *Watcher) apply(tx *store.Tx, block uint64, receipts []*types.Receipt, n
 // confirm resolves a finalized transaction against the in-flight set and
 // advances the flow that was waiting on it. The watchlist and the router are the
 // same structure, so this is one lookup.
-func (w *Watcher) confirm(tx *store.Tx, rc *types.Receipt, now time.Time, touched map[uuid.UUID]struct{}) error {
+func (w *Watcher) confirm(tx *store.Tx, rc *types.Receipt, block uint64, now time.Time, touched map[uuid.UUID]struct{}) error {
 	ref, found, err := tx.TxRefByHash(rc.TxHash)
 	if err != nil {
 		return err
@@ -81,15 +81,18 @@ func (w *Watcher) confirm(tx *store.Tx, rc *types.Receipt, now time.Time, touche
 	if err := w.forget(tx, rc.TxHash, ref); err != nil {
 		return err
 	}
-	next, err := engine.Advance(tx, f, success, now)
+	// The block is passed down because a settled debit is ordered by it: that is
+	// the feed a caller polls, and this is the only place the number is known
+	// (§42).
+	next, err := engine.Advance(tx, f, block, success, now)
 	if err != nil {
 		return fmt.Errorf("watcher: advance flow %s: %w", f.ID, err)
 	}
 	touched[f.Wallet] = struct{}{}
 
-	metrics.FlowTransitions.WithLabelValues(f.Kind.String(), next.State.String()).Inc()
+	metrics.FlowTransitions.WithLabelValues(f.Label(), next.State.String()).Inc()
 	w.log.Info("flow advanced",
-		"flow", f.ID, "kind", f.Kind, "from", f.State, "to", next.State,
+		"flow", f.ID, "kind", f.Label(), "from", f.State, "to", next.State,
 		"tx", rc.TxHash.Hex(), "ok", success)
 	return nil
 }
@@ -139,41 +142,34 @@ func (w *Watcher) transfer(tx *store.Tx, rc *types.Receipt, lg *types.Log, block
 	return nil
 }
 
-// credit adds an incoming transfer to a wallet's custody and, if the wallet is a
-// deposit address and the transfer is worth at least a whole cent, records it as
-// a deposit — one future ledger entry, floored once, here and nowhere else.
+// credit adds an incoming transfer to a wallet's custody and, unless the wallet
+// is bsc's own master, records it as a deposit.
+//
+// There is no threshold and no rounding. Under the ledger this function floored
+// the amount to cents and dropped anything worth less than one, because a
+// sub-cent credit was a ledger entry that changed nothing. With the chain's own
+// units on the wire there is no floor to apply and no dust to create: every
+// transfer is recordable exactly as it arrived (§36).
 func (w *Watcher) credit(tx *store.Tx, id uuid.UUID, ev *usdt.UsdtTransfer, rc *types.Receipt, lg *types.Log, block uint64, now time.Time) error {
 	wallet, err := tx.Credit(id, ev.Value)
 	if err != nil {
 		return err
 	}
-	// A drain arriving at a top-level wallet is our own money moving, not an
-	// external payment: crediting it is right, recording it as a deposit would
-	// double-count it in the app's feed.
-	if wallet.Kind != store.KindDeposit {
+	// The master is the service's own wallet: its token balance is tracked like
+	// any other so `bsc check` can report it, but money arriving there is not a
+	// deposit anybody is waiting to hear about.
+	if wallet.Kind != store.KindManaged {
 		return nil
 	}
-	// Flooring to cents is the only rounding in the service and it always
-	// rounds towards the house. A transfer not worth a whole cent gets no
-	// record at all: there is no ledger entry to write, and a feed item that
-	// credits nothing is worse than silence.
-	cents, ok := w.scale.ToCents(ev.Value)
-	if !ok {
-		// Unrepresentable as cents. On a real token this cannot happen, so it
-		// is a loud refusal rather than a clamped number in the books.
-		metrics.DepositsIgnored.Inc()
-		w.log.Error("transfer too large to record",
-			"app", wallet.App, "ref", wallet.Ref, "amount", ev.Value, "tx", rc.TxHash.Hex())
-		return nil
-	}
-	if cents == 0 {
-		metrics.DepositsIgnored.Inc()
-		return nil
-	}
+	// A drain arriving at the wallet it was aimed at *is* recorded. It is a real
+	// transfer onto a wallet the caller owns, and with no ledger to double-count
+	// into there is nothing to protect against — the caller sees the deposit and
+	// the matching `forwarded` deposit upstream and can tell they are two ends
+	// of one movement by the drain's tx hash.
 	created, err := tx.PutDeposit(store.Deposit{
-		Wallet: id, App: wallet.App, Block: block, LogIndex: uint32(lg.Index),
-		TxHash: rc.TxHash, From: ev.From, AmountWei: ev.Value, Cents: cents,
-		Status: store.DepositPending, CreatedAt: now.UTC(),
+		Wallet: id, Block: block, LogIndex: uint32(lg.Index),
+		TxHash: rc.TxHash, From: ev.From, Amount: ev.Value,
+		Status: store.DepositReceived, CreatedAt: now.UTC(),
 	})
 	if err != nil {
 		return err
@@ -181,8 +177,8 @@ func (w *Watcher) credit(tx *store.Tx, id uuid.UUID, ev *usdt.UsdtTransfer, rc *
 	if created {
 		metrics.DepositsRecorded.Inc()
 		w.log.Info("deposit",
-			"app", wallet.App, "ref", wallet.Ref, "cents", cents, "wei", ev.Value,
-			"dust", w.scale.Dust(ev.Value), "tx", rc.TxHash.Hex(), "log", lg.Index)
+			"ref", wallet.Ref, "amount", ev.Value,
+			"tx", rc.TxHash.Hex(), "log", lg.Index)
 	}
 	return nil
 }
@@ -204,28 +200,47 @@ func (w *Watcher) evaluateTouched(tx *store.Tx, touched map[uuid.UUID]struct{}, 
 			return err
 		}
 		if started {
-			metrics.FlowsStarted.WithLabelValues(store.FlowDrain.String()).Inc()
-			w.log.Info("drain started", "app", wallet.App, "ref", wallet.Ref, "balance", wallet.Balance)
+			metrics.FlowsStarted.WithLabelValues("drain").Inc()
+			w.log.Info("work started", "ref", wallet.Ref, "balance", wallet.Balance)
 		}
 	}
 	return nil
 }
 
-// evaluateApps runs the app-level rules — pending withdrawals and due house
-// sweeps. Unlike the drain rule this is not driven by block contents, so it
-// runs once per commit rather than per block.
-func (w *Watcher) evaluateApps(tx *store.Tx, now time.Time) error {
-	apps, err := tx.Apps()
+// evaluatePending gives every wallet with an outstanding withdrawal a chance to
+// start it. Unlike the drain rule this is not driven by block contents — a
+// withdrawal arrives over HTTP, not from the chain — so it runs once per commit
+// rather than per block.
+//
+// It scans the outstanding set rather than every wallet, so its cost is
+// proportional to withdrawals in flight rather than to how many wallets exist.
+// That replaces the pass over every app, which was proportional to the number
+// of apps whether or not any of them had work.
+func (w *Watcher) evaluatePending(tx *store.Tx, now time.Time) error {
+	open, err := tx.OpenWithdrawals()
 	if err != nil {
 		return err
 	}
-	for _, a := range apps {
-		started, err := engine.EvaluateApp(tx, a, w.cfg, now)
+	seen := map[uuid.UUID]bool{}
+	for _, wd := range open {
+		if seen[wd.Wallet] {
+			continue
+		}
+		seen[wd.Wallet] = true
+		wallet, found, err := tx.Wallet(wd.Wallet)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		started, err := engine.EvaluateWallet(tx, wallet, w.cfg, now)
 		if err != nil {
 			return err
 		}
 		if started {
-			w.log.Info("app work started", "app", a.Slug)
+			metrics.FlowsStarted.WithLabelValues("payout").Inc()
+			w.log.Info("withdrawal started", "ref", wallet.Ref, "withdrawal", wd.ID)
 		}
 	}
 	return nil

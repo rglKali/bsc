@@ -6,11 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"bsc/money"
 	"bsc/store"
-
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/google/uuid"
 )
 
 type depositsPage struct {
@@ -18,20 +14,24 @@ type depositsPage struct {
 	Cursor   string        `json:"cursor"`
 }
 
-// deposit records one, as the watcher would after seeing a Transfer log.
-func (f *fixture) deposit(slug, ref string, block uint64, logIndex uint32, amount int64) {
+// deposit records an incoming transfer on a wallet, as the watcher would.
+func (f *fixture) deposit(ref string, block uint64, logIndex uint32, amount int64) {
 	f.t.Helper()
 	if err := f.st.Update(func(tx *store.Tx) error {
-		w, ok, err := tx.WalletByRef(slug, ref)
+		w, ok, err := tx.WalletByRef(ref)
 		if err != nil || !ok {
-			f.t.Fatalf("wallet for ref %q: ok=%v err=%v", ref, ok, err)
+			f.t.Fatalf("wallet %q: ok=%v err=%v", ref, ok, err)
 		}
-		var txHash common.Hash
-		txHash[0], txHash[1] = byte(block), byte(logIndex)
+		if _, err := tx.Credit(w.ID, big.NewInt(amount)); err != nil {
+			return err
+		}
+		var txh [32]byte
+		txh[31] = byte(block)
+		txh[30] = byte(logIndex)
 		_, err = tx.PutDeposit(store.Deposit{
-			Wallet: w.ID, App: slug, Block: block, LogIndex: logIndex, TxHash: txHash,
-			From: common.HexToAddress("0xf0"), AmountWei: big.NewInt(amount), Cents: money.Cents(amount),
-			Status: store.DepositPending, CreatedAt: time.Now().UTC(),
+			Wallet: w.ID, Block: block, LogIndex: logIndex, TxHash: txh,
+			From: hexAddr(0xF0), Amount: big.NewInt(amount),
+			Status: store.DepositReceived, CreatedAt: time.Now().UTC(),
 		})
 		return err
 	}); err != nil {
@@ -39,179 +39,98 @@ func (f *fixture) deposit(slug, ref string, block uint64, logIndex uint32, amoun
 	}
 }
 
-func TestDepositFeedIsCursored(t *testing.T) {
+// Deposits are unsolicited — nobody can know one is coming — so the caller asks
+// "what is new since I last looked".
+func TestDepositFeedIsOrderedAndResumable(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
-	f.deposit("df", "cust-1", 100, 3, 500)
-	f.deposit("df", "cust-1", 101, 0, 600)
+	hot := f.wallet("hot")
+	f.proxy("cust-1", hot.Address)
+	f.deposit("cust-1", 10, 0, 100)
+	f.deposit("cust-1", 20, 0, 200)
+	f.deposit("cust-1", 30, 0, 300)
 
 	var page depositsPage
-	f.json(f.do("GET", "/v1/apps/df/deposits?limit=1", nil), http.StatusOK, &page)
-	if len(page.Deposits) != 1 || page.Deposits[0].AmountCents != "500" {
-		t.Fatalf("first page = %+v", page.Deposits)
-	}
-	// The app sees its own ref rather than an address it never chose, and the
-	// deposit's id doubles as the cursor.
-	first := page.Deposits[0].ID
-	if first == "" || page.Deposits[0].Ref != "cust-1" {
-		t.Fatalf("deposit view = %+v", page.Deposits[0])
-	}
-	if page.Cursor != first {
-		t.Fatalf("cursor = %q, want the last deposit's id %q", page.Cursor, first)
-	}
-
-	f.json(f.do("GET", "/v1/apps/df/deposits?since="+page.Cursor, nil), http.StatusOK, &page)
-	if len(page.Deposits) != 1 || page.Deposits[0].AmountCents != "600" {
-		t.Fatalf("second page = %+v", page.Deposits)
-	}
-	// Opaque, but ordered: an app may compare two ids without parsing either.
-	if page.Deposits[0].ID <= first {
-		t.Fatalf("ids did not increase: %q then %q", first, page.Deposits[0].ID)
-	}
-
-	// Passing the cursor back when nothing is new must not lose the place.
-	prev := page.Cursor
-	f.json(f.do("GET", "/v1/apps/df/deposits?since="+prev, nil), http.StatusOK, &page)
-	if len(page.Deposits) != 0 || page.Cursor != prev {
-		t.Fatalf("empty read moved the cursor: %q -> %q", prev, page.Cursor)
-	}
-}
-
-func TestDepositFeedIsScopedPerApp(t *testing.T) {
-	f := newFixture(t)
-	f.register("df")
-	f.register("other")
-	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "a"}), http.StatusCreated, nil)
-	f.json(f.do("POST", "/v1/apps/other/addresses", depositAddressBody{Ref: "a"}), http.StatusCreated, nil)
-	f.deposit("df", "a", 100, 0, 1)
-	f.deposit("other", "a", 101, 0, 2)
-
-	var page depositsPage
-	f.json(f.do("GET", "/v1/apps/df/deposits", nil), http.StatusOK, &page)
-	if len(page.Deposits) != 1 || page.Deposits[0].AmountCents != "1" {
-		t.Fatalf("df feed = %+v", page.Deposits)
-	}
-}
-
-func TestUncreditedDepositsAreListable(t *testing.T) {
-	// Crediting is a status rather than a feed entry, because one sweep credits
-	// several deposits at once.
-	f := newFixture(t)
-	f.register("df")
-	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
-	f.deposit("df", "cust-1", 100, 0, 300)
-	f.deposit("df", "cust-1", 100, 1, 400)
-
-	var page depositsPage
-	f.json(f.do("GET", "/v1/apps/df/deposits?status=pending", nil), http.StatusOK, &page)
+	f.json(f.do("GET", "/v1/deposits?limit=2", nil), http.StatusOK, &page)
 	if len(page.Deposits) != 2 {
-		t.Fatalf("awaiting drain = %d, want 2", len(page.Deposits))
+		t.Fatalf("page = %d deposits, want 2", len(page.Deposits))
+	}
+	if page.Deposits[0].Amount != "100" || page.Deposits[1].Amount != "200" {
+		t.Fatalf("out of order: %+v", page.Deposits)
 	}
 
-	// Credit them, as a landed sweep would.
-	var wallet uuid.UUID
-	if err := f.st.Update(func(tx *store.Tx) error {
-		w, _, err := tx.WalletByRef("df", "cust-1")
-		if err != nil {
-			return err
-		}
-		wallet = w.ID
-		_, cents, err := tx.CreditDeposits("df", wallet, common.HexToHash("0xaa"))
-		if err != nil {
-			return err
-		}
-		_, err = tx.CreditLedger("df", cents)
-		return err
-	}); err != nil {
-		t.Fatalf("credit: %v", err)
+	var next depositsPage
+	f.json(f.do("GET", "/v1/deposits?since="+page.Cursor, nil), http.StatusOK, &next)
+	if len(next.Deposits) != 1 || next.Deposits[0].Amount != "300" {
+		t.Fatalf("resume = %+v", next.Deposits)
 	}
 
-	f.json(f.do("GET", "/v1/apps/df/deposits?status=pending", nil), http.StatusOK, &page)
-	if len(page.Deposits) != 0 {
-		t.Fatalf("still awaiting drain: %+v", page.Deposits)
-	}
-	f.json(f.do("GET", "/v1/apps/df/deposits", nil), http.StatusOK, &page)
-	for _, d := range page.Deposits {
-		if d.Status != "credited" {
-			t.Fatalf("deposit = %+v, want credited", d)
-		}
+	// Passing the cursor back when nothing is new returns it unchanged, so a
+	// caller that keeps passing it never loses its place.
+	var empty depositsPage
+	f.json(f.do("GET", "/v1/deposits?since="+next.Cursor, nil), http.StatusOK, &empty)
+	if len(empty.Deposits) != 0 || empty.Cursor != next.Cursor {
+		t.Fatalf("cursor moved with nothing new: %q -> %q", next.Cursor, empty.Cursor)
 	}
 }
 
-func TestDepositQueryValidation(t *testing.T) {
+// The feed is global: one caller owns this service, and splitting it per app
+// was a tenancy boundary bsc no longer draws (§37).
+func TestDepositFeedSpansEveryWallet(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	for _, q := range []string{"?since=nonsense", "?status=weird", "?limit=0", "?limit=abc"} {
-		if w := f.do("GET", "/v1/apps/df/deposits"+q, nil); w.Code != http.StatusBadRequest {
-			t.Fatalf("%s: status %d, want 400", q, w.Code)
-		}
+	f.wallet("a")
+	f.wallet("b")
+	f.deposit("a", 10, 0, 100)
+	f.deposit("b", 11, 0, 200)
+
+	var all depositsPage
+	f.json(f.do("GET", "/v1/deposits", nil), http.StatusOK, &all)
+	if len(all.Deposits) != 2 {
+		t.Fatalf("feed = %d, want 2", len(all.Deposits))
+	}
+
+	var one depositsPage
+	f.json(f.do("GET", "/v1/wallets/a/deposits", nil), http.StatusOK, &one)
+	if len(one.Deposits) != 1 || one.Deposits[0].Wallet != "a" {
+		t.Fatalf("per-wallet view = %+v", one.Deposits)
 	}
 }
 
-func TestPendingBalanceCountsUndrainedDeposits(t *testing.T) {
-	// Money detected but not yet swept is real and worth showing, but it is not
-	// spendable until it reaches the wallet payouts are drawn from.
+// The cursor is opaque but ordered: a caller may compare two ids and pass one
+// back, never parse one.
+func TestDepositIdIsTheCursor(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
-	f.deposit("df", "cust-1", 10, 0, 750)
+	f.wallet("a")
+	f.deposit("a", 10, 4, 100)
 
-	var app appView
-	f.json(f.do("GET", "/v1/apps/df", nil), http.StatusOK, &app)
-	if app.Balance.PendingCents != "750" {
-		t.Fatalf("pending = %s, want 750", app.Balance.PendingCents)
+	var page depositsPage
+	f.json(f.do("GET", "/v1/deposits", nil), http.StatusOK, &page)
+	if len(page.Deposits) != 1 {
+		t.Fatalf("deposits = %d", len(page.Deposits))
 	}
-	if app.Balance.AvailableCents != "0" {
-		t.Fatalf("available = %s: undrained money must not be spendable", app.Balance.AvailableCents)
+	if page.Deposits[0].ID != page.Cursor {
+		t.Fatalf("id %q != cursor %q", page.Deposits[0].ID, page.Cursor)
+	}
+	if w := f.do("GET", "/v1/deposits?since=not-a-cursor", nil); w.Code != http.StatusBadRequest {
+		t.Fatalf("bad cursor: status %d, want 400", w.Code)
 	}
 }
 
-// TestPendingExcludesUncreditedDust: a deposit wallet also collects sub-cent
-// remainders that were never credited to anyone. Reporting them as the app's
-// pending money would promise a balance that will never arrive (§22).
-func TestPendingExcludesUncreditedDust(t *testing.T) {
+func TestWalletDepositsFilterByStatus(t *testing.T) {
 	f := newFixture(t)
-	f.register("df")
-	f.json(f.do("POST", "/v1/apps/df/addresses", depositAddressBody{Ref: "cust-1"}), http.StatusCreated, nil)
-	f.deposit("df", "cust-1", 10, 0, 750)
-	// Custody rises by more than was ever recorded, as flooring guarantees.
-	if err := f.st.Update(func(tx *store.Tx) error {
-		w, _, err := tx.WalletByRef("df", "cust-1")
-		if err != nil {
-			return err
-		}
-		_, err = tx.Credit(w.ID, big.NewInt(999))
-		return err
-	}); err != nil {
-		t.Fatalf("credit: %v", err)
-	}
+	hot := f.wallet("hot")
+	f.proxy("cust-1", hot.Address)
+	f.deposit("cust-1", 10, 0, 100)
 
-	var app appView
-	f.json(f.do("GET", "/v1/apps/df", nil), http.StatusOK, &app)
-	if app.Balance.PendingCents != "750" {
-		t.Fatalf("pending = %s, want only the recorded deposits", app.Balance.PendingCents)
+	var got depositsPage
+	f.json(f.do("GET", "/v1/wallets/cust-1/deposits?status=received", nil), http.StatusOK, &got)
+	if len(got.Deposits) != 1 {
+		t.Fatalf("received = %d, want 1", len(got.Deposits))
 	}
-}
-
-func TestBalanceEndpoint(t *testing.T) {
-	f := newFixture(t)
-	f.register("df")
-	f.credit("df", 500)
-
-	var b balanceView
-	f.json(f.do("GET", "/v1/apps/df/balance", nil), http.StatusOK, &b)
-	if b.AvailableCents != "500" || b.ReservedCents != "0" || b.PendingCents != "0" {
-		t.Fatalf("balance = %+v", b)
+	f.json(f.do("GET", "/v1/wallets/cust-1/deposits?status=forwarded", nil), http.StatusOK, &got)
+	if len(got.Deposits) != 0 {
+		t.Fatalf("forwarded = %d, want 0", len(got.Deposits))
 	}
-	if b.TotalCents != "500" {
-		t.Fatalf("total = %s, want the three parts summed", b.TotalCents)
-	}
-}
-
-func TestHealthz(t *testing.T) {
-	f := newFixture(t)
-	if w := f.do("GET", "/healthz", nil); w.Code != http.StatusOK {
-		t.Fatalf("status = %d", w.Code)
+	if w := f.do("GET", "/v1/wallets/cust-1/deposits?status=nonsense", nil); w.Code != http.StatusBadRequest {
+		t.Fatalf("bad status: %d, want 400", w.Code)
 	}
 }

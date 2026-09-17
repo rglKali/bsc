@@ -18,14 +18,8 @@ func (t *Tx) PutFlow(f Flow) error {
 	if f.ID == uuid.Nil {
 		return errors.New("store: flow id must be set")
 	}
-	// A gas top-up is the service's own work on its own wallet, so it names no
-	// app — the same exemption the master wallet record gets.
-	if f.Kind == FlowGasTopUp {
-		if f.App != "" {
-			return fmt.Errorf("store: a gas top-up must not belong to an app (got %q)", f.App)
-		}
-	} else if err := ValidSlug(f.App); err != nil {
-		return err
+	if f.Wallet == uuid.Nil {
+		return errors.New("store: flow must name a wallet")
 	}
 	return put(t, bFlow, f.ID[:], f.encode)
 }

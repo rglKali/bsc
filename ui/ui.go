@@ -4,7 +4,7 @@
 // It is disabled by default and, when on, exists only on the one listener —
 // which is loopback-only and unauthenticated by design. It is a sandbox and an
 // operator's window, not a product surface: there is no auth, no notion of who
-// is looking, and anyone who can load it can move every app's money (§29).
+// is looking, and anyone who can load it can move every wallet's money (§29).
 //
 // The page is deliberately plain. No build step, no framework, no CDN: the
 // service is one binary with one file on disk, and a dashboard that needed npm

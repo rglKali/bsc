@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"bsc/flow"
-	"bsc/money"
 	"bsc/store"
 	"bsc/usdt"
 
@@ -21,10 +20,9 @@ func (h *harness) startFlow(kind store.FlowKind, w store.Wallet, state store.Flo
 	h.t.Helper()
 	params.Kind = kind
 	params.Wallet = w.ID
-	params.App = w.App
 	params.Active = true
 	if params.To == (common.Address{}) {
-		params.To = h.top.Address
+		params.To = h.hot.Address
 	}
 	f, err := flow.Begin(params)
 	if err != nil {
@@ -51,9 +49,9 @@ func (h *harness) startFlow(kind store.FlowKind, w store.Wallet, state store.Flo
 
 func TestConfirmationAdvancesAndClearsTheJournal(t *testing.T) {
 	h := newHarness(t, 1)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	txh := hash(0x31)
-	f := h.startFlow(store.FlowDrain, h.deposit, store.StateFunding, txh, flow.Params{})
+	f := h.startFlow(store.FlowTransfer, h.proxy, store.StateFunding, txh, flow.Params{})
 	h.chain.put(1, receipt(txh, true))
 
 	h.runOnce()
@@ -88,66 +86,78 @@ func TestApprovalConfirmationMarksTheWalletActive(t *testing.T) {
 	// Leaving `approving` is what activates a wallet, whichever kind of flow
 	// happened to be the one that ran the activation.
 	h := newHarness(t, 1)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	txh := hash(0x32)
-	h.startFlow(store.FlowDrain, h.deposit, store.StateApproving, txh, flow.Params{})
+	h.startFlow(store.FlowTransfer, h.proxy, store.StateApproving, txh, flow.Params{})
 	h.chain.put(1, receipt(txh, true))
 
 	h.runOnce()
 
-	if w := h.wallet(h.deposit.ID); !w.Active {
+	if w := h.walletOf(h.proxy.ID); !w.Active {
 		t.Fatal("wallet not marked active after its approve confirmed")
 	}
 	flows := h.flows()
-	if len(flows) != 1 || flows[0].State != store.StateSweeping {
+	if len(flows) != 1 || flows[0].State != store.StateMoving {
 		t.Fatalf("flows = %+v, want one sweeping", flows)
 	}
 }
 
 func TestDrainCompletionCreditsEveryWaitingDeposit(t *testing.T) {
 	h := newHarness(t, 2)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
-	h.addrs.Add(h.top.Address, h.top.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
+	h.addrs.Add(h.hot.Address, h.hot.ID)
 
-	// Two recorded deposits awaiting a sweep.
+	// Two recorded deposits awaiting a sweep. Their log indexes avoid the
+	// sweep's own, since (block, log_index) is unique across a whole block.
 	h.update(func(tx *store.Tx) error {
 		for i, amount := range []int64{300, 400} {
 			if _, err := tx.PutDeposit(store.Deposit{
-				Wallet: h.deposit.ID, App: "df", Block: 1, LogIndex: uint32(i),
-				TxHash: hash(byte(0x40 + i)), AmountWei: wei(amount), Cents: money.Cents(amount),
-				Status: store.DepositPending, CreatedAt: time.Now(),
+				Wallet: h.proxy.ID, Block: 1, LogIndex: uint32(10 + i),
+				TxHash: hash(byte(0x40 + i)), Amount: wei(amount),
+				Status: store.DepositReceived, CreatedAt: time.Now(),
 			}); err != nil {
 				return err
 			}
 		}
-		_, err := tx.Credit(h.deposit.ID, wei(700))
+		_, err := tx.Credit(h.proxy.ID, wei(700))
 		return err
 	})
 
 	sweep := hash(0x41)
-	h.startFlow(store.FlowDrain, h.deposit, store.StateSweeping, sweep, flow.Params{})
+	h.startFlow(store.FlowTransfer, h.proxy, store.StateMoving, sweep, flow.Params{})
 	h.chain.put(1, receipt(sweep, true,
-		transferLog(usdt.MainnetAddress, h.deposit.Address, h.top.Address, wei(700), 0)))
+		transferLog(usdt.MainnetAddress, h.proxy.Address, h.hot.Address, wei(700), 0)))
 
 	h.runOnce()
 
+	// Three records now: the two that were forwarded, plus the arrival of that
+	// same money on the wallet it was aimed at. The caller pairs the two ends
+	// by the drain's hash (§34).
 	deps := h.deposits()
-	if len(deps) != 2 {
-		t.Fatalf("deposits = %d", len(deps))
+	if len(deps) != 3 {
+		t.Fatalf("deposits = %d, want 3", len(deps))
 	}
+	forwarded := 0
 	for _, d := range deps {
-		if d.Status != store.DepositCredited {
-			t.Fatalf("deposit %d-%d status = %s, want credited", d.Block, d.LogIndex, d.Status)
+		if d.Wallet != h.proxy.ID {
+			continue
 		}
-		if d.DrainTx != sweep {
-			t.Fatalf("deposit not stamped with the sweep: %s", d.DrainTx.Hex())
+		forwarded++
+		if d.Status != store.DepositForwarded {
+			t.Fatalf("deposit %d-%d status = %s, want forwarded", d.Block, d.LogIndex, d.Status)
 		}
+		if d.SweptBy == uuid.Nil {
+			t.Fatalf("deposit not linked to the debit that carried it: %+v", d)
+		}
+	}
+	if forwarded != 2 {
+		t.Fatalf("forwarded %d deposits, want 2", forwarded)
 	}
 	// The flow is gone and the wallet is idle again.
 	if got := h.flows(); len(got) != 0 {
 		t.Fatalf("flow survived settlement: %+v", got)
 	}
-	if w := h.wallet(h.deposit.ID); !w.Idle() {
+	if w := h.walletOf(h.proxy.ID); !w.Idle() {
 		t.Fatalf("wallet still owned by %s", w.Flow)
 	}
 }
@@ -156,18 +166,18 @@ func TestRevertFailsTheFlowAndBacksTheWalletOff(t *testing.T) {
 	// Without the backoff, the declarative drain rule would immediately start
 	// another attempt and burn gas as fast as blocks arrive.
 	h := newHarness(t, 1)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	h.update(func(tx *store.Tx) error {
-		_, err := tx.Credit(h.deposit.ID, wei(500))
+		_, err := tx.Credit(h.proxy.ID, wei(500))
 		return err
 	})
 	txh := hash(0x51)
-	h.startFlow(store.FlowDrain, h.deposit, store.StateSweeping, txh, flow.Params{})
+	h.startFlow(store.FlowTransfer, h.proxy, store.StateMoving, txh, flow.Params{})
 	h.chain.put(1, receipt(txh, false)) // reverted
 
 	h.runOnce()
 
-	w := h.wallet(h.deposit.ID)
+	w := h.walletOf(h.proxy.ID)
 	if w.FailedAttempts != 1 {
 		t.Fatalf("failed attempts = %d, want 1", w.FailedAttempts)
 	}
@@ -181,35 +191,27 @@ func TestRevertFailsTheFlowAndBacksTheWalletOff(t *testing.T) {
 	}
 }
 
-func TestWithdrawalSettlementReleasesItsReserve(t *testing.T) {
+func TestWithdrawalSettlementConfirmsAndReleasesTheCommitment(t *testing.T) {
 	h := newHarness(t, 1)
-	h.addrs.Add(h.top.Address, h.top.ID)
+	h.addrs.Add(h.hot.Address, h.hot.ID)
 
 	wd := store.Withdrawal{
-		ID: uuid.New(), App: "df", Destination: addr(0xDD),
-		Amount: 50, Fee: 1, Payout: 50, Debit: 51,
-		Status: store.WithdrawalPending, CreatedAt: time.Now(),
+		ID: uuid.New(), Wallet: h.hot.ID, Reason: store.ReasonPayout, Destination: addr(0xDD),
+		Amount: wei(50), Status: store.WithdrawalPending, CreatedAt: time.Now(),
 	}
 	h.update(func(tx *store.Tx) error {
-		if _, err := tx.Credit(h.top.ID, wei(1000)); err != nil {
+		if _, err := tx.Credit(h.hot.ID, wei(1000)); err != nil {
 			return err
 		}
-		if _, err := tx.CreditLedger("df", 1000); err != nil {
-			return err
-		}
-		if err := tx.PutWithdrawal(wd); err != nil {
-			return err
-		}
-		_, err := tx.ReserveLedger("df", wd.Debit)
-		return err
+		return tx.PutWithdrawal(wd)
 	})
 
 	txh := hash(0x61)
-	h.startFlow(store.FlowWithdrawal, h.top, store.StatePaying, txh, flow.Params{
-		Amount: testScale.Wei(wd.Payout), To: wd.Destination, Withdrawal: wd.ID,
+	h.startFlow(store.FlowTransfer, h.hot, store.StateMoving, txh, flow.Params{
+		Amount: wd.Amount, To: wd.Destination, Withdrawal: wd.ID,
 	})
 	h.chain.put(1, receipt(txh, true,
-		transferLog(usdt.MainnetAddress, h.top.Address, wd.Destination, wei(50), 0)))
+		transferLog(usdt.MainnetAddress, h.hot.Address, wd.Destination, wei(50), 0)))
 
 	h.runOnce()
 
@@ -218,51 +220,47 @@ func TestWithdrawalSettlementReleasesItsReserve(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("withdrawal: ok=%v err=%v", ok, err)
 		}
-		if got.Status != store.WithdrawalDebited || got.TxHash != txh {
+		if got.Status != store.WithdrawalConfirmed || got.TxHash != txh {
 			t.Fatalf("withdrawal = %+v", got)
+		}
+		committed, err := tx.Committed(h.hot.ID)
+		if err != nil {
+			return err
+		}
+		if committed.Sign() != 0 {
+			t.Fatalf("committed = %s after settlement, want 0", committed)
 		}
 		return nil
 	})
-	// Payout and fee both leave the ledger; only the payout left the wallet.
-	a := h.app2()
-	if a.Reserved != 0 || a.Ledger != 949 {
-		t.Fatalf("ledger %d reserved %d, want 949 and 0", a.Ledger, a.Reserved)
-	}
-	if w := h.wallet(h.top.ID); w.Balance.Cmp(wei(950)) != 0 {
+	// Custody is debited from the observed Transfer, not by the settlement:
+	// one source of truth for what a wallet holds.
+	if w := h.walletOf(h.hot.ID); w.Balance.Cmp(wei(950)) != 0 {
 		t.Fatalf("custody = %s, want 950 after the payout left", w.Balance)
 	}
 }
 
-func TestRevertedWithdrawalChargesNothingAndStaysPending(t *testing.T) {
-	// A payout that never happened is not charged — and it is not failed
-	// either: it keeps its reservation and waits for the retry (§28).
+func TestRevertedWithdrawalStaysPendingAndKeepsItsCommitment(t *testing.T) {
+	// A payout that never happened is not failed either: it keeps its place in
+	// the outstanding set and waits for the retry (§28).
 	h := newHarness(t, 1)
-	h.addrs.Add(h.top.Address, h.top.ID)
+	h.addrs.Add(h.hot.Address, h.hot.ID)
 
 	wd := store.Withdrawal{
-		ID: uuid.New(), App: "df", Destination: addr(0xDD),
-		Amount: 50, Fee: 1, Payout: 50, Debit: 51,
-		Status: store.WithdrawalPending, CreatedAt: time.Now(),
+		ID: uuid.New(), Wallet: h.hot.ID, Reason: store.ReasonPayout, Destination: addr(0xDD),
+		Amount: wei(50), Status: store.WithdrawalPending, CreatedAt: time.Now(),
 	}
 	h.update(func(tx *store.Tx) error {
-		if _, err := tx.Credit(h.top.ID, wei(1000)); err != nil {
+		if _, err := tx.Credit(h.hot.ID, wei(1000)); err != nil {
 			return err
 		}
-		if _, err := tx.CreditLedger("df", 1000); err != nil {
-			return err
-		}
-		if err := tx.PutWithdrawal(wd); err != nil {
-			return err
-		}
-		_, err := tx.ReserveLedger("df", wd.Debit)
-		return err
+		return tx.PutWithdrawal(wd)
 	})
 
 	txh := hash(0x62)
-	h.startFlow(store.FlowWithdrawal, h.top, store.StatePaying, txh, flow.Params{
-		Amount: testScale.Wei(wd.Payout), To: wd.Destination, Withdrawal: wd.ID,
+	h.startFlow(store.FlowTransfer, h.hot, store.StateMoving, txh, flow.Params{
+		Amount: wd.Amount, To: wd.Destination, Withdrawal: wd.ID,
 	})
-	h.chain.put(1, receipt(txh, false))
+	h.chain.put(1, receipt(txh, false)) // reverted: no Transfer log
 
 	h.runOnce()
 
@@ -271,16 +269,23 @@ func TestRevertedWithdrawalChargesNothingAndStaysPending(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if got.Status != store.WithdrawalPending || got.Error == "" {
-			t.Fatalf("withdrawal = %+v, want it still pending with a recorded reason", got)
+		if got.Status != store.WithdrawalPending {
+			t.Fatalf("status = %s, want it to stay pending", got.Status)
+		}
+		if got.Attempts != 1 {
+			t.Fatalf("attempts = %d, want 1", got.Attempts)
+		}
+		committed, err := tx.Committed(h.hot.ID)
+		if err != nil {
+			return err
+		}
+		if committed.Cmp(wei(50)) != 0 {
+			t.Fatalf("committed = %s, want the 50 still promised", committed)
 		}
 		return nil
 	})
-	// Nothing was charged: the ledger is untouched and the reservation still
-	// stands, because the payout is going to be attempted again.
-	if a := h.app2(); a.Reserved != 51 || a.Ledger != 1000 {
-		t.Fatalf("ledger %d reserved %d, want 1000/51 — charged nothing, released nothing",
-			a.Ledger, a.Reserved)
+	if w := h.walletOf(h.hot.ID); w.Balance.Cmp(wei(1000)) != 0 {
+		t.Fatalf("custody = %s, want 1000 — nothing moved", w.Balance)
 	}
 }
 
@@ -318,7 +323,7 @@ func TestBackfillBatchesBlocksIntoOneCommit(t *testing.T) {
 	// 8,000 blocks one-per-transaction is 8,000 fsyncs; batching is what makes
 	// catching up after an outage practical.
 	h := newHarness(t, 25)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	for b := uint64(1); b <= 25; b++ {
 		h.chain.put(b, receipt(hash(byte(b)), true))
 	}
@@ -348,26 +353,17 @@ func TestBackfillBatchesBlocksIntoOneCommit(t *testing.T) {
 
 func TestQueuedWithdrawalsWaitUntilCaughtUp(t *testing.T) {
 	// Balances are only current once we reach the head, and starting a payout
-	// from a stale balance could overdraw an app.
+	// from a stale one could overdraw the wallet.
 	h := newHarness(t, 25)
-	h.addrs.Add(h.top.Address, h.top.ID)
+	h.addrs.Add(h.hot.Address, h.hot.ID)
 	h.update(func(tx *store.Tx) error {
-		if _, err := tx.Credit(h.top.ID, wei(1000)); err != nil {
+		if _, err := tx.Credit(h.hot.ID, wei(1000)); err != nil {
 			return err
 		}
-		wd := store.Withdrawal{
-			ID: uuid.New(), App: "df", Destination: addr(0xDD),
-			Amount: 50, Payout: 50, Debit: 50,
-			Status: store.WithdrawalPending, CreatedAt: time.Now(),
-		}
-		if err := tx.PutWithdrawal(wd); err != nil {
-			return err
-		}
-		if _, err := tx.CreditLedger("df", 1000); err != nil {
-			return err
-		}
-		_, err := tx.ReserveLedger("df", wd.Debit)
-		return err
+		return tx.PutWithdrawal(store.Withdrawal{
+			ID: uuid.New(), Wallet: h.hot.ID, Reason: store.ReasonPayout, Destination: addr(0xDD),
+			Amount: wei(50), Status: store.WithdrawalPending, CreatedAt: time.Now(),
+		})
 	})
 	for b := uint64(1); b <= 25; b++ {
 		h.chain.put(b, receipt(hash(byte(b)), true))
@@ -399,7 +395,7 @@ func TestQueuedWithdrawalsWaitUntilCaughtUp(t *testing.T) {
 			break
 		}
 	}
-	if got := h.flows(); len(got) != 1 || got[0].Kind != store.FlowWithdrawal {
+	if got := h.flows(); len(got) != 1 || got[0].Kind != store.FlowTransfer {
 		t.Fatalf("withdrawal did not start once caught up: %+v", got)
 	}
 }

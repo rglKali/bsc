@@ -12,7 +12,6 @@ import (
 
 	"bsc/flow"
 	"bsc/keys"
-	"bsc/money"
 	"bsc/store"
 	"bsc/swap"
 	"bsc/usdt"
@@ -183,9 +182,8 @@ type fixture struct {
 	s     *Sender
 	ring  *keys.Ring
 
-	app store.App
-	top store.Wallet
-	dep store.Wallet
+	hot   store.Wallet // accumulates
+	proxy store.Wallet // forwards into hot
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -205,15 +203,8 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("keys.New: %v", err)
 	}
 	ch := newFakeChain()
-	// Two decimals: a cent is a wei, so every figure in these tests reads as
-	// both units at once.
-	scale, err := money.NewScale(2)
-	if err != nil {
-		t.Fatalf("scale: %v", err)
-	}
 	snd, err := New(st, ch, ring, Options{
 		ChainID: 56, Token: usdt.MainnetAddress, Tick: time.Millisecond,
-		FeeCollector: addr(0xFE), Scale: scale,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -221,25 +212,21 @@ func newFixture(t *testing.T) *fixture {
 
 	f := &fixture{t: t, st: st, chain: ch, s: snd, ring: ring}
 
-	topID, topKey, _ := ring.Generate()
-	depID, depKey, _ := ring.Generate()
-	f.top = store.Wallet{
-		ID: topID, App: "df", Kind: store.KindTopLevel, Address: topKey.Address,
+	hotID, hotKey, _ := ring.Generate()
+	proxyID, proxyKey, _ := ring.Generate()
+	f.hot = store.Wallet{
+		ID: hotID, Ref: "hot", Kind: store.KindManaged, Address: hotKey.Address,
 		Active: true, Balance: new(big.Int), CreatedAt: time.Now(),
 	}
-	f.dep = store.Wallet{
-		ID: depID, App: "df", Kind: store.KindDeposit, Ref: "cust-1", Address: depKey.Address,
-		Balance: new(big.Int), CreatedAt: time.Now(),
+	f.proxy = store.Wallet{
+		ID: proxyID, Ref: "cust-1", Kind: store.KindManaged, Address: proxyKey.Address,
+		DrainTo: hotKey.Address, Balance: new(big.Int), CreatedAt: time.Now(),
 	}
-	f.app = store.App{Slug: "df", Wallet: topID, CreatedAt: time.Now()}
 	f.update(func(tx *store.Tx) error {
-		if err := tx.PutWallet(f.top); err != nil {
+		if err := tx.PutWallet(f.hot); err != nil {
 			return err
 		}
-		if err := tx.PutWallet(f.dep); err != nil {
-			return err
-		}
-		return tx.PutApp(f.app)
+		return tx.PutWallet(f.proxy)
 	})
 	return f
 }
@@ -254,9 +241,9 @@ func (f *fixture) update(fn func(*store.Tx) error) {
 // begin puts a flow in the given state, ready for the sender to act on.
 func (f *fixture) begin(kind store.FlowKind, w store.Wallet, state store.FlowState, p flow.Params) store.Flow {
 	f.t.Helper()
-	p.Kind, p.Wallet, p.App, p.Active = kind, w.ID, w.App, true
+	p.Kind, p.Wallet, p.Active = kind, w.ID, true
 	if p.To == (common.Address{}) {
-		p.To = f.top.Address
+		p.To = f.hot.Address
 	}
 	fl, err := flow.Begin(p)
 	if err != nil {
@@ -316,14 +303,14 @@ func (f *fixture) wallet(id uuid.UUID) store.Wallet {
 
 func TestFundSendsNativeValueFromTheMaster(t *testing.T) {
 	f := newFixture(t)
-	fl := f.begin(store.FlowDrain, f.dep, store.StateFunding, flow.Params{})
+	fl := f.begin(store.FlowTransfer, f.proxy, store.StateFunding, flow.Params{})
 
 	if !f.step() {
 		t.Fatal("sender did nothing")
 	}
 
 	tx := f.chain.lastSent(t)
-	if *tx.To() != f.dep.Address {
+	if *tx.To() != f.proxy.Address {
 		t.Fatalf("funded %s, want the deposit wallet", tx.To().Hex())
 	}
 	if tx.Value().Sign() <= 0 {
@@ -347,8 +334,8 @@ func TestFundIsSkippedWhenTheWalletAlreadyHasGas(t *testing.T) {
 	// v1 checked this on-chain before funding; the state model keeps that by
 	// letting the sender report an unnecessary action as success.
 	f := newFixture(t)
-	f.chain.bnb[f.dep.Address] = wei(1_000_000_000_000_000_000)
-	fl := f.begin(store.FlowDrain, f.dep, store.StateFunding, flow.Params{})
+	f.chain.bnb[f.proxy.Address] = wei(1_000_000_000_000_000_000)
+	fl := f.begin(store.FlowTransfer, f.proxy, store.StateFunding, flow.Params{})
 
 	f.step()
 
@@ -366,7 +353,7 @@ func TestApproveIsSignedByTheWalletNotTheMaster(t *testing.T) {
 	// the master would approve the master to itself and leave the real wallet
 	// unusable.
 	f := newFixture(t)
-	fl := f.begin(store.FlowDrain, f.dep, store.StateApproving, flow.Params{})
+	fl := f.begin(store.FlowTransfer, f.proxy, store.StateApproving, flow.Params{})
 
 	f.step()
 
@@ -374,8 +361,8 @@ func TestApproveIsSignedByTheWalletNotTheMaster(t *testing.T) {
 	if *tx.To() != usdt.MainnetAddress {
 		t.Fatalf("approve sent to %s, want the token", tx.To().Hex())
 	}
-	if got := signerOf(t, tx); got != f.dep.Address {
-		t.Fatalf("approve signed by %s, want the deposit wallet %s", got.Hex(), f.dep.Address.Hex())
+	if got := signerOf(t, tx); got != f.proxy.Address {
+		t.Fatalf("approve signed by %s, want the deposit wallet %s", got.Hex(), f.proxy.Address.Hex())
 	}
 	got, _ := f.flow(fl.ID)
 	if !got.Waiting() {
@@ -385,8 +372,8 @@ func TestApproveIsSignedByTheWalletNotTheMaster(t *testing.T) {
 
 func TestApproveIsSkippedWhenTheAllowanceExists(t *testing.T) {
 	f := newFixture(t)
-	f.chain.allowance[f.dep.Address] = wei(1)
-	fl := f.begin(store.FlowDrain, f.dep, store.StateApproving, flow.Params{})
+	f.chain.allowance[f.proxy.Address] = wei(1)
+	fl := f.begin(store.FlowTransfer, f.proxy, store.StateApproving, flow.Params{})
 
 	f.step()
 
@@ -394,12 +381,12 @@ func TestApproveIsSkippedWhenTheAllowanceExists(t *testing.T) {
 		t.Fatal("re-approved a wallet that already had an allowance")
 	}
 	got, _ := f.flow(fl.ID)
-	if got.State != store.StateSweeping {
+	if got.State != store.StateMoving {
 		t.Fatalf("state = %s, want sweeping", got.State)
 	}
 	// Skipping still marks the wallet active: the allowance is what "active"
 	// means, however it got there.
-	if !f.wallet(f.dep.ID).Active {
+	if !f.wallet(f.proxy.ID).Active {
 		t.Fatal("wallet not marked active after a skipped approve")
 	}
 }
@@ -408,12 +395,12 @@ func TestSweepMovesTheChainBalanceNotOurRecord(t *testing.T) {
 	// The deposit is only a trigger; balanceOf at signing time is the authority,
 	// so anything that arrived in the meantime leaves with the same sweep.
 	f := newFixture(t)
-	f.chain.balance[f.dep.Address] = wei(777)
+	f.chain.balance[f.proxy.Address] = wei(777)
 	f.update(func(tx *store.Tx) error {
-		_, err := tx.Credit(f.dep.ID, wei(500)) // our record says less
+		_, err := tx.Credit(f.proxy.ID, wei(500)) // our record says less
 		return err
 	})
-	f.begin(store.FlowDrain, f.dep, store.StateSweeping, flow.Params{})
+	f.begin(store.FlowTransfer, f.proxy, store.StateMoving, flow.Params{})
 
 	f.step()
 
@@ -422,7 +409,7 @@ func TestSweepMovesTheChainBalanceNotOurRecord(t *testing.T) {
 		t.Fatalf("transferFrom signed by %s, want the master", got.Hex())
 	}
 	from, to, amount := decodeTransferFrom(t, tx.Data())
-	if from != f.dep.Address || to != f.top.Address {
+	if from != f.proxy.Address || to != f.hot.Address {
 		t.Fatalf("transferFrom(%s -> %s), want deposit -> top-level", from.Hex(), to.Hex())
 	}
 	if amount.Cmp(wei(777)) != 0 {
@@ -432,7 +419,7 @@ func TestSweepMovesTheChainBalanceNotOurRecord(t *testing.T) {
 
 func TestSweepOfAnEmptyWalletSpendsNoGas(t *testing.T) {
 	f := newFixture(t)
-	fl := f.begin(store.FlowDrain, f.dep, store.StateSweeping, flow.Params{})
+	fl := f.begin(store.FlowTransfer, f.proxy, store.StateMoving, flow.Params{})
 
 	f.step()
 
@@ -442,22 +429,22 @@ func TestSweepOfAnEmptyWalletSpendsNoGas(t *testing.T) {
 	if _, found := f.flow(fl.ID); found {
 		t.Fatal("flow should have finished")
 	}
-	if w := f.wallet(f.dep.ID); !w.Idle() {
+	if w := f.wallet(f.proxy.ID); !w.Idle() {
 		t.Fatal("wallet not released")
 	}
 }
 
 func TestPayMovesAnExactAmount(t *testing.T) {
 	f := newFixture(t)
-	f.chain.balance[f.top.Address] = wei(1000)
-	f.begin(store.FlowWithdrawal, f.top, store.StatePaying, flow.Params{
+	f.chain.balance[f.hot.Address] = wei(1000)
+	f.begin(store.FlowTransfer, f.hot, store.StateMoving, flow.Params{
 		Amount: wei(250), To: addr(0xDD), Withdrawal: uuid.New(),
 	})
 
 	f.step()
 
 	from, to, amount := decodeTransferFrom(t, f.chain.lastSent(t).Data())
-	if from != f.top.Address || to != addr(0xDD) || amount.Cmp(wei(250)) != 0 {
+	if from != f.hot.Address || to != addr(0xDD) || amount.Cmp(wei(250)) != 0 {
 		t.Fatalf("transferFrom(%s -> %s, %s)", from.Hex(), to.Hex(), amount)
 	}
 }
@@ -466,27 +453,19 @@ func TestPayRefusesWhenTheChainHoldsLessThanOurRecords(t *testing.T) {
 	// "Verify at the point of spending" — the check that replaces a periodic
 	// reconciler, made exactly where drift would cost money.
 	f := newFixture(t)
-	f.chain.balance[f.top.Address] = wei(10)
+	f.chain.balance[f.hot.Address] = wei(10)
 
 	wd := store.Withdrawal{
-		ID: uuid.New(), App: "df", Destination: addr(0xDD),
-		Amount: 250, Payout: 250, Debit: 250,
-		Status: store.WithdrawalPending, CreatedAt: time.Now(),
+		ID: uuid.New(), Wallet: f.hot.ID, Reason: store.ReasonPayout, Destination: addr(0xDD),
+		Amount: wei(250), Status: store.WithdrawalPending, CreatedAt: time.Now(),
 	}
 	f.update(func(tx *store.Tx) error {
-		if _, err := tx.Credit(f.top.ID, wei(1000)); err != nil { // our record is wrong
+		if _, err := tx.Credit(f.hot.ID, wei(1000)); err != nil { // our record is wrong
 			return err
 		}
-		if _, err := tx.CreditLedger("df", 1000); err != nil {
-			return err
-		}
-		if err := tx.PutWithdrawal(wd); err != nil {
-			return err
-		}
-		_, err := tx.ReserveLedger("df", wd.Debit)
-		return err
+		return tx.PutWithdrawal(wd)
 	})
-	fl := f.begin(store.FlowWithdrawal, f.top, store.StatePaying, flow.Params{
+	fl := f.begin(store.FlowTransfer, f.hot, store.StateMoving, flow.Params{
 		Amount: wei(250), To: wd.Destination, Withdrawal: wd.ID,
 	})
 
@@ -517,15 +496,14 @@ func TestPayRefusesWhenTheChainHoldsLessThanOurRecords(t *testing.T) {
 		t.Fatalf("View: %v", err)
 	}
 	if err := f.st.View(func(tx *store.Tx) error {
-		a, _, err := tx.App("df")
+		committed, err := tx.Committed(f.hot.ID)
 		if err != nil {
 			return err
 		}
-		// The reservation stands: the payout has not been decided, only
-		// deferred, and the app's commitment is still live (§28).
-		if a.Reserved != 250 || a.Ledger != 1000 {
-			t.Fatalf("ledger %d reserved %d, want 1000/250 — nothing charged, nothing released",
-				a.Ledger, a.Reserved)
+		// The commitment stands: the payout has not been decided, only
+		// deferred, so the wallet still owes it (§28).
+		if committed.Cmp(wei(250)) != 0 {
+			t.Fatalf("committed = %s, want the 250 still promised", committed)
 		}
 		return nil
 	}); err != nil {
@@ -538,9 +516,9 @@ func TestJournalSurvivesABroadcastFailure(t *testing.T) {
 	// is sent, so a failure to send leaves it to be retried rather than lost —
 	// and never re-signed, which could double-spend.
 	f := newFixture(t)
-	f.chain.balance[f.dep.Address] = wei(500)
+	f.chain.balance[f.proxy.Address] = wei(500)
 	f.chain.sendErr = errors.New("connection refused")
-	fl := f.begin(store.FlowDrain, f.dep, store.StateSweeping, flow.Params{})
+	fl := f.begin(store.FlowTransfer, f.proxy, store.StateMoving, flow.Params{})
 
 	f.step()
 
@@ -574,10 +552,10 @@ func TestSigningIsSequential(t *testing.T) {
 	// One transaction in flight at a time is what keeps the pending nonce
 	// gapless without a nonce manager.
 	f := newFixture(t)
-	f.chain.balance[f.dep.Address] = wei(500)
-	f.begin(store.FlowDrain, f.dep, store.StateSweeping, flow.Params{})
+	f.chain.balance[f.proxy.Address] = wei(500)
+	f.begin(store.FlowTransfer, f.proxy, store.StateMoving, flow.Params{})
 	// A second flow, on a different wallet, also ready to go.
-	f.begin(store.FlowWithdrawal, f.top, store.StatePaying, flow.Params{
+	f.begin(store.FlowTransfer, f.hot, store.StateMoving, flow.Params{
 		Amount: wei(1), To: addr(0xDD), Withdrawal: uuid.New(),
 	})
 
@@ -596,8 +574,8 @@ func TestSigningIsSequential(t *testing.T) {
 func TestNonceComesFromTheChain(t *testing.T) {
 	f := newFixture(t)
 	f.chain.nonce = 41
-	f.chain.balance[f.dep.Address] = wei(500)
-	f.begin(store.FlowDrain, f.dep, store.StateSweeping, flow.Params{})
+	f.chain.balance[f.proxy.Address] = wei(500)
+	f.begin(store.FlowTransfer, f.proxy, store.StateMoving, flow.Params{})
 
 	f.step()
 
@@ -614,8 +592,8 @@ func TestNonceComesFromTheChain(t *testing.T) {
 func TestStaleTransactionIsRebroadcast(t *testing.T) {
 	f := newFixture(t)
 	f.s.opts.RebroadcastAfter = time.Millisecond
-	f.chain.balance[f.dep.Address] = wei(500)
-	f.begin(store.FlowDrain, f.dep, store.StateSweeping, flow.Params{})
+	f.chain.balance[f.proxy.Address] = wei(500)
+	f.begin(store.FlowTransfer, f.proxy, store.StateMoving, flow.Params{})
 
 	f.step()
 	if len(f.chain.sent) != 1 {
@@ -684,7 +662,7 @@ func decodeTransferFrom(t *testing.T, data []byte) (from, to common.Address, amo
 
 func TestRunDrainsWorkThenIdlesUntilNudged(t *testing.T) {
 	f := newFixture(t)
-	f.chain.balance[f.dep.Address] = wei(500)
+	f.chain.balance[f.proxy.Address] = wei(500)
 	f.s.opts.Tick = time.Hour // only a nudge can wake it, so the test is not timing-driven
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -701,7 +679,7 @@ func TestRunDrainsWorkThenIdlesUntilNudged(t *testing.T) {
 		t.Fatalf("sent %d transactions with no work queued", sent)
 	}
 
-	f.begin(store.FlowDrain, f.dep, store.StateSweeping, flow.Params{})
+	f.begin(store.FlowTransfer, f.proxy, store.StateMoving, flow.Params{})
 	f.s.Notify()
 
 	deadline := time.Now().Add(2 * time.Second)

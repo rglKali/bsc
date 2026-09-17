@@ -8,341 +8,371 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
 	"bsc/app"
-	"bsc/money"
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/google/uuid"
 )
 
-type appView struct {
-	Slug    string `json:"slug"`
-	Address string `json:"address"`
-	Balance struct {
-		AvailableCents string `json:"available_cents"`
-		ReservedCents  string `json:"reserved_cents"`
-		PendingCents   string `json:"pending_cents"`
-	} `json:"balance"`
-}
-
-type addressView struct {
-	Ref     string `json:"ref"`
-	Address string `json:"address"`
+type walletView struct {
+	Ref       string `json:"ref"`
+	Address   string `json:"address"`
+	DrainTo   string `json:"drain_to"`
+	Balance   string `json:"balance"`
+	Committed string `json:"committed"`
+	Available string `json:"available"`
 }
 
 type depositsPage struct {
 	Deposits []struct {
-		ID          string `json:"id"`
-		Ref         string `json:"ref"`
-		AmountCents string `json:"amount_cents"`
-		Status      string `json:"status"`
-		TxHash      string `json:"tx_hash"`
+		ID      string `json:"id"`
+		Wallet  string `json:"wallet"`
+		Amount  string `json:"amount"`
+		Status  string `json:"status"`
+		TxHash  string `json:"tx_hash"`
+		SweptBy string `json:"swept_by"`
+		SweptTx string `json:"swept_tx"`
 	} `json:"deposits"`
 	Cursor string `json:"cursor"`
 }
 
-type withdrawalView struct {
-	ID          string `json:"id"`
-	Status      string `json:"status"`
-	FeeCents    string `json:"fee_cents"`
-	PayoutCents string `json:"payout_cents"`
-	TxHash      string `json:"tx_hash"`
-	Attempts    int    `json:"attempts"`
-	LastError   string `json:"last_error"`
+type createdView struct {
+	Payout withdrawalView  `json:"payout"`
+	Fee    *withdrawalView `json:"fee,omitempty"`
 }
 
-// TestLifecycle walks real money through the whole service on a real chain:
-// registration and activation, a deposit from an outside wallet, the automatic
-// drain, a payout, and the house sweep that collects the fee — then audits the
-// result against the chain itself.
+type withdrawalView struct {
+	ID        string `json:"id"`
+	Wallet    string `json:"wallet"`
+	Reason    string `json:"reason"`
+	PartOf    string `json:"part_of"`
+	Cursor    string `json:"cursor"`
+	Status    string `json:"status"`
+	To        string `json:"to"`
+	Amount    string `json:"amount"`
+	TxHash    string `json:"tx_hash"`
+	Attempts  int    `json:"attempts"`
+	LastError string `json:"last_error"`
+}
+
+// TestLifecycle walks real money through the whole service on a real chain: a
+// wallet that accumulates, a forwarding wallet that drains into it, a deposit
+// from an outside address, the automatic forward, and a payout — then audits
+// the result against the chain itself.
 //
 // It runs as one sequence of subtests because every stage shares the master's
 // single nonce lane; running them in parallel would violate the invariant the
 // sender exists to hold.
 func TestLifecycle(t *testing.T) {
 	h := setup(t, needs{deposit: true})
-	slug := "e2e-" + uuid.New().String()[:8]
-	dest := h.destination
+
+	suffix := uuid.New().String()[:8]
+	treasury := "e2e-treasury-" + suffix
+	user := "e2e-user-" + suffix
 
 	var (
-		appInfo    appView
-		depositAdr addressView
-		withdrawal withdrawalView
-		// Captured before the payout is requested: see the note there.
-		collectorBefore *big.Int
+		treasuryAddr common.Address
+		userAddr     common.Address
+		withdrawal   withdrawalView
 	)
 
-	t.Run("register", func(t *testing.T) {
-		// Registration derives the hot wallet and pre-warms it, so the first
-		// payout does not also pay for activation.
-		h.call("PUT", "/v1/apps/"+slug, map[string]any{}, http.StatusCreated, &appInfo)
-		t.Logf("app %s → hot wallet %s", slug, appInfo.Address)
+	t.Run("deriving a wallet spends nothing", func(t *testing.T) {
+		before, err := h.chain.BalanceBNB(h.ctx, h.master)
+		if err != nil {
+			t.Fatalf("master balance: %v", err)
+		}
 
-		hot := common.HexToAddress(appInfo.Address)
-		h.pump("hot wallet activated on-chain", func() bool {
-			return h.active(hot)
+		var w walletView
+		h.call("PUT", "/v1/wallets/"+treasury, map[string]any{}, http.StatusCreated, &w)
+		treasuryAddr = common.HexToAddress(w.Address)
+		t.Logf("treasury %s → %s", treasury, w.Address)
+
+		if w.DrainTo != "" {
+			t.Fatalf("drain_to = %q, want a wallet that keeps what it receives", w.DrainTo)
+		}
+
+		// Nothing is signed and no gas is paid: an address book of users who
+		// register and never deposit must cost nothing (§41). On a real chain
+		// this is the assertion that matters, because activation is two real
+		// transactions and the bill is real.
+		after, err := h.chain.BalanceBNB(h.ctx, h.master)
+		if err != nil {
+			t.Fatalf("master balance: %v", err)
+		}
+		if after.Cmp(before) != 0 {
+			t.Fatalf("master gas went from %s to %s deriving a wallet", before, after)
+		}
+		h.view(func(tx *store.Tx) error {
+			got, ok, err := tx.WalletByRef(treasury)
+			if err != nil || !ok {
+				t.Fatalf("lookup: ok=%v err=%v", ok, err)
+			}
+			if got.Active {
+				t.Fatal("a freshly derived wallet is already active")
+			}
+			return nil
 		})
 	})
 
-	t.Run("deposit address", func(t *testing.T) {
-		h.call("POST", "/v1/apps/"+slug+"/addresses",
-			map[string]any{"ref": "cust-1"}, http.StatusCreated, &depositAdr)
-		if !common.IsHexAddress(depositAdr.Address) {
-			t.Fatalf("bad address %q", depositAdr.Address)
+	t.Run("a forwarding wallet is pointed at it", func(t *testing.T) {
+		var w walletView
+		h.call("PUT", "/v1/wallets/"+user,
+			map[string]any{"drain_to": treasuryAddr.Hex()},
+			http.StatusCreated, &w)
+		userAddr = common.HexToAddress(w.Address)
+		t.Logf("user %s → %s, forwarding to %s", user, w.Address, w.DrainTo)
+
+		if !common.IsHexAddress(w.DrainTo) || common.HexToAddress(w.DrainTo) != treasuryAddr {
+			t.Fatalf("drain_to = %q, want the treasury", w.DrainTo)
 		}
-		t.Logf("deposit address for cust-1 → %s", depositAdr.Address)
 	})
 
-	t.Run("deposit is detected and drained", func(t *testing.T) {
-		target := common.HexToAddress(depositAdr.Address)
-		h.sendTokens(target, h.deposit)
+	t.Run("a cycle is refused by the real service", func(t *testing.T) {
+		// The check that exists because §32 made topology settable: pointing the
+		// treasury back at the user would loop, and every hop would succeed.
+		h.call("PATCH", "/v1/wallets/"+treasury,
+			map[string]any{"drain_to": userAddr.Hex()},
+			http.StatusUnprocessableEntity, nil)
+	})
 
-		// Detection: the watcher sees the transfer in a finalized block.
+	t.Run("a deposit is recorded and forwarded on its own", func(t *testing.T) {
+		h.sendTokens(userAddr, h.deposit)
+		t.Logf("sent %s tokens to %s", fmtToken(h.deposit), userAddr.Hex())
+
 		var page depositsPage
-		h.pump("deposit detected", func() bool {
-			h.call("GET", "/v1/apps/"+slug+"/deposits", nil, http.StatusOK, &page)
+		h.pump("the deposit to be recorded", func() bool {
+			h.call("GET", "/v1/wallets/"+user+"/deposits", nil, http.StatusOK, &page)
 			return len(page.Deposits) > 0
 		})
-		got := page.Deposits[0]
-		depositCents, _ := h.scale.ToCents(h.deposit)
-		if got.Ref != "cust-1" || got.AmountCents != depositCents.String() {
-			t.Fatalf("deposit = %+v, want %s cents to cust-1", got, depositCents)
+
+		d := page.Deposits[0]
+		// The amount is the chain's own figure, to the last unit. Nothing is
+		// floored, so this is exactly what a block explorer shows (§36).
+		if d.Amount != h.deposit.String() {
+			t.Fatalf("amount = %s, want %s exactly", d.Amount, h.deposit)
 		}
-		// The app is shown cents and a hash it can look up, and nothing about
-		// how the money moved — no wei, no block, no log index (§27).
-		if got.ID == "" || got.TxHash == "" {
-			t.Fatalf("deposit = %+v, want an id and a transaction hash", got)
+		if d.TxHash == "" {
+			t.Fatal("no tx hash on the deposit")
 		}
 
-		// The drain is nobody's request: the rules noticed the balance and
-		// started it. A fresh deposit wallet is activated inside that flow —
-		// funded with just enough gas, then approving the master — so watch
-		// that happen before the sweep itself.
-		h.pump("deposit wallet activated on-chain", func() bool {
-			return h.active(target)
-		})
-		if gas, err := h.chain.BalanceBNB(h.ctx, target); err != nil {
-			t.Fatalf("deposit wallet gas: %v", err)
-		} else if gas.Sign() == 0 {
-			t.Fatal("deposit wallet was activated without ever being funded")
-		}
-
-		// Wait on the *record*, not the chain. A sweep is visible on-chain the
-		// moment it mines, but the service only credits at finality — so
-		// polling the balance would race ahead of the service and see a state
-		// it has not reached yet. "Credited" is the stronger condition and
-		// implies the weaker one.
-		hot := common.HexToAddress(appInfo.Address)
-		h.pump("deposit credited", func() bool {
-			h.call("GET", "/v1/apps/"+slug+"/deposits", nil, http.StatusOK, &page)
-			return len(page.Deposits) > 0 && page.Deposits[0].Status == "credited"
-		})
-		if got := h.tokenBalance(hot); got.Cmp(h.deposit) < 0 {
-			t.Fatalf("hot wallet holds %s on-chain, want the whole deposit %s",
-				fmtToken(got), fmtToken(h.deposit))
-		}
-		if left := h.tokenBalance(target); left.Sign() != 0 {
-			t.Fatalf("deposit wallet still holds %s", fmtToken(left))
-		}
-
-		h.call("GET", "/v1/apps/"+slug, nil, http.StatusOK, &appInfo)
-		if appInfo.Balance.AvailableCents != depositCents.String() {
-			t.Fatalf("available = %s cents, want the whole deposit %s",
-				appInfo.Balance.AvailableCents, depositCents)
-		}
-		t.Logf("available %s cents · pending %s", appInfo.Balance.AvailableCents,
-			appInfo.Balance.PendingCents)
-	})
-
-	t.Run("withdrawal pays out", func(t *testing.T) {
-		const payoutCents = 100 // $1.00
-		payout := h.scale.Wei(payoutCents)
-		before := h.tokenBalance(dest)
-		// Read the collector *before the withdrawal exists*. The house sweep is
-		// nobody's request — the rules start it as soon as the wallet is free —
-		// so it can land while we are still pumping this subtest. A baseline
-		// taken afterwards could already include it, and the next assertion
-		// would then wait forever for a rise that already happened.
-		collectorBefore = h.tokenBalance(h.collector)
-
-		h.call("POST", "/v1/apps/"+slug+"/withdrawals", map[string]any{
-			"destination": dest.Hex(), "amount_cents": "100",
-			"idempotency_key": "e2e-1",
-		}, http.StatusCreated, &withdrawal)
-		if withdrawal.Status != "pending" {
-			t.Fatalf("status = %s", withdrawal.Status)
-		}
-
-		// A retry must replay rather than pay twice — the property that
-		// matters most on a real chain, because the second payment would be
-		// unrecoverable.
-		var replay withdrawalView
-		h.call("POST", "/v1/apps/"+slug+"/withdrawals", map[string]any{
-			"destination": dest.Hex(), "amount_cents": "100",
-			"idempotency_key": "e2e-1",
-		}, http.StatusOK, &replay)
-		if replay.ID != withdrawal.ID {
-			t.Fatalf("retry created a second withdrawal: %s vs %s", replay.ID, withdrawal.ID)
-		}
-
-		h.pump("withdrawal settled", func() bool {
-			var got withdrawalView
-			h.call("GET", "/v1/apps/"+slug+"/withdrawals/"+withdrawal.ID, nil, http.StatusOK, &got)
-			withdrawal = got
-			// There is no failure state to wait for: a payout that reverts is
-			// retried, so the only terminal status is `debited` (§28).
-			return got.Status == "debited"
-		})
-		if withdrawal.Status != "debited" {
-			t.Fatalf("withdrawal %s after %d attempts: %s",
-				withdrawal.Status, withdrawal.Attempts, withdrawal.LastError)
-		}
-		if withdrawal.TxHash == "" {
-			t.Fatal("settled withdrawal has no transaction hash")
-		}
-		t.Logf("payout tx %s", withdrawal.TxHash)
-
-		// The destination actually received it, on-chain.
-		want := new(big.Int).Add(before, payout)
-		h.pump("destination credited on-chain", func() bool {
-			return h.tokenBalance(dest).Cmp(want) >= 0
-		})
-	})
-
-	t.Run("the fee stays behind and the house sweeps it", func(t *testing.T) {
-		// The fee never rode along with the payout. It was charged in the
-		// ledger and simply left in the wallet, which is what makes a
-		// withdrawal one transfer instead of two (§24).
-		h.call("GET", "/v1/apps/"+slug, nil, http.StatusOK, &appInfo)
-		if appInfo.Balance.ReservedCents != "0" {
-			t.Fatalf("reserved = %s after the payout settled, want nothing held",
-				appInfo.Balance.ReservedCents)
-		}
-		if withdrawal.FeeCents == "0" {
-			t.Fatal("no fee charged")
-		}
-		t.Logf("charged %s cents in fees, left in the hot wallet", withdrawal.FeeCents)
-
-		// The collector is the master by default, so this is also the check that
-		// the master accumulates fee income — the balance a USDT→BNB gas top-up
-		// draws on. The bound is monotone (at least the baseline plus the fee),
-		// so it holds whether the sweep landed before this line or after it.
-		fee, err := strconv.ParseInt(withdrawal.FeeCents, 10, 64)
-		if err != nil {
-			t.Fatalf("fee %q: %v", withdrawal.FeeCents, err)
-		}
-		want := new(big.Int).Add(collectorBefore, h.scale.Wei(money.Cents(fee)))
-		h.pump("house excess swept to the collector", func() bool {
-			return h.tokenBalance(h.collector).Cmp(want) >= 0
-		})
-		t.Logf("collector %s now holds %s", h.collector.Hex(), fmtToken(h.tokenBalance(h.collector)))
-
-		// And what is left in the hot wallet is exactly what the app is owed:
-		// the sweep took the house's share and nothing else (§25).
+		// The drain is not scheduled anywhere: the work rules noticed a
+		// forwarding wallet holding more than the threshold, and converged.
 		//
-		// Wait on our *record* of custody, not on the chain. The sweep is
-		// visible on-chain the moment it mines, but the service only applies it
-		// at finality — so a chain-only wait would let the next subtest audit a
-		// record that has not caught up yet and report a balance divergence
-		// that is really just a transaction in flight.
-		hot := common.HexToAddress(appInfo.Address)
-		owed, err := strconv.ParseInt(appInfo.Balance.AvailableCents, 10, 64)
-		if err != nil {
-			t.Fatalf("available %q: %v", appInfo.Balance.AvailableCents, err)
-		}
-		h.pump("the sweep reaches our records", func() bool {
-			return h.scale.Excess(h.custody(hot), money.Cents(owed)).Sign() == 0
+		// This is also where activation happens — funding then approve, as the
+		// prefix of the drain rather than a cost paid up front (§41). Gas
+		// estimation is the thing a simulator cannot check: if the estimate is
+		// short, the approve simply fails on a real chain.
+		h.pump("the deposit to be forwarded", func() bool {
+			h.call("GET", "/v1/wallets/"+user+"/deposits", nil, http.StatusOK, &page)
+			return len(page.Deposits) > 0 && page.Deposits[0].Status == "forwarded"
 		})
-		if excess := h.scale.Excess(h.tokenBalance(hot), money.Cents(owed)); excess.Sign() != 0 {
-			t.Fatalf("hot wallet holds %s over the ledger on-chain, want nothing", excess)
+		if page.Deposits[0].SweptBy == "" {
+			t.Fatal("a forwarded deposit was not linked to the debit that carried it")
+		}
+
+		h.awaitBalance("the treasury to hold the deposit",
+			func() *big.Int { return h.tokenBalance(treasuryAddr) }, h.deposit)
+		h.awaitBalance("the forwarding wallet to be empty",
+			func() *big.Int { return h.tokenBalance(userAddr) }, new(big.Int))
+
+		// The drain is what activated it, which is the whole point of lazy
+		// activation: the wallet paid for its allowance at the moment it first
+		// had something to move.
+		h.view(func(tx *store.Tx) error {
+			got, ok, err := tx.WalletByRef(user)
+			if err != nil || !ok {
+				t.Fatalf("lookup: ok=%v err=%v", ok, err)
+			}
+			if !got.Active {
+				t.Fatal("the forwarding wallet moved money without being activated")
+			}
+			return nil
+		})
+	})
+
+	t.Run("both ends of the movement are on the feed", func(t *testing.T) {
+		// The arrival at the treasury is a deposit like any other. The two
+		// records pair by hash, which is how a caller counting money avoids
+		// counting one transfer twice (§34).
+		var feed depositsPage
+		h.call("GET", "/v1/deposits", nil, http.StatusOK, &feed)
+
+		var forwarded, landed *struct {
+			ID      string `json:"id"`
+			Wallet  string `json:"wallet"`
+			Amount  string `json:"amount"`
+			Status  string `json:"status"`
+			TxHash  string `json:"tx_hash"`
+			SweptBy string `json:"swept_by"`
+			SweptTx string `json:"swept_tx"`
+		}
+		for i := range feed.Deposits {
+			switch feed.Deposits[i].Wallet {
+			case user:
+				forwarded = &feed.Deposits[i]
+			case treasury:
+				landed = &feed.Deposits[i]
+			}
+		}
+		if forwarded == nil || landed == nil {
+			t.Fatalf("feed does not carry both ends: %+v", feed.Deposits)
+		}
+		if forwarded.SweptTx != landed.TxHash {
+			t.Fatalf("swept_tx %s does not match the landing tx %s",
+				forwarded.SweptTx, landed.TxHash)
 		}
 	})
 
-	t.Run("audit against the chain", func(t *testing.T) {
-		// The offline audit recomputes every ledger from the log and checks
-		// each app is solvent against our record of custody; --rpc is the only
-		// thing that can catch that record diverging from the token's own view,
-		// which is precisely what a real chain can reveal and a simulator
-		// cannot.
+	t.Run("a payout moves exactly what was asked for", func(t *testing.T) {
+		dest := h.destination
+		before := h.tokenBalance(dest)
+
+		// Half the deposit, so the treasury is still funded afterwards.
+		amount := new(big.Int).Div(h.deposit, big.NewInt(2))
+
+		var created createdView
+		h.call("POST", "/v1/wallets/"+treasury+"/withdrawals", map[string]any{
+			"to": dest.Hex(), "amount": amount.String(),
+			"idempotency_key": "e2e-" + suffix,
+		}, http.StatusCreated, &created)
+		withdrawal = created.Payout
+		if withdrawal.Status != "pending" || withdrawal.Reason != "payout" {
+			t.Fatalf("payout = %+v", withdrawal)
+		}
+
+		// While it is pending the treasury has promised it.
+		var w walletView
+		h.call("GET", "/v1/wallets/"+treasury, nil, http.StatusOK, &w)
+		if w.Committed != amount.String() {
+			t.Fatalf("committed = %s, want %s", w.Committed, amount)
+		}
+
+		// A retry replays rather than paying twice — on a real chain this is the
+		// failure that is unrecoverable.
+		var again createdView
+		h.call("POST", "/v1/wallets/"+treasury+"/withdrawals", map[string]any{
+			"to": dest.Hex(), "amount": amount.String(),
+			"idempotency_key": "e2e-" + suffix,
+		}, http.StatusCreated, &again)
+		if again.Payout.ID != withdrawal.ID {
+			t.Fatalf("idempotency replayed as a new withdrawal: %s vs %s",
+				again.Payout.ID, withdrawal.ID)
+		}
+
+		h.pump("the payout to confirm", func() bool {
+			var got withdrawalView
+			h.call("GET", "/v1/withdrawals/"+withdrawal.ID, nil, http.StatusOK, &got)
+			if got.Attempts > 0 && got.LastError != "" {
+				t.Logf("attempt %d: %s", got.Attempts, got.LastError)
+			}
+			withdrawal = got
+			return got.Status == "confirmed"
+		})
+
+		// Exactly the amount, and nothing withheld: bsc charges no fee (§33).
+		want := new(big.Int).Add(before, amount)
+		h.awaitBalance("the destination to receive exactly the amount",
+			func() *big.Int { return h.tokenBalance(dest) }, want)
+
+		h.call("GET", "/v1/wallets/"+treasury, nil, http.StatusOK, &w)
+		if w.Committed != "0" {
+			t.Fatalf("committed = %s after settlement, want 0", w.Committed)
+		}
+		remaining := new(big.Int).Sub(h.deposit, amount)
+		if w.Balance != remaining.String() {
+			t.Fatalf("treasury balance = %s, want %s — nothing is kept back", w.Balance, remaining)
+		}
+	})
+
+	t.Run("the settled feed carries the drain and the payout", func(t *testing.T) {
+		// One feed of everything that left, whoever decided it — the property
+		// that made a drain stop being a third kind of thing (§42).
+		var feed struct {
+			Withdrawals []withdrawalView `json:"withdrawals"`
+			Cursor      string           `json:"cursor"`
+		}
+		h.call("GET", "/v1/withdrawals", nil, http.StatusOK, &feed)
+
+		seen := map[string]bool{}
+		for _, wd := range feed.Withdrawals {
+			seen[wd.Reason] = true
+			if wd.Status != "confirmed" {
+				t.Errorf("the settled feed carries a %s debit: %+v", wd.Status, wd)
+			}
+			if wd.Cursor == "" {
+				t.Errorf("a settled debit has no cursor: %+v", wd)
+			}
+		}
+		if !seen["drain"] || !seen["payout"] {
+			t.Fatalf("feed = %+v, want both the forward and the payout", feed.Withdrawals)
+		}
+
+		// Passing the cursor back yields nothing new.
+		var again struct {
+			Withdrawals []withdrawalView `json:"withdrawals"`
+		}
+		h.call("GET", "/v1/withdrawals?since="+feed.Cursor, nil, http.StatusOK, &again)
+		if len(again.Withdrawals) != 0 {
+			t.Fatalf("resuming past the end returned %d debits", len(again.Withdrawals))
+		}
+	})
+
+	t.Run("our record of custody agrees with the token", func(t *testing.T) {
+		// The check a simulator cannot make, because a simulator *is* our view.
 		rep, err := h.audit()
 		if err != nil {
-			t.Fatalf("offline audit: %v", err)
+			t.Fatalf("audit: %v", err)
 		}
-		if !rep.OK() {
-			t.Fatalf("offline audit findings: %v", rep.Findings)
+		for _, f := range rep.Findings {
+			t.Errorf("audit finding: %s", f)
 		}
-		path := h.snapshot(t)
+
+		path := filepath.Join(t.TempDir(), "snapshot.db")
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatalf("create snapshot: %v", err)
+		}
+		if _, err := h.store.Snapshot(f); err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		f.Close()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		rep, err = app.VerifyOnChain(ctx, path, h.rpcURL, 20, h.token)
+		withChain, err := app.VerifyOnChain(ctx, path, h.rpcURL, 20, h.token)
 		if err != nil {
-			t.Fatalf("on-chain audit: %v", err)
+			t.Fatalf("verify --rpc: %v", err)
 		}
-		if !rep.OK() {
-			t.Fatalf("on-chain audit findings — our balances disagree with the token: %v", rep.Findings)
+		for _, finding := range withChain.Findings {
+			t.Errorf("chain audit finding: %s", finding)
 		}
-		t.Logf("audit clean · %d wallets, %d deposits, %d withdrawals",
-			rep.Wallets, rep.Deposits, rep.Withdrawals)
 	})
 }
 
-// TestRejectsOverdraft proves the balance guard on a real chain: the refusal
-// must happen before anything is signed, not after a transfer reverts.
+// A payout larger than the wallet holds is refused before anything is signed,
+// so it costs no gas and leaves no record to clean up.
 func TestRejectsOverdraft(t *testing.T) {
 	h := setup(t, needs{})
-	slug := "e2e-od-" + uuid.New().String()[:8]
 
-	var view appView
-	h.call("PUT", "/v1/apps/"+slug, map[string]any{}, http.StatusCreated, &view)
+	ref := "e2e-empty-" + uuid.New().String()[:8]
+	var w walletView
+	h.call("PUT", "/v1/wallets/"+ref, map[string]any{}, http.StatusCreated, &w)
 
-	// A fresh app has nothing, so any payout must be refused outright.
-	h.call("POST", "/v1/apps/"+slug+"/withdrawals", map[string]any{
-		"destination":  h.destination.Hex(),
-		"amount_cents": "100",
+	h.call("POST", "/v1/wallets/"+ref+"/withdrawals", map[string]any{
+		"to": h.destination.Hex(), "amount": whole(1_000_000).String(),
 	}, http.StatusUnprocessableEntity, nil)
 
-	var after appView
-	h.call("GET", "/v1/apps/"+slug, nil, http.StatusOK, &after)
-	if after.Balance.ReservedCents != "0" {
-		t.Fatalf("a refused withdrawal left state behind: %+v", after)
+	var list struct {
+		Withdrawals []withdrawalView `json:"withdrawals"`
 	}
-}
-
-// active reports whether a wallet has approved the master, read from the chain
-// rather than from our own record.
-func (h *harness) active(wallet common.Address) bool {
-	h.t.Helper()
-	var known bool
-	if err := h.store.View(func(tx *store.Tx) error {
-		w, ok, err := tx.WalletByAddress(wallet)
-		if err != nil {
-			return err
+	h.call("GET", "/v1/wallets/"+ref+"/withdrawals?status=all", nil, http.StatusOK, &list)
+	for _, got := range list.Withdrawals {
+		if got.Wallet == ref {
+			t.Fatalf("a refused request became a record: %+v", got)
 		}
-		known = ok && w.Active
-		return nil
-	}); err != nil {
-		h.t.Fatalf("View: %v", err)
 	}
-	return known
-}
-
-// snapshot writes the live database to a file the audit can open read-only.
-func (h *harness) snapshot(t *testing.T) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "snapshot.db")
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatalf("create snapshot: %v", err)
-	}
-	defer f.Close()
-	if _, err := h.store.Snapshot(f); err != nil {
-		t.Fatalf("snapshot: %v", err)
-	}
-	return path
 }

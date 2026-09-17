@@ -29,14 +29,14 @@ func storeWith(t *testing.T, balance int64) *store.Store {
 	}
 	t.Cleanup(func() { st.Close() })
 	w := store.Wallet{
-		ID: uuid.New(), App: "df", Kind: store.KindTopLevel, Address: common.HexToAddress("0xabc"),
+		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged, Address: common.HexToAddress("0xabc"),
 		Balance: big.NewInt(balance), CreatedAt: time.Now(),
 	}
 	if err := st.Update(func(tx *store.Tx) error {
 		if err := tx.PutWallet(w); err != nil {
 			return err
 		}
-		return tx.PutApp(store.App{Slug: "df", Wallet: w.ID, CreatedAt: time.Now()})
+		return nil
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}

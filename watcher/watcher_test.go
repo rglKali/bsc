@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"bsc/metrics"
-	"bsc/money"
 	"bsc/store"
 	"bsc/usdt"
 
@@ -108,25 +107,13 @@ type harness struct {
 	w     *Watcher
 	addrs *AddrSet
 
-	app     store.App
-	top     store.Wallet
-	deposit store.Wallet
+	hot   store.Wallet // accumulates: drain_to unset
+	proxy store.Wallet // forwards into hot
 }
 
-const (
-	minDeposit    = 100
-	houseSweepMin = 100
-)
-
-// testScale values a cent at a wei: true for a two-decimal token, and it keeps
-// every figure in these tests readable as both units at once.
-var testScale = func() money.Scale {
-	sc, err := money.NewScale(2)
-	if err != nil {
-		panic(err)
-	}
-	return sc
-}()
+// drainThreshold is pure gas economics: below it, forwarding costs more than
+// it moves. It has no bearing on what gets recorded.
+const drainThreshold = 100
 
 func newHarness(t *testing.T, head uint64) *harness {
 	t.Helper()
@@ -137,47 +124,38 @@ func newHarness(t *testing.T, head uint64) *harness {
 	t.Cleanup(func() { st.Close() })
 
 	h := &harness{t: t, store: st, chain: newFakeChain(head), addrs: NewAddrSet()}
-	h.top = store.Wallet{
-		ID: uuid.New(), App: "df", Kind: store.KindTopLevel, Address: addr(0x01),
+	h.hot = store.Wallet{
+		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged, Address: addr(0x01),
 		Active: true, Balance: new(big.Int), CreatedAt: time.Now(),
 	}
-	h.deposit = store.Wallet{
-		ID: uuid.New(), App: "df", Kind: store.KindDeposit, Ref: "cust-1", Address: addr(0x02),
-		Balance: new(big.Int), CreatedAt: time.Now(),
-	}
-	h.app = store.App{
-		Slug: "df", Wallet: h.top.ID,
-		Fee:       store.FeePolicy{Flat: 1},
-		CreatedAt: time.Now(),
+	h.proxy = store.Wallet{
+		ID: uuid.New(), Ref: "cust-1", Kind: store.KindManaged, Address: addr(0x02),
+		DrainTo: h.hot.Address, Balance: new(big.Int), CreatedAt: time.Now(),
 	}
 	h.update(func(tx *store.Tx) error {
-		if err := tx.PutWallet(h.top); err != nil {
+		if err := tx.PutWallet(h.hot); err != nil {
 			return err
 		}
-		if err := tx.PutWallet(h.deposit); err != nil {
-			return err
-		}
-		return tx.PutApp(h.app)
+		return tx.PutWallet(h.proxy)
 	})
 
 	h.w = New(st, h.chain, h.addrs, Options{
 		StartBlock: 1, Poll: time.Millisecond, BackfillBatch: 10,
-		Scale: testScale, DrainThreshold: wei(minDeposit), HouseSweepMin: wei(houseSweepMin),
-		FeeCollector: addr(0xFE), Token: usdt.MainnetAddress,
+		DrainThreshold: wei(drainThreshold), Token: usdt.MainnetAddress,
 	})
 	return h
 }
 
-// app2 reads the app back, for asserting on its ledger.
-func (h *harness) app2() store.App {
+// walletOf reads a wallet back, for asserting on custody.
+func (h *harness) walletOf(id uuid.UUID) store.Wallet {
 	h.t.Helper()
-	var out store.App
+	var out store.Wallet
 	h.view(func(tx *store.Tx) error {
-		a, ok, err := tx.App("df")
+		w, ok, err := tx.Wallet(id)
 		if err != nil || !ok {
-			h.t.Fatalf("App: ok=%v err=%v", ok, err)
+			h.t.Fatalf("Wallet: ok=%v err=%v", ok, err)
 		}
-		out = a
+		out = w
 		return nil
 	})
 	return out
@@ -247,7 +225,7 @@ func (h *harness) deposits() []store.Deposit {
 	var out []store.Deposit
 	h.view(func(tx *store.Tx) error {
 		var err error
-		out, _, err = tx.DepositsSince("df", store.Cursor{}, 0)
+		out, _, err = tx.DepositsSince(store.Cursor{}, 0)
 		return err
 	})
 	return out
@@ -255,19 +233,19 @@ func (h *harness) deposits() []store.Deposit {
 
 func TestDepositIsCreditedRecordedAndDrained(t *testing.T) {
 	h := newHarness(t, 1)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
-	h.addrs.Add(h.top.Address, h.top.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
+	h.addrs.Add(h.hot.Address, h.hot.ID)
 	h.chain.put(1, receipt(hash(0xA1), true,
-		transferLog(usdt.MainnetAddress, addr(0xF0), h.deposit.Address, wei(500), 3)))
+		transferLog(usdt.MainnetAddress, addr(0xF0), h.proxy.Address, wei(500), 3)))
 
 	h.runOnce()
 
-	w := h.wallet(h.deposit.ID)
+	w := h.walletOf(h.proxy.ID)
 	if w.Balance.Cmp(wei(500)) != 0 {
 		t.Fatalf("balance = %s, want 500", w.Balance)
 	}
 	deps := h.deposits()
-	if len(deps) != 1 || deps[0].AmountWei.Cmp(wei(500)) != 0 || deps[0].Cents != 500 || deps[0].LogIndex != 3 {
+	if len(deps) != 1 || deps[0].Amount.Cmp(wei(500)) != 0 || deps[0].LogIndex != 3 {
 		t.Fatalf("deposits = %+v", deps)
 	}
 	if deps[0].Cursor() != (store.Cursor{Block: 1, LogIndex: 3}) {
@@ -275,7 +253,7 @@ func TestDepositIsCreditedRecordedAndDrained(t *testing.T) {
 	}
 	// The drain rule ran in the same transaction, so the wallet is already busy.
 	flows := h.flows()
-	if len(flows) != 1 || flows[0].Kind != store.FlowDrain {
+	if len(flows) != 1 || flows[0].Kind != store.FlowTransfer {
 		t.Fatalf("flows = %+v", flows)
 	}
 	if w.Flow != flows[0].ID {
@@ -285,7 +263,7 @@ func TestDepositIsCreditedRecordedAndDrained(t *testing.T) {
 	if flows[0].State != store.StateFunding {
 		t.Fatalf("state = %s, want funding", flows[0].State)
 	}
-	if flows[0].To != h.top.Address {
+	if flows[0].To != h.hot.Address {
 		t.Fatalf("drain destination = %s, want the top-level", flows[0].To.Hex())
 	}
 }
@@ -294,11 +272,11 @@ func TestTwoDepositsInOneBlockStartExactlyOneDrain(t *testing.T) {
 	// The case that started this design: two transfers to a fresh, inactive
 	// wallet must not each try to activate it.
 	h := newHarness(t, 1)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	h.chain.put(1,
 		receipt(hash(0xB1), true,
-			transferLog(usdt.MainnetAddress, addr(0xF0), h.deposit.Address, wei(300), 0),
-			transferLog(usdt.MainnetAddress, addr(0xF1), h.deposit.Address, wei(400), 1)),
+			transferLog(usdt.MainnetAddress, addr(0xF0), h.proxy.Address, wei(300), 0),
+			transferLog(usdt.MainnetAddress, addr(0xF1), h.proxy.Address, wei(400), 1)),
 	)
 
 	h.runOnce()
@@ -306,7 +284,7 @@ func TestTwoDepositsInOneBlockStartExactlyOneDrain(t *testing.T) {
 	if got := h.flows(); len(got) != 1 {
 		t.Fatalf("started %d flows, want exactly 1: %+v", len(got), got)
 	}
-	if w := h.wallet(h.deposit.ID); w.Balance.Cmp(wei(700)) != 0 {
+	if w := h.walletOf(h.proxy.ID); w.Balance.Cmp(wei(700)) != 0 {
 		t.Fatalf("balance = %s, want both deposits summed", w.Balance)
 	}
 	if deps := h.deposits(); len(deps) != 2 {
@@ -314,54 +292,45 @@ func TestTwoDepositsInOneBlockStartExactlyOneDrain(t *testing.T) {
 	}
 }
 
-// TestSubCentTransfersAreIgnoredEntirely: the ledger's resolution is a cent, so
-// a transfer worth less than one has no entry to write. It is still credited to
-// custody, because the chain says it arrived — it simply belongs to the house
-// rather than to the app (§22).
-func TestSubCentTransfersAreIgnoredEntirely(t *testing.T) {
-	// A cent is a wei at this scale, so half a cent needs a finer token. Use
-	// four decimals, where a cent is 100 wei and 99 of them is sub-cent dust.
-	sc, err := money.NewScale(4)
-	if err != nil {
-		t.Fatal(err)
-	}
+// With the chain's own units there is no amount too small to record: the floor
+// existed only because a sub-cent credit was a ledger entry that changed
+// nothing, and there is no ledger now (§36).
+func TestEvenTheSmallestTransferIsRecorded(t *testing.T) {
 	h := newHarness(t, 1)
-	h.w.scale, h.w.cfg.Scale = sc, sc
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	h.chain.put(1, receipt(hash(0xC1), true,
-		transferLog(usdt.MainnetAddress, addr(0xF0), h.deposit.Address, wei(99), 0)))
+		transferLog(usdt.MainnetAddress, addr(0xF0), h.proxy.Address, wei(1), 0)))
 
 	h.runOnce()
 
-	if w := h.wallet(h.deposit.ID); w.Balance.Cmp(wei(99)) != 0 {
+	if w := h.walletOf(h.proxy.ID); w.Balance.Cmp(wei(1)) != 0 {
 		t.Fatalf("custody was not credited: balance = %s", w.Balance)
 	}
-	if deps := h.deposits(); len(deps) != 0 {
-		t.Fatalf("sub-cent dust was recorded: %+v", deps)
+	deps := h.deposits()
+	if len(deps) != 1 || deps[0].Amount.Cmp(wei(1)) != 0 {
+		t.Fatalf("the smallest transfer was not recorded: %+v", deps)
 	}
 }
 
-// TestDepositsBelowTheDrainThresholdAreStillRecorded is the distinction the
-// ledger forced: the threshold decides when we spend gas moving money, never
-// whether the app is credited for it. Until the drain runs it shows as pending.
+// The threshold decides when we spend gas moving money, never whether the
+// transfer is recorded. Until the drain runs the deposit reads as `received`.
 func TestDepositsBelowTheDrainThresholdAreStillRecorded(t *testing.T) {
 	h := newHarness(t, 1)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	h.chain.put(1, receipt(hash(0xD1), true,
-		transferLog(usdt.MainnetAddress, addr(0xF0), h.deposit.Address, wei(60), 0)))
+		transferLog(usdt.MainnetAddress, addr(0xF0), h.proxy.Address, wei(60), 0)))
 
 	h.runOnce()
 
 	deps := h.deposits()
-	if len(deps) != 1 || deps[0].Cents != 60 {
+	if len(deps) != 1 || deps[0].Amount.Cmp(wei(60)) != 0 {
 		t.Fatalf("deposits = %+v, want the 60 recorded", deps)
+	}
+	if deps[0].Status != store.DepositReceived {
+		t.Fatalf("status = %s, want received", deps[0].Status)
 	}
 	if got := h.flows(); len(got) != 0 {
 		t.Fatalf("spent gas draining less than the threshold: %+v", got)
-	}
-	// Recorded but not yet credited: it is not in the hot wallet.
-	if a := h.app2(); a.Ledger != 0 {
-		t.Fatalf("ledger = %d before the drain, want 0", a.Ledger)
 	}
 }
 
@@ -369,18 +338,18 @@ func TestSmallDepositsAggregatePastTheDrainThreshold(t *testing.T) {
 	// Money below the threshold is never lost: it sits in the wallet and leaves
 	// once the total is worth a transaction.
 	h := newHarness(t, 2)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	h.chain.put(1, receipt(hash(0xD1), true,
-		transferLog(usdt.MainnetAddress, addr(0xF0), h.deposit.Address, wei(60), 0)))
+		transferLog(usdt.MainnetAddress, addr(0xF0), h.proxy.Address, wei(60), 0)))
 	h.chain.put(2, receipt(hash(0xD2), true,
-		transferLog(usdt.MainnetAddress, addr(0xF0), h.deposit.Address, wei(60), 0)))
+		transferLog(usdt.MainnetAddress, addr(0xF0), h.proxy.Address, wei(60), 0)))
 
 	h.runOnce()
 
-	if w := h.wallet(h.deposit.ID); w.Balance.Cmp(wei(120)) != 0 {
+	if w := h.walletOf(h.proxy.ID); w.Balance.Cmp(wei(120)) != 0 {
 		t.Fatalf("balance = %s, want 120", w.Balance)
 	}
-	if got := h.flows(); len(got) != 1 || got[0].Kind != store.FlowDrain {
+	if got := h.flows(); len(got) != 1 || got[0].Kind != store.FlowTransfer {
 		t.Fatalf("aggregated deposits did not start a drain: %+v", got)
 	}
 	if deps := h.deposits(); len(deps) != 2 {
@@ -388,50 +357,47 @@ func TestSmallDepositsAggregatePastTheDrainThreshold(t *testing.T) {
 	}
 }
 
-// TestTransferToATopLevelIsCreditedButNotADeposit: a drain arriving at the
-// top-level is our own money moving, and recording it would double-count it in
-// the app's feed. Nobody is credited for it, so it reads as house excess — which
-// is exactly what an unexpected transfer to a hot wallet is.
-func TestTransferToATopLevelIsCreditedButNotADeposit(t *testing.T) {
+// A transfer arriving at an accumulating wallet is a deposit like any other.
+// Under the ledger it had to be suppressed to avoid double-counting a drain
+// into an app's feed; with no ledger there is nothing to double-count, and the
+// caller can pair the two ends by the drain's tx hash (§34).
+func TestTransferToAnAccumulatingWalletIsRecorded(t *testing.T) {
 	h := newHarness(t, 1)
-	h.addrs.Add(h.top.Address, h.top.ID)
+	h.addrs.Add(h.hot.Address, h.hot.ID)
 	h.chain.put(1, receipt(hash(0xE1), true,
-		transferLog(usdt.MainnetAddress, addr(0xF0), h.top.Address, wei(900), 0)))
+		transferLog(usdt.MainnetAddress, addr(0xF0), h.hot.Address, wei(900), 0)))
 
 	h.runOnce()
 
-	if w := h.wallet(h.top.ID); w.Balance.Cmp(wei(900)) != 0 {
+	if w := h.walletOf(h.hot.ID); w.Balance.Cmp(wei(900)) != 0 {
 		t.Fatalf("balance = %s, want 900", w.Balance)
 	}
-	if deps := h.deposits(); len(deps) != 0 {
-		t.Fatalf("top-level credit was recorded as a deposit: %+v", deps)
-	}
-	if a := h.app2(); a.Ledger != 0 {
-		t.Fatalf("ledger = %d; a top-level credit is nobody's deposit", a.Ledger)
+	if deps := h.deposits(); len(deps) != 1 {
+		t.Fatalf("deposits = %d, want 1", len(deps))
 	}
 	for _, fl := range h.flows() {
-		if fl.Kind == store.FlowDrain {
-			t.Fatalf("top-level credit started a drain: %+v", fl)
+		if fl.Kind == store.FlowTransfer {
+			t.Fatalf("an accumulating wallet started a drain: %+v", fl)
 		}
 	}
 }
 
 func TestOutgoingTransfersAreDebited(t *testing.T) {
 	h := newHarness(t, 2)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
-	h.addrs.Add(h.top.Address, h.top.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
+	h.addrs.Add(h.hot.Address, h.hot.ID)
 	h.chain.put(1, receipt(hash(0xF1), true,
-		transferLog(usdt.MainnetAddress, addr(0xF0), h.deposit.Address, wei(500), 0)))
+		transferLog(usdt.MainnetAddress, addr(0xF0), h.proxy.Address, wei(500), 0)))
 	// The sweep: out of the deposit wallet, into the top-level.
 	h.chain.put(2, receipt(hash(0xF2), true,
-		transferLog(usdt.MainnetAddress, h.deposit.Address, h.top.Address, wei(500), 0)))
+		transferLog(usdt.MainnetAddress, h.proxy.Address, h.hot.Address, wei(500), 0)))
 
 	h.runOnce()
 
-	if w := h.wallet(h.deposit.ID); w.Balance.Sign() != 0 {
+	if w := h.walletOf(h.proxy.ID); w.Balance.Sign() != 0 {
 		t.Fatalf("deposit wallet balance = %s, want 0 after the sweep", w.Balance)
 	}
-	if w := h.wallet(h.top.ID); w.Balance.Cmp(wei(500)) != 0 {
+	if w := h.walletOf(h.hot.ID); w.Balance.Cmp(wei(500)) != 0 {
 		t.Fatalf("top-level balance = %s, want 500", w.Balance)
 	}
 }
@@ -439,13 +405,13 @@ func TestOutgoingTransfersAreDebited(t *testing.T) {
 func TestLogsFromOtherTokensAreIgnored(t *testing.T) {
 	// Every BEP-20 shares the Transfer topic, so the emitter is what decides.
 	h := newHarness(t, 1)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	h.chain.put(1, receipt(hash(0x11), true,
-		transferLog(addr(0xBA), addr(0xF0), h.deposit.Address, wei(1_000_000), 0)))
+		transferLog(addr(0xBA), addr(0xF0), h.proxy.Address, wei(1_000_000), 0)))
 
 	h.runOnce()
 
-	if w := h.wallet(h.deposit.ID); w.Balance.Sign() != 0 {
+	if w := h.walletOf(h.proxy.ID); w.Balance.Sign() != 0 {
 		t.Fatalf("a foreign token credited the balance: %s", w.Balance)
 	}
 	if deps := h.deposits(); len(deps) != 0 {
@@ -457,9 +423,9 @@ func TestReprocessingABlockDoesNotDuplicate(t *testing.T) {
 	// Exactly-once falls out of the key layout and the single transaction, with
 	// no dedup window to tune.
 	h := newHarness(t, 1)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	h.chain.put(1, receipt(hash(0x21), true,
-		transferLog(usdt.MainnetAddress, addr(0xF0), h.deposit.Address, wei(500), 0)))
+		transferLog(usdt.MainnetAddress, addr(0xF0), h.proxy.Address, wei(500), 0)))
 
 	h.runOnce()
 	// Rewind the cursor and replay, as a crash between commit and cursor would.
@@ -479,9 +445,9 @@ func TestReprocessingABlockDoesNotDuplicate(t *testing.T) {
 
 func TestRunProcessesBlocksAndStopsOnCancel(t *testing.T) {
 	h := newHarness(t, 2)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	h.chain.put(1, receipt(hash(0x81), true,
-		transferLog(usdt.MainnetAddress, addr(0xF0), h.deposit.Address, wei(500), 0)))
+		transferLog(usdt.MainnetAddress, addr(0xF0), h.proxy.Address, wei(500), 0)))
 	h.chain.put(2, receipt(hash(0x82), true))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -512,9 +478,9 @@ func TestRunSurvivesTransientChainErrors(t *testing.T) {
 	// An RPC hiccup must not end the loop: the watcher is what observes
 	// finality, so if it stops, every in-flight transfer stops with it.
 	h := newHarness(t, 1)
-	h.addrs.Add(h.deposit.Address, h.deposit.ID)
+	h.addrs.Add(h.proxy.Address, h.proxy.ID)
 	h.chain.put(1, receipt(hash(0x83), true,
-		transferLog(usdt.MainnetAddress, addr(0xF0), h.deposit.Address, wei(500), 0)))
+		transferLog(usdt.MainnetAddress, addr(0xF0), h.proxy.Address, wei(500), 0)))
 	h.chain.mu.Lock()
 	h.chain.headErr = context.DeadlineExceeded
 	h.chain.mu.Unlock()

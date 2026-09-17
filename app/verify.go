@@ -90,8 +90,8 @@ func VerifyOnChain(ctx context.Context, path, rpcURL string, rateLimit int, toke
 				rep.Findings = append(rep.Findings, store.Finding{
 					Kind:  "balance",
 					Where: "wallet/" + w.Address.Hex(),
-					Detail: fmt.Sprintf("stored %s, on-chain %s (app %q, %s)",
-						stored, onChain, w.App, w.Kind),
+					Detail: fmt.Sprintf("stored %s, on-chain %s (ref %q, %s)",
+						stored, onChain, w.Ref, w.Kind),
 				})
 			}
 		}

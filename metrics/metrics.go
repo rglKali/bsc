@@ -72,9 +72,13 @@ var (
 )
 
 // Money. TransfersSeen counts every USDT transfer touching a watched address;
-// DepositsIgnored counts those worth less than a whole cent, which are credited
-// to custody but never recorded, because there is no ledger entry to write. The
-// two series differing is correct, not a fault.
+// DepositsRecorded counts those that became a record. The two differ by the
+// transfers that touched the master, which is bsc's own wallet and not a
+// deposit anybody is waiting on.
+//
+// There is no longer an "ignored" series. It counted transfers worth less than
+// a cent, which the ledger could not represent; with the chain's own units
+// there is no amount too small to record (§36).
 var (
 	TransfersSeen = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "bsc_transfers_seen_total",
@@ -82,11 +86,7 @@ var (
 	})
 	DepositsRecorded = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "bsc_deposits_recorded_total",
-		Help: "Deposits recorded (at or above the minimum).",
-	})
-	DepositsIgnored = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "bsc_deposits_ignored_total",
-		Help: "Incoming transfers worth less than a cent: credited to custody, not recorded.",
+		Help: "Incoming transfers recorded as deposits.",
 	})
 	BalanceUnderflows = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "bsc_balance_underflows_total",
@@ -151,14 +151,5 @@ var (
 	InsufficientBalance = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "bsc_insufficient_balance_total",
 		Help: "Payments refused at signing time because the chain held less than our records said. Any value above zero means our record of custody drifted.",
-	}, []string{"app"})
+	}, []string{"ref"})
 )
-
-// SolvencyShortfalls counts the times a wallet was found holding less than its
-// app's ledger says it owes. Any value above zero means our books and the chain
-// disagree about money that belongs to somebody, which is the one condition in
-// this service that is never self-correcting.
-var SolvencyShortfalls = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "bsc_solvency_shortfalls_total",
-	Help: "Times a hot wallet held less than its app's ledger balance.",
-})
