@@ -43,7 +43,7 @@ func TestRefsAreUniqueAcrossTheWholeService(t *testing.T) {
 	seedWallet(t, s, "cust-1", 0)
 
 	second := Wallet{
-		ID: uuid.New(), Ref: "cust-1", Kind: KindManaged, Address: addr(0x33),
+		ID: nextID(), Ref: "cust-1", Address: addr(0x33),
 		Balance: new(big.Int), CreatedAt: time.Now().UTC(),
 	}
 	update(t, s, func(tx *Tx) error { return tx.PutWallet(second) })
@@ -66,13 +66,11 @@ func TestRefsAreUniqueAcrossTheWholeService(t *testing.T) {
 func TestPutWalletValidates(t *testing.T) {
 	s := open(t)
 	cases := map[string]Wallet{
-		"no id":           {Ref: "a", Kind: KindManaged, Address: addr(1)},
-		"no address":      {ID: uuid.New(), Ref: "a", Kind: KindManaged},
-		"no ref":          {ID: uuid.New(), Kind: KindManaged, Address: addr(1)},
-		"bad ref":         {ID: uuid.New(), Ref: "Cust 1", Kind: KindManaged, Address: addr(1)},
-		"master with ref": {ID: uuid.New(), Ref: "m", Kind: KindMaster, Address: addr(1)},
-		"master draining": {ID: uuid.New(), Kind: KindMaster, Address: addr(1), DrainTo: addr(2)},
-		"drains to self":  {ID: uuid.New(), Ref: "a", Kind: KindManaged, Address: addr(1), DrainTo: addr(1)},
+		"no id":          {Ref: "a", Address: addr(1)},
+		"no address":     {ID: nextID(), Ref: "a"},
+		"no ref":         {ID: nextID(), Address: addr(1)},
+		"bad ref":        {ID: nextID(), Ref: "Cust 1", Address: addr(1)},
+		"drains to self": {ID: nextID(), Ref: "a", Address: addr(1), DrainTo: addr(1)},
 	}
 	for name, w := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -88,10 +86,9 @@ func TestMutateWalletRefusesIndexedFields(t *testing.T) {
 	w := seedWallet(t, s, "cust-1", 0)
 
 	cases := map[string]func(*Wallet){
-		"id":      func(x *Wallet) { x.ID = uuid.New() },
+		"id":      func(x *Wallet) { x.ID = nextID() },
 		"ref":     func(x *Wallet) { x.Ref = "other" },
 		"address": func(x *Wallet) { x.Address = addr(0x44) },
-		"kind":    func(x *Wallet) { x.Kind = KindMaster },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -182,7 +179,7 @@ func TestDrainChainRefusesTooManyHops(t *testing.T) {
 	for i := n; i >= 1; i-- {
 		at := addr(byte(0x80 + i))
 		w := Wallet{
-			ID: uuid.New(), Ref: string(rune('a' + i)), Kind: KindManaged,
+			ID: nextID(), Ref: string(rune('a' + i)),
 			Address: at, DrainTo: prev, Balance: new(big.Int), CreatedAt: time.Now().UTC(),
 		}
 		if err := s.Update(func(tx *Tx) error { return tx.PutWallet(w) }); err != nil {
@@ -341,24 +338,25 @@ func TestWalletsPaginateByRef(t *testing.T) {
 	}
 }
 
-// The master has no ref, so it must not appear in a listing the caller reads.
-func TestWalletListingExcludesTheMaster(t *testing.T) {
+// Every wallet in this store is a derived, nameable one, so a wallet written is
+// a wallet listed. There is no longer an unlisted kind hiding in the table: the
+// master is not a row at all (§49).
+func TestEveryWalletIsListable(t *testing.T) {
 	s := open(t)
-	seedWallet(t, s, "cust-1", 0)
-	update(t, s, func(tx *Tx) error {
-		return tx.PutWallet(Wallet{
-			ID: uuid.New(), Kind: KindMaster, Address: addr(0xFF),
-			Balance: new(big.Int), CreatedAt: time.Now().UTC(),
-		})
-	})
+	seedWalletAt(t, s, "cust-1", addr(0x11), common.Address{}, 0)
+	seedWalletAt(t, s, "cust-2", addr(0x12), common.Address{}, 0)
 
 	if err := s.View(func(tx *Tx) error {
 		list, err := tx.Wallets("", 0)
 		if err != nil {
 			return err
 		}
-		if got := refs(list); len(got) != 1 || got[0] != "cust-1" {
-			t.Fatalf("listing = %v, want just cust-1", got)
+		var n int
+		if err := tx.EachWallet(func(Wallet) error { n++; return nil }); err != nil {
+			return err
+		}
+		if len(list) != n {
+			t.Fatalf("listing has %d of %d wallets — something is unlisted", len(list), n)
 		}
 		return nil
 	}); err != nil {
@@ -372,4 +370,76 @@ func refs(ws []Wallet) []string {
 		out = append(out, w.Ref)
 	}
 	return out
+}
+
+// Id 0 is the master's row and the one wallet whose key is the secret itself
+// rather than an HMAC of its id. A managed wallet landing there would be signed
+// for with the wrong key, and a master anywhere else would not be found by the
+// code that looks it up by constant — so both directions are refused (§48).
+func TestIdZeroIsNotAWallet(t *testing.T) {
+	s := open(t)
+	err := s.Update(func(tx *Tx) error {
+		return tx.PutWallet(Wallet{
+			ID: 0, Ref: "cust-1",
+			Address: addr(1), Balance: new(big.Int), CreatedAt: time.Now().UTC(),
+		})
+	})
+	if err == nil {
+		t.Fatal("a wallet was written at id 0")
+	}
+}
+
+// The next id comes from the table itself rather than a counter beside it, so
+// there is no second number that can disagree with the rows (§48).
+func TestNextWalletIDFollowsTheHighestRow(t *testing.T) {
+	s := open(t)
+
+	if err := s.View(func(tx *Tx) error {
+		if got, err := tx.NextWalletID(); err != nil || got != 1 {
+			t.Fatalf("empty store: NextWalletID = %d, %v; want 1", got, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ids need not be contiguous — keys.Allocate skips any index that is not a
+	// valid scalar — so "next" must follow the highest, not count the rows.
+	update(t, s, func(tx *Tx) error {
+		return tx.PutWallet(Wallet{
+			ID: 40, Ref: "cust-1", Address: addr(1),
+			Balance: new(big.Int), CreatedAt: time.Now().UTC(),
+		})
+	})
+	if err := s.View(func(tx *Tx) error {
+		if got, err := tx.NextWalletID(); err != nil || got != 41 {
+			t.Fatalf("NextWalletID = %d, %v; want 41", got, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A rewound sequence — the shape a restored snapshot leaves — must not quietly
+// hand one address to two refs. It cannot be detected once the address is
+// forgotten too, but while the record is there this refuses (§48).
+func TestReissuingAnAddressIsRefused(t *testing.T) {
+	s := open(t)
+	update(t, s, func(tx *Tx) error {
+		return tx.PutWallet(Wallet{
+			ID: 5, Ref: "cust-1", Address: addr(0xAB),
+			Balance: new(big.Int), CreatedAt: time.Now().UTC(),
+		})
+	})
+
+	err := s.Update(func(tx *Tx) error {
+		return tx.PutWallet(Wallet{
+			ID: 6, Ref: "cust-2", Address: addr(0xAB),
+			Balance: new(big.Int), CreatedAt: time.Now().UTC(),
+		})
+	})
+	if !errors.Is(err, ErrAddressReissued) {
+		t.Fatalf("err = %v, want ErrAddressReissued", err)
+	}
 }

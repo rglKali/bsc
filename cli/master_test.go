@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// belowFloor is the guard that makes `bsc swap` safe to run on a timer: the
-// automation lives in cron rather than in the service, so the check has to be
-// cheap and has to fail towards doing nothing (§44).
+// belowFloor is what makes `bsc check` usable from cron: it has to be cheap and
+// has to fail towards "fine", because a check that pages on every run is a
+// check nobody reads (§44, §53).
 func TestBelowFloor(t *testing.T) {
 	floor := big.NewInt(50_000_000_000_000_000) // 0.05
 
@@ -26,19 +26,19 @@ func TestBelowFloor(t *testing.T) {
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			m := &masterCtx{cfg: cfgWithFloor(c.floor)}
-			got := m.wouldTrade(c.native)
+			got := m.belowFloor(c.native)
 			if got != c.want {
-				t.Fatalf("wouldTrade(%s, floor %v) = %v, want %v", c.native, c.floor, got, c.want)
+				t.Fatalf("belowFloor(%s, floor %v) = %v, want %v", c.native, c.floor, got, c.want)
 			}
 		})
 	}
 }
 
-// An unset floor reads as "fine", never as "always trade". Getting that
-// backwards would mean a cron line trading on every run.
-func TestNoFloorNeverTrades(t *testing.T) {
+// An unset floor reads as "fine", never as "always low". Getting that backwards
+// would mean a cron line paging on every run.
+func TestNoFloorNeverPages(t *testing.T) {
 	m := &masterCtx{cfg: cfgWithFloor(nil)}
-	if m.wouldTrade(new(big.Int)) {
-		t.Fatal("an empty master with no configured floor was judged to need a trade")
+	if m.belowFloor(new(big.Int)) {
+		t.Fatal("an empty master with no configured floor was judged to be low")
 	}
 }

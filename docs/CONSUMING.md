@@ -22,7 +22,7 @@ category to account for.
 | --- | --- |
 | **Wallet** | An address bsc derived for one of your handles (`ref`). Unique across the service. |
 | **`drain_to`** | Where this wallet forwards to. Set means it forwards; unset means it accumulates. |
-| **Deposit** | A credit: money that arrived on one of your wallets. |
+| **Deposit** | A credit: money that arrived on one of your wallets. Immutable. |
 | **Withdrawal** | A debit: money that left one. A payout you asked for, the fee beside it, or a forward bsc made. |
 | **Balance** | What the chain says the address holds. There is no other balance. |
 
@@ -72,8 +72,7 @@ curl -X PUT $BSC/v1/wallets/acme:cust-1 \
 # 4. see what arrived, anywhere
 curl "$BSC/v1/deposits?since="
 # → {"deposits":[{"id":"0000000002dfd5d100000009","wallet":"acme:cust-1",
-#                 "amount":"50000000000000000000","status":"received",
-#                 "tx_hash":"0x7c…"}],
+#                 "amount":"50000000000000000000","tx_hash":"0x7c…"}],
 #    "cursor":"0000000002dfd5d100000009"}
 
 # 5. pay someone out of the treasury
@@ -138,9 +137,6 @@ Each deposit is:
   "wallet":     "acme:cust-1",
   "from":       "0x1234…",
   "amount":     "50000000000000000000",
-  "status":     "received" | "forwarded",
-  "swept_by":   "9f1c…",
-  "swept_tx":   "0x9e1a…",
   "created_at": "2026-09-16T09:51:08Z" }
 ```
 
@@ -153,31 +149,25 @@ Store the cursor *after* you have processed the page, never before. Delivery is
 at-least-once and ordered. When nothing is new the same cursor comes back.
 Deposits are kept forever; there is no replay window to fall outside.
 
-Two statuses, and they say where the money physically is:
+**A deposit has no status.** It is recorded once, after it happened, and never
+changes: this much landed here, at this block. That is the whole of it.
 
-| `status` | Meaning |
-| --- | --- |
-| `received` | It is sitting on the wallet it was sent to. |
-| `forwarded` | A debit carried it on to that wallet's `drain_to`. `swept_by` is that debit; `swept_tx` is its transfer. |
-
-A deposit on a wallet that accumulates stays `received` forever. That is not an
-unfinished state — the money is exactly where it was meant to land. The same is
-true of an amount too small to be worth forwarding: it is recorded, it sits
-there, and a later deposit carries it along.
+Money leaving the wallet again is a *separate* record — a debit — rather than a
+change to the credit. Whether a given deposit's money is still sitting there is
+not a question bsc answers per deposit, because a forward moves the wallet's
+**balance**, not a chosen set of deposits. Ask the wallet what it holds.
 
 **A forward is a withdrawal.** There is no separate "drain" object: when bsc
-moves a wallet to its `drain_to`, that is a debit with `reason: "drain"`, and
-every credit it carried names it in `swept_by`. Follow the link for the
-transfer, the destination, and the other credits that left with it.
+moves a wallet to its `drain_to`, that is a debit with `reason: "drain"` on
+`/v1/withdrawals`.
 
 **A forward into another managed wallet produces a credit at the far end.** The
-arrival is a deposit like any other, and the two ends pair up: the upstream
-credit's `swept_tx` equals the downstream credit's `tx_hash`. Deduplicate on
+arrival is a deposit like any other, and the two ends pair through the debit:
+the drain's `tx_hash` **is** the downstream credit's `tx_hash`. Deduplicate on
 that if you are counting money.
 
 The feed is **global** — every deposit on every wallet. `GET
-/v1/wallets/{ref}/deposits` is the per-wallet view, with an optional
-`?status=received|forwarded`.
+/v1/wallets/{ref}/deposits` is the per-wallet view.
 
 ## Withdrawals
 
@@ -300,7 +290,7 @@ PUT    /v1/wallets/{ref}                {drain_to?, prewarm?}    idempotent
 GET    /v1/wallets/{ref}
 PATCH  /v1/wallets/{ref}                {drain_to?, paused?}
 
-GET    /v1/wallets/{ref}/deposits       ?status=received|forwarded&limit=
+GET    /v1/wallets/{ref}/deposits       ?limit=
 POST   /v1/wallets/{ref}/withdrawals    {to, amount, fee?, idempotency_key?}
 GET    /v1/wallets/{ref}/withdrawals    ?status=pending|confirmed|all&reason=&limit=
 
@@ -315,9 +305,9 @@ Everything about one wallet hangs off its own path; the two feeds are the only
 top-level collections, because they are the only things that are not about one
 wallet.
 
-Statuses, in full: deposits are `received` → `forwarded`, withdrawals are
-`pending` → `confirmed`. Reasons are `payout`, `fee`, `drain`. That is the
-entire vocabulary.
+Statuses, in full: **deposits have none** — they are facts, recorded after the
+event. Withdrawals are `pending` → `confirmed`, because one is accepted before
+it happens. Reasons are `payout`, `fee`, `drain`. That is the entire vocabulary.
 
 Errors are `{"error": "...", "code": "..."}` with a meaningful status:
 

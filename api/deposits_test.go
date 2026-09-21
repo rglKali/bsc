@@ -31,7 +31,7 @@ func (f *fixture) deposit(ref string, block uint64, logIndex uint32, amount int6
 		_, err = tx.PutDeposit(store.Deposit{
 			Wallet: w.ID, Block: block, LogIndex: logIndex, TxHash: txh,
 			From: hexAddr(0xF0), Amount: big.NewInt(amount),
-			Status: store.DepositReceived, CreatedAt: time.Now().UTC(),
+			CreatedAt: time.Now().UTC(),
 		})
 		return err
 	}); err != nil {
@@ -115,22 +115,25 @@ func TestDepositIdIsTheCursor(t *testing.T) {
 	}
 }
 
-func TestWalletDepositsFilterByStatus(t *testing.T) {
+// A deposit has no lifecycle, so a wallet's deposits are simply its deposits.
+// There is nothing to filter by and nothing that changes after the record is
+// written (§50).
+func TestWalletDepositsAreTheWholeHistory(t *testing.T) {
 	f := newFixture(t)
 	hot := f.wallet("hot")
 	f.proxy("cust-1", hot.Address)
 	f.deposit("cust-1", 10, 0, 100)
+	f.deposit("cust-1", 11, 0, 250)
 
 	var got depositsPage
+	f.json(f.do("GET", "/v1/wallets/cust-1/deposits", nil), http.StatusOK, &got)
+	if len(got.Deposits) != 2 {
+		t.Fatalf("deposits = %d, want 2", len(got.Deposits))
+	}
+	// An unknown query parameter is ignored rather than refused, but the old
+	// ?status= must not silently filter anything out.
 	f.json(f.do("GET", "/v1/wallets/cust-1/deposits?status=received", nil), http.StatusOK, &got)
-	if len(got.Deposits) != 1 {
-		t.Fatalf("received = %d, want 1", len(got.Deposits))
-	}
-	f.json(f.do("GET", "/v1/wallets/cust-1/deposits?status=forwarded", nil), http.StatusOK, &got)
-	if len(got.Deposits) != 0 {
-		t.Fatalf("forwarded = %d, want 0", len(got.Deposits))
-	}
-	if w := f.do("GET", "/v1/wallets/cust-1/deposits?status=nonsense", nil); w.Code != http.StatusBadRequest {
-		t.Fatalf("bad status: %d, want 400", w.Code)
+	if len(got.Deposits) != 2 {
+		t.Fatalf("deposits with a stale filter = %d, want all 2", len(got.Deposits))
 	}
 }

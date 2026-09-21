@@ -2,14 +2,9 @@ package cli
 
 import (
 	"bsc/config"
-	"bufio"
 	"fmt"
 	"math/big"
 	"strings"
-
-	"github.com/ethereum/go-ethereum"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/spf13/cobra"
 )
 
 // Rendering helpers for the operator commands.
@@ -81,26 +76,6 @@ func bumped(v *big.Int, mul float64) *big.Int {
 	f := new(big.Float).Mul(new(big.Float).SetInt(v), big.NewFloat(mul))
 	out, _ := f.Int(nil)
 	return out
-}
-
-func callMsg(from, to common.Address, value *big.Int, data []byte) ethereum.CallMsg {
-	return ethereum.CallMsg{From: from, To: &to, Value: value, Data: data}
-}
-
-// confirm asks before signing. A trade is the one operator action whose outcome
-// is a price rather than a yes or no, so it gets the one prompt in this CLI.
-func confirm(cmd *cobra.Command, question string) bool {
-	fmt.Fprintf(cmd.OutOrStdout(), "%s [y/N] ", question)
-	r := bufio.NewReader(cmd.InOrStdin())
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
-	case "y", "yes":
-		return true
-	}
-	return false
 }
 
 // cfgWithFloor builds the minimal configuration the gas-floor check needs. It

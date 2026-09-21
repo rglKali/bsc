@@ -3,8 +3,8 @@
 Everything in `task unit` runs offline against a chain simulator. The simulator
 is faithful — it enforces allowances and balances exactly as the token does — but
 it is still our own model, and a model agreeing with itself proves nothing about
-gas estimation, finality timing, receipt shapes, or whether the token and the
-router behave the way we assume.
+gas estimation, finality timing, receipt shapes, or whether the token behaves the
+way we assume.
 
 This suite closes that gap. It is the only test that spends real funds, so it is
 build-tagged and **skips unless configured**.
@@ -39,11 +39,6 @@ The offline tests cannot reach any of this:
   is the one check that can detect our view of a transfer diverging from the
   token's, and a simulator cannot produce that divergence because it *is* our
   view.
-- **The swap actually works** (`TestOperatorSwap`). It is the one operation whose
-  outcome is a price rather than a yes or no, and the hardest to fake
-  convincingly: a fake router can only confirm our own assumptions about
-  calldata. It exercises the quote in both directions, the slippage bound, the
-  allowance, and the trade — the same sequence `bsc swap` runs.
 
 ## Configuration
 
@@ -52,13 +47,11 @@ The offline tests cannot reach any of this:
 | `BSC_MASTER_SECRET` | **Required.** 32-byte hex. Without it every test skips. |
 | `E2E_RPC_URL` | Endpoint. Defaults to the public BSC testnet. |
 | `E2E_DEPOSIT` | Tokens the lifecycle test deposits, in base units. Default 1 whole token. |
-| `E2E_SWAP_AMOUNT` | Tokens `TestOperatorSwap` trades away. Default 1 whole token. |
 | `E2E_TIMEOUT` | Per-run budget. Default 15m. |
-| `E2E_ROUTER` | Override the router; otherwise resolved from the chain. |
 | `E2E_RECOVER` | `0xaddr[,0xaddr…]` — pull stranded tokens back, for `TestRecoverStrandedTokens`. |
 
 The endpoint is the only chain input, exactly as the service treats it: which
-chain this is, the token and the router all follow what it reports once dialled.
+chain this is and which token follow what it reports once dialled.
 Running against **mainnet is refused** unless you also set the guard the harness
 prints when it sees one.
 
@@ -71,16 +64,21 @@ The master needs:
 - **Tokens**, but only for the tests that move them — `needs{}` declares it, so a
   run that never deposits does not demand a deposit's worth.
 
-Teardown pulls tokens back out of every wallet the run derived and returns the
-funder's balance to the master, so a passing run costs only gas.
+Recovery runs at **both ends**: the suite sweeps the wallets this secret derives
+before it starts as well as after, and returns the funder's balance to the
+master, so a passing run costs only gas.
 
-**One exception:** `TestOperatorSwap` trades tokens for native currency and does
-**not** trade back. Buying back would be exactly the automation §38 removed, at a
-price nobody looked at. The test logs what it sold; top the master up by hand.
+The sweep before matters because wallet addresses are deterministic since §48 —
+index 1 is the same address in every run. A run killed mid-flight leaves tokens
+in a derived wallet, and without the sweep the next run would drain its own
+deposit *plus* those leftovers: more moves than was deposited, the watcher
+reports a balance underflow, and every amount assertion is wrong by the
+leftover. If the stranded wallet was never activated the master cannot pull
+from it, so the harness funds it with gas and pushes instead.
+
 
 ## Cost
 
 A full lifecycle run on testnet is roughly a dozen transactions — activation for
 two wallets, a forward, a payout, and the teardown transfers. On testnet that is
-free in every sense that matters. On mainnet, at 1 gwei, it is cents of gas plus
-whatever the swap test trades.
+free in every sense that matters. On mainnet, at 1 gwei, it is cents of gas.

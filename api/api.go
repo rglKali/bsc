@@ -27,7 +27,6 @@ import (
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/google/uuid"
 )
 
 // Sync reports how far the chain watcher is behind the finalized head.
@@ -39,7 +38,7 @@ type Sync interface {
 // address must be added to it in the same place it is created, or the first
 // transfer to it would be missed.
 type Addresses interface {
-	Add(addr common.Address, id uuid.UUID)
+	Add(addr common.Address, id store.WalletID)
 }
 
 // Options configure the server.
@@ -147,8 +146,6 @@ func (e *apiError) Unwrap() error { return e.err }
 func fail(status int, code string, format string, args ...any) *apiError {
 	return &apiError{status: status, code: code, err: fmt.Errorf(format, args...)}
 }
-
-var errNotFound = fail(http.StatusNotFound, "not_found", "not found")
 
 // handle wraps a handler with JSON error rendering. A domain error that has not
 // been given a status is a 500 and is logged: callers get a generic message,

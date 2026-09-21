@@ -2,6 +2,7 @@ package store
 
 import (
 	"math/big"
+	"strconv"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -22,35 +23,42 @@ const (
 	vSend       = 1
 	vDeposit    = 1
 	vWithdrawal = 1
+	vPending    = 1
 )
 
-// WalletKind separates the wallets bsc derives for callers from the one it
-// derives for itself.
+// A wallet record has no kind. There used to be one, separating the wallets bsc
+// derives for callers from the master — and before that carrying the topology
+// as well, baking a two-level shape into the type system.
 //
-// It used to carry the topology as well — a top-level hot wallet and the
-// deposit addresses that drained into it — which baked a two-level shape into
-// the type system. The shape is now a field: a wallet with a DrainTo forwards,
-// a wallet without one accumulates, and any wallet can be either (§32).
-type WalletKind uint8
+// The topology became a field: a wallet with a DrainTo forwards, a wallet
+// without one accumulates, and any wallet can be either (§32). The master
+// stopped being a row at all: it is the operator's own key, its address lives
+// in meta, and bsc stores nothing else about it (§49). So every record here is
+// the same kind of thing — derived, and nameable by its caller.
+// WalletID is a wallet's sequential number, and the message its private key is
+// derived from: priv = HMAC-SHA256(master_secret, be64(id)).
+//
+// Sequential rather than random is what makes the money recoverable without
+// this database. Under UUIDs the id was half the key material and 122 random
+// bits are not searchable, so losing the file lost every address even while
+// holding the secret. Now a recovery walks 0, 1, 2 … and asks the chain (§48).
+//
+// It is 8 bytes big-endian everywhere it appears — as the wallet's own key, as
+// the leading part of every wallet-scoped composite key, and as the derivation
+// message — so bbolt's byte order is numeric order, which is what lets the next
+// id be read as "the last one, plus one" with no counter to keep in step.
+//
+// Ids start at 1; zero is not a wallet.
+type WalletID uint64
 
-const (
-	KindManaged WalletKind = 1
-	// KindMaster is the gas-paying wallet itself. It is recorded so its token
-	// balance is tracked like any other, and so a gas top-up can own it the way
-	// every other flow owns a wallet. Its key comes from the master secret
-	// directly, not from HMAC derivation.
-	KindMaster WalletKind = 2
-)
+// Ids start at 1. Zero is not a wallet and never becomes one — it is refused by
+// both the store and keys.Derive — which keeps it usable as "unset" in the one
+// place that matters: a call site that forgot to fill the field in.
 
-func (k WalletKind) String() string {
-	switch k {
-	case KindManaged:
-		return "managed"
-	case KindMaster:
-		return "master"
-	}
-	return "unknown"
-}
+// Key renders the id as its 8-byte sortable form.
+func (id WalletID) Key() []byte { return be64(uint64(id)) }
+
+func (id WalletID) String() string { return strconv.FormatUint(uint64(id), 10) }
 
 // FlowKind is which pipeline a flow is running.
 //
@@ -116,35 +124,6 @@ func (s FlowState) String() string {
 	return "unknown"
 }
 
-// DepositStatus is the caller-visible lifecycle of money arriving.
-//
-// It names where the money physically is, which is the only thing bsc can
-// honestly report now that it keeps no ledger. `received` means it is sitting
-// on the wallet it was sent to; `forwarded` means a drain moved it on to that
-// wallet's DrainTo and it is no longer here.
-//
-// A deposit to a wallet with no DrainTo stays `received` forever. That is not
-// an unfinished state — the money is exactly where it was meant to land, and
-// there is nothing further for bsc to do with it (§34).
-//
-// The stored values are frozen: they are a packed field in every deposit record.
-type DepositStatus uint8
-
-const (
-	DepositReceived  DepositStatus = 1
-	DepositForwarded DepositStatus = 2
-)
-
-func (s DepositStatus) String() string {
-	switch s {
-	case DepositReceived:
-		return "received"
-	case DepositForwarded:
-		return "forwarded"
-	}
-	return "unknown"
-}
-
 // DebitReason says why money left a wallet.
 //
 // Every outgoing movement bsc makes is the same operation — the master moving a
@@ -184,33 +163,6 @@ func (r DebitReason) String() string {
 	return "unknown"
 }
 
-// WithdrawalStatus is the caller-visible lifecycle of money leaving.
-//
-// **There is no failure state.** A request that cannot be honoured is refused
-// synchronously at creation — bad address, zero amount, more than the wallet
-// holds — so it never becomes a record at all. Anything that goes wrong after
-// that is ours: a reverted payout backs the wallet off and the withdrawal stays
-// `pending` for the rules to retry. The caller is therefore never handed a
-// terminal state it has to compensate for (§28, which survives the rewrite).
-type WithdrawalStatus uint8
-
-const (
-	WithdrawalPending   WithdrawalStatus = 1 // accepted, not yet on-chain
-	WithdrawalConfirmed WithdrawalStatus = 2 // the transfer reached finality
-)
-
-func (s WithdrawalStatus) IsTerminal() bool { return s == WithdrawalConfirmed }
-
-func (s WithdrawalStatus) String() string {
-	switch s {
-	case WithdrawalPending:
-		return "pending"
-	case WithdrawalConfirmed:
-		return "confirmed"
-	}
-	return "unknown"
-}
-
 // Wallet is any derived wallet. ID is the derivation handle — the private key
 // is HMAC(master, ID) — so losing these records loses the ability to address
 // funds.
@@ -226,9 +178,8 @@ func (s WithdrawalStatus) String() string {
 // DrainTo references is checked for cycles at write time, since A→B→A would
 // otherwise burn the master's gas as fast as blocks arrive (§35).
 type Wallet struct {
-	ID      uuid.UUID
+	ID      WalletID
 	Ref     string // the caller's handle for this wallet; unique across the service
-	Kind    WalletKind
 	Address common.Address
 	DrainTo common.Address // zero = this wallet accumulates
 	Active  bool           // has approved the master for MaxUint256
@@ -260,9 +211,8 @@ func (w *Wallet) Proxies() bool { return w.DrainTo != (common.Address{}) }
 func (w *Wallet) encode() ([]byte, error) {
 	e := &enc{}
 	e.u8(vWallet)
-	e.id(w.ID)
+	e.walletID(w.ID)
 	e.str(w.Ref)
-	e.u8(uint8(w.Kind))
 	e.addr(w.Address)
 	e.addr(w.DrainTo)
 	e.boolean(w.Active)
@@ -280,9 +230,8 @@ func decodeWallet(b []byte) (Wallet, error) {
 	d := newDec(b)
 	_ = d.u8()
 	var w Wallet
-	w.ID = d.id()
+	w.ID = d.walletID()
 	w.Ref = d.str()
-	w.Kind = WalletKind(d.u8())
 	w.Address = d.addr()
 	w.DrainTo = d.addr()
 	w.Active = d.boolean()
@@ -310,7 +259,7 @@ type Flow struct {
 	ID         uuid.UUID
 	Kind       FlowKind
 	State      FlowState
-	Wallet     uuid.UUID
+	Wallet     WalletID
 	Withdrawal uuid.UUID // the withdrawal this transfer pays, when it pays one
 	Amount     *big.Int  // zero on a drain: the amount is read from the chain
 	To         common.Address
@@ -349,7 +298,7 @@ func (f *Flow) encode() ([]byte, error) {
 	e.id(f.ID)
 	e.u8(uint8(f.Kind))
 	e.u8(uint8(f.State))
-	e.id(f.Wallet)
+	e.walletID(f.Wallet)
 	e.id(f.Withdrawal)
 	e.wei(f.Amount)
 	e.addr(f.To)
@@ -368,7 +317,7 @@ func decodeFlow(b []byte) (Flow, error) {
 	f.ID = d.id()
 	f.Kind = FlowKind(d.u8())
 	f.State = FlowState(d.u8())
-	f.Wallet = d.id()
+	f.Wallet = d.walletID()
 	f.Withdrawal = d.id()
 	f.Amount = d.wei()
 	f.To = d.addr()
@@ -446,23 +395,19 @@ func decodeSend(b []byte) (Send, error) {
 }
 
 // Deposit is a recorded incoming transfer: one Transfer log that paid a wallet
-// bsc manages.
+// bsc manages. It is an observation and nothing else — there is no lifecycle,
+// because a deposit is only ever recorded *after* it happened (§50).
 //
 // Amount is the chain's own figure, unscaled and unrounded. There is no second
 // unit beside it and no floor applied to it, so there is no dust — the number
 // here is the number on the block explorer (§36).
 type Deposit struct {
-	Wallet   uuid.UUID
-	Block    uint64
-	LogIndex uint32
-	TxHash   common.Hash
-	From     common.Address
-	Amount   *big.Int
-	Status   DepositStatus
-	// SweptBy is the debit that carried this deposit onward, set when a drain
-	// lands. It points at a withdrawal record rather than at a bare hash, so a
-	// credit and the debit that consumed it are two ends of one link (§42).
-	SweptBy   uuid.UUID
+	Wallet    WalletID
+	Block     uint64
+	LogIndex  uint32
+	TxHash    common.Hash
+	From      common.Address
+	Amount    *big.Int
 	CreatedAt time.Time
 }
 
@@ -472,14 +417,12 @@ func (dp *Deposit) Cursor() Cursor { return Cursor{Block: dp.Block, LogIndex: dp
 func (dp *Deposit) encode() ([]byte, error) {
 	e := &enc{}
 	e.u8(vDeposit)
-	e.id(dp.Wallet)
+	e.walletID(dp.Wallet)
 	e.u64(dp.Block)
 	e.u32(dp.LogIndex)
 	e.hash(dp.TxHash)
 	e.addr(dp.From)
 	e.wei(dp.Amount)
-	e.u8(uint8(dp.Status))
-	e.id(dp.SweptBy)
 	e.stamp(dp.CreatedAt)
 	return e.b, e.err
 }
@@ -488,19 +431,64 @@ func decodeDeposit(b []byte) (Deposit, error) {
 	d := newDec(b)
 	_ = d.u8()
 	var dp Deposit
-	dp.Wallet = d.id()
+	dp.Wallet = d.walletID()
 	dp.Block = d.u64()
 	dp.LogIndex = d.u32()
 	dp.TxHash = d.hash()
 	dp.From = d.addr()
 	dp.Amount = d.wei()
-	dp.Status = DepositStatus(d.u8())
-	dp.SweptBy = d.id()
 	dp.CreatedAt = d.stamp()
 	return dp, d.done()
 }
 
-// Withdrawal is money leaving a managed wallet — a debit.
+// Pending is a debit that has been accepted but has not happened yet: a promise
+// bsc made to its caller and is now responsible for keeping.
+//
+// It lives in state/ rather than log/, and that is the whole point of splitting
+// the two (§51). A pending withdrawal is not a movement — nothing has left the
+// wallet — so it has no business in a namespace whose contract is "a record of
+// what happened, kept forever". The bucket a record sits in *is* its status:
+// there is no stored `pending`/`confirmed` field that could disagree with
+// anything, because being here is what pending means.
+//
+// It carries what a promise needs and nothing a fact needs: no TxHash and no
+// Block, because neither exists yet, and Attempts/Error, which are diagnostics
+// about keeping the promise rather than anything about the movement.
+//
+// A withdrawal has NO FAILURE STATE (§28). What cannot be honoured is refused
+// synchronously at creation and never becomes a record; what breaks afterwards
+// is ours to retry, so a record stays here — and stays committed against its
+// wallet — until it settles.
+type Pending struct {
+	ID          uuid.UUID
+	Wallet      WalletID
+	Reason      DebitReason
+	PartOf      uuid.UUID // a fee names the payout it accompanies
+	Destination common.Address
+	Amount      *big.Int
+
+	Attempts   uint32
+	Error      string // the last attempt's, for an operator; never a verdict
+	RetryAfter time.Time
+
+	IdempotencyKey string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// Settle turns a promise into the observation that it was kept.
+func (p *Pending) Settle(txHash common.Hash, block uint64, now time.Time) Withdrawal {
+	return Withdrawal{
+		ID: p.ID, Wallet: p.Wallet, Reason: p.Reason, PartOf: p.PartOf,
+		Destination: p.Destination, Amount: p.Amount,
+		TxHash: txHash, Block: block,
+		IdempotencyKey: p.IdempotencyKey,
+		CreatedAt:      p.CreatedAt,
+		SettledAt:      now.UTC(),
+	}
+}
+
+// Withdrawal is money that has left a managed wallet — a debit, and a fact.
 //
 // Every outgoing movement is this record: a payout the caller asked for, the fee
 // that accompanied it, and a drain bsc decided to make. Reason says which. That
@@ -511,9 +499,14 @@ func decodeDeposit(b []byte) (Deposit, error) {
 // which needs to know who they are, and bsc does not. A caller that wants to
 // take a dollar asks for a payout a dollar smaller and moves the remainder with
 // a second withdrawal of its own (§33).
+// It lives in log/ and only ever arrives here settled: a promise is a Pending
+// until the chain says otherwise, and settling moves the record (§51). There is
+// no status field — being here is what confirmed means — and no Attempts or
+// Error, because how many tries it took is a story about the promise, not about
+// the movement.
 type Withdrawal struct {
 	ID          uuid.UUID
-	Wallet      uuid.UUID // the wallet it is paid from
+	Wallet      WalletID // the wallet it was paid from
 	Reason      DebitReason
 	Destination common.Address
 
@@ -523,44 +516,72 @@ type Withdrawal struct {
 	// (§43).
 	PartOf uuid.UUID
 	Amount *big.Int
-	Status WithdrawalStatus
 	TxHash common.Hash
 
-	// Block is the finalized block the transfer landed in, set when the
-	// withdrawal confirms. It is the feed's ordering: a caller polls settled
-	// debits the same way it polls deposits.
+	// Block is the finalized block the transfer landed in. It is the feed's
+	// ordering: a caller polls settled debits the same way it polls deposits.
 	Block uint64
-	// Error and Attempts are diagnostics, never a verdict: a withdrawal has no
-	// failure state, so these describe a request still being retried (§28).
-	Error          string
-	Attempts       uint32
+
 	IdempotencyKey string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	CreatedAt      time.Time // when it was asked for
+	SettledAt      time.Time // when the chain confirmed it
 }
 
-// Settled is this withdrawal's position in the finalized-debit feed. It is only
-// meaningful once the withdrawal is terminal.
+// Settled is this withdrawal's position in the finalized-debit feed.
 func (wd *Withdrawal) Settled() Settled { return Settled{Block: wd.Block, ID: wd.ID} }
 
 func (wd *Withdrawal) encode() ([]byte, error) {
 	e := &enc{}
 	e.u8(vWithdrawal)
 	e.id(wd.ID)
-	e.id(wd.Wallet)
+	e.walletID(wd.Wallet)
 	e.u8(uint8(wd.Reason))
 	e.id(wd.PartOf)
 	e.addr(wd.Destination)
 	e.wei(wd.Amount)
-	e.u8(uint8(wd.Status))
 	e.hash(wd.TxHash)
 	e.u64(wd.Block)
-	e.str(wd.Error)
-	e.u32(wd.Attempts)
 	e.str(wd.IdempotencyKey)
 	e.stamp(wd.CreatedAt)
-	e.stamp(wd.UpdatedAt)
+	e.stamp(wd.SettledAt)
 	return e.b, e.err
+}
+
+func (p *Pending) encode() ([]byte, error) {
+	e := &enc{}
+	e.u8(vPending)
+	e.id(p.ID)
+	e.walletID(p.Wallet)
+	e.u8(uint8(p.Reason))
+	e.id(p.PartOf)
+	e.addr(p.Destination)
+	e.wei(p.Amount)
+	e.u32(p.Attempts)
+	e.str(p.Error)
+	e.stamp(p.RetryAfter)
+	e.str(p.IdempotencyKey)
+	e.stamp(p.CreatedAt)
+	e.stamp(p.UpdatedAt)
+	return e.b, e.err
+}
+
+func decodePending(b []byte) (Pending, error) {
+	d := newDec(b)
+	_ = d.u8()
+	var p Pending
+	p.ID = d.id()
+	p.Wallet = d.walletID()
+	p.Reason = DebitReason(d.u8())
+	p.PartOf = d.id()
+	p.Destination = d.addr()
+	p.Amount = d.wei()
+	p.Attempts = d.u32()
+	p.Error = d.str()
+	p.RetryAfter = d.stamp()
+	p.IdempotencyKey = d.str()
+	p.CreatedAt = d.stamp()
+	p.UpdatedAt = d.stamp()
+	return p, d.done()
 }
 
 func decodeWithdrawal(b []byte) (Withdrawal, error) {
@@ -568,19 +589,16 @@ func decodeWithdrawal(b []byte) (Withdrawal, error) {
 	_ = d.u8()
 	var wd Withdrawal
 	wd.ID = d.id()
-	wd.Wallet = d.id()
+	wd.Wallet = d.walletID()
 	wd.Reason = DebitReason(d.u8())
 	wd.PartOf = d.id()
 	wd.Destination = d.addr()
 	wd.Amount = d.wei()
-	wd.Status = WithdrawalStatus(d.u8())
 	wd.TxHash = d.hash()
 	wd.Block = d.u64()
-	wd.Error = d.str()
-	wd.Attempts = d.u32()
 	wd.IdempotencyKey = d.str()
 	wd.CreatedAt = d.stamp()
-	wd.UpdatedAt = d.stamp()
+	wd.SettledAt = d.stamp()
 	return wd, d.done()
 }
 

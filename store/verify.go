@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math/big"
 
@@ -23,7 +24,8 @@ type Report struct {
 	Proxies     int
 	Flows       int
 	Deposits    int
-	Withdrawals int
+	Withdrawals int      // settled
+	Pending     int      // promises still outstanding
 	Held        *big.Int // custody across every managed wallet
 	Committed   *big.Int // the total promised by pending withdrawals
 	Findings    []Finding
@@ -49,8 +51,8 @@ func (r *Report) flag(kind, where, detail string) {
 func (t *Tx) Verify() (Report, error) {
 	rep := Report{Held: new(big.Int), Committed: new(big.Int)}
 
-	wallets := map[uuid.UUID]Wallet{}
-	byAddr := map[common.Address]uuid.UUID{}
+	wallets := map[WalletID]Wallet{}
+	byAddr := map[common.Address]WalletID{}
 	if err := t.EachWallet(func(w Wallet) error {
 		rep.Wallets++
 		wallets[w.ID] = w
@@ -71,13 +73,10 @@ func (t *Tx) Verify() (Report, error) {
 	// Both lookup indexes must resolve to the record that claims them.
 	for id, w := range wallets {
 		got := t.tx.Bucket(bAddr).Get(w.Address.Bytes())
-		if !isID(got, id) {
+		if !isWalletID(got, id) {
 			rep.flag("index", "addr/"+w.Address.Hex(), "does not point back at its wallet")
 		}
-		if w.Kind == KindMaster {
-			continue
-		}
-		if !isID(t.tx.Bucket(bRef).Get([]byte(w.Ref)), id) {
+		if !isWalletID(t.tx.Bucket(bRef).Get([]byte(w.Ref)), id) {
 			rep.flag("index", "ref/"+w.Ref, "does not point back at its wallet")
 		}
 	}
@@ -124,17 +123,9 @@ func (t *Tx) Verify() (Report, error) {
 		}
 	}
 
-	// Deposits: every record reachable from both indexes, the open set holding
-	// exactly the un-forwarded ones on proxy wallets, and every forwarded one
-	// pointing at a debit that exists.
-	sweptBy := map[uuid.UUID][]common.Hash{}
-	openSeen := map[string]bool{}
-	if err := scanPrefix(t, iDepOpen, nil, func(k, _ []byte) error {
-		openSeen[string(k)] = true
-		return nil
-	}); err != nil {
-		return rep, err
-	}
+	// Deposits: every record reachable from both indexes, and belonging to a
+	// wallet that exists. There is nothing else to check — a deposit has no
+	// lifecycle and points at nothing (§50).
 	if err := scanPrefix(t, bDeposit, nil, func(k, v []byte) error {
 		rep.Deposits++
 		d, err := decodeDeposit(v)
@@ -145,61 +136,68 @@ func (t *Tx) Verify() (Report, error) {
 		if got := t.tx.Bucket(iDep).Get(cur); string(got) != string(k) {
 			rep.flag("index", "dep/"+d.TxHash.Hex(), "missing from the cursor index")
 		}
-		if got := t.tx.Bucket(iDepWallet).Get(join(d.Wallet[:], cur)); string(got) != string(k) {
+		if got := t.tx.Bucket(iDepWallet).Get(join(d.Wallet.Key(), cur)); string(got) != string(k) {
 			rep.flag("index", "dep/"+d.TxHash.Hex(), "missing from the per-wallet index")
 		}
-		w, known := wallets[d.Wallet]
-		if !known {
+		if _, known := wallets[d.Wallet]; !known {
 			rep.flag("ownership", "dep/"+d.TxHash.Hex(), "belongs to a wallet that does not exist")
-			return nil
-		}
-		wantOpen := d.Status == DepositReceived && w.Proxies()
-		gotOpen := openSeen[string(join(d.Wallet[:], k))]
-		if wantOpen != gotOpen {
-			rep.flag("index", "dep/"+d.TxHash.Hex(),
-				fmt.Sprintf("status %s on a proxy=%t wallet but open-index membership is %t", d.Status, w.Proxies(), gotOpen))
-		}
-		// A forwarded credit must name the debit that carried it, and that debit
-		// must exist. This is the link that replaces the drain concept, so a
-		// broken one is the audit's business (§42).
-		switch {
-		case d.Status == DepositForwarded && d.SweptBy == uuid.Nil:
-			rep.flag("ownership", "dep/"+d.TxHash.Hex(), "forwarded but names no debit")
-		case d.Status != DepositForwarded && d.SweptBy != uuid.Nil:
-			rep.flag("ownership", "dep/"+d.TxHash.Hex(), "names a debit but is not forwarded")
-		case d.SweptBy != uuid.Nil:
-			sweptBy[d.SweptBy] = append(sweptBy[d.SweptBy], d.TxHash)
 		}
 		return nil
 	}); err != nil {
 		return rep, err
 	}
 
-	// Withdrawals: indexes both ways, and the promise a wallet has made.
-	committed := map[uuid.UUID]*big.Int{}
-	debits := map[uuid.UUID]bool{}
-	if err := scanPrefix(t, bWithdrawal, nil, func(k, v []byte) error {
+	// Debits, in two keyspaces. A promise must not also be a fact, a fact must
+	// be in the feed and the per-wallet index, and every wallet's promises must
+	// be coverable by what it holds (§51).
+	committed := map[WalletID]*big.Int{}
+	if err := scanPrefix(t, bPending, nil, func(_, v []byte) error {
+		p, err := decodePending(v)
+		if err != nil {
+			return err
+		}
+		rep.Pending++
+		if p.Reason.String() == "unknown" {
+			rep.flag("ownership", "wd/"+p.ID.String(),
+				fmt.Sprintf("reason %d is not one this service writes", p.Reason))
+		}
+		// A drain is recorded once it has already happened, so one waiting here
+		// means something wrote a promise nobody will keep.
+		if p.Reason == ReasonDrain {
+			rep.flag("ownership", "wd/"+p.ID.String(), "a drain is pending, which it can never be")
+		}
+		// The two keyspaces are exclusive by construction — Settle deletes then
+		// writes, in one transaction — so a record in both means one of those
+		// halves did not happen.
+		if _, both, err := t.Withdrawal(p.ID); err != nil {
+			return err
+		} else if both {
+			rep.flag("ownership", "wd/"+p.ID.String(), "is both a promise and a fact")
+		}
+		if p.IdempotencyKey != "" && !isID(t.tx.Bucket(iWdIdem).Get([]byte(p.IdempotencyKey)), p.ID) {
+			rep.flag("index", "wd/"+p.ID.String(), "idempotency key does not point back at it")
+		}
+		if committed[p.Wallet] == nil {
+			committed[p.Wallet] = new(big.Int)
+		}
+		committed[p.Wallet].Add(committed[p.Wallet], orZero(p.Amount))
+		return nil
+	}); err != nil {
+		return rep, err
+	}
+
+	if err := scanPrefix(t, bWithdrawal, nil, func(_, v []byte) error {
 		rep.Withdrawals++
 		wd, err := decodeWithdrawal(v)
 		if err != nil {
 			return err
 		}
 		created := be64(stampNanos(wd.CreatedAt))
-		if t.tx.Bucket(iWd).Get(join(created, wd.ID[:])) == nil {
-			rep.flag("index", "wd/"+wd.ID.String(), "missing from the history index")
-		}
-		if t.tx.Bucket(iWdWallet).Get(join(wd.Wallet[:], created, wd.ID[:])) == nil {
+		if t.tx.Bucket(iWdWallet).Get(join(wd.Wallet.Key(), created, wd.ID[:])) == nil {
 			rep.flag("index", "wd/"+wd.ID.String(), "missing from the per-wallet index")
 		}
-		inOpen := t.tx.Bucket(iWdOpen).Get(wd.ID[:]) != nil
-		if inOpen == wd.Status.IsTerminal() {
-			rep.flag("index", "wd/"+wd.ID.String(),
-				fmt.Sprintf("status %s but open-set membership is %t", wd.Status, inOpen))
-		}
-		inFeed := t.tx.Bucket(iWdFeed).Get(wd.Settled().Key()) != nil
-		if inFeed != wd.Status.IsTerminal() {
-			rep.flag("index", "wd/"+wd.ID.String(),
-				fmt.Sprintf("status %s but settled-feed membership is %t", wd.Status, inFeed))
+		if t.tx.Bucket(iWdFeed).Get(wd.Settled().Key()) == nil {
+			rep.flag("index", "wd/"+wd.ID.String(), "missing from the settled feed")
 		}
 		// Go's zero value is a valid uint8, so a construction site that forgets
 		// the field writes a debit that explains nothing and compiles silently.
@@ -209,33 +207,19 @@ func (t *Tx) Verify() (Report, error) {
 			rep.flag("ownership", "wd/"+wd.ID.String(),
 				fmt.Sprintf("reason %d is not one this service writes", wd.Reason))
 		}
-		// A drain is recorded once it has already happened, so one that is not
-		// terminal means something wrote a promise nobody will keep.
-		if wd.Reason == ReasonDrain && !wd.Status.IsTerminal() {
-			rep.flag("ownership", "wd/"+wd.ID.String(), "a drain is pending, which it can never be")
+		// Being here means it happened, so it must say what happened.
+		if wd.TxHash == (common.Hash{}) {
+			rep.flag("ownership", "wd/"+wd.ID.String(), "is a settled debit with no transaction")
 		}
 		if wd.IdempotencyKey != "" && !isID(t.tx.Bucket(iWdIdem).Get([]byte(wd.IdempotencyKey)), wd.ID) {
 			rep.flag("index", "wd/"+wd.ID.String(), "idempotency key does not point back at it")
 		}
-		debits[wd.ID] = true
-		if !wd.Status.IsTerminal() {
-			if committed[wd.Wallet] == nil {
-				committed[wd.Wallet] = new(big.Int)
-			}
-			committed[wd.Wallet].Add(committed[wd.Wallet], orZero(wd.Amount))
+		if _, known := wallets[wd.Wallet]; !known {
+			rep.flag("ownership", "wd/"+wd.ID.String(), "belongs to a wallet that does not exist")
 		}
-		_ = k
 		return nil
 	}); err != nil {
 		return rep, err
-	}
-
-	for id, deposits := range sweptBy {
-		if !debits[id] {
-			for _, h := range deposits {
-				rep.flag("ownership", "dep/"+h.Hex(), "names a debit that does not exist")
-			}
-		}
 	}
 
 	// A wallet must never owe more than it holds. This is what the per-app
@@ -254,9 +238,156 @@ func (t *Tx) Verify() (Report, error) {
 		}
 	}
 
+	if err := t.checkIndexes(&rep); err != nil {
+		return rep, err
+	}
 	return rep, nil
+}
+
+// checkIndexes walks every index bucket and checks each entry resolves to a
+// record that agrees with it.
+//
+// This is the other direction. Everything above starts from a record and asks
+// whether the indexes know about it, which catches a missing entry — but an
+// entry pointing at a record that was never written, or at the wrong one, is
+// invisible from that side. A hand-rolled index can fail either way, and the
+// failure this misses is the worse one: a lookup that succeeds and returns
+// somebody else's row.
+func (t *Tx) checkIndexes(rep *Report) error {
+	// idx/dep: the caller's cursor. Its key must be the deposit's own position.
+	if err := scanPrefix(t, iDep, nil, func(k, v []byte) error {
+		d, err := decodeDeposit(t.tx.Bucket(bDeposit).Get(v))
+		if err != nil {
+			rep.flag("index", "idx/dep/"+hex.EncodeToString(k), "points at no deposit")
+			return nil //nolint:nilerr // a dangling entry is a finding, not a read failure
+		}
+		if string(d.Cursor().Key()) != string(k) {
+			rep.flag("index", "idx/dep/"+hex.EncodeToString(k), "indexed under a cursor that is not the deposit's")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// idx/dep_wallet: wallet ++ cursor.
+	if err := scanPrefix(t, iDepWallet, nil, func(k, v []byte) error {
+		d, err := decodeDeposit(t.tx.Bucket(bDeposit).Get(v))
+		if err != nil {
+			rep.flag("index", "idx/dep_wallet/"+hex.EncodeToString(k), "points at no deposit")
+			return nil //nolint:nilerr // a dangling entry is a finding, not a read failure
+		}
+		if string(join(d.Wallet.Key(), d.Cursor().Key())) != string(k) {
+			rep.flag("index", "idx/dep_wallet/"+hex.EncodeToString(k), "indexed under the wrong wallet or cursor")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// idx/wd_feed: block ++ id, settled debits only.
+	if err := scanPrefix(t, iWdFeed, nil, func(k, _ []byte) error {
+		pos, ok := settledFromKey(k)
+		if !ok {
+			rep.flag("index", "idx/wd_feed/"+hex.EncodeToString(k), "malformed key")
+			return nil
+		}
+		wd, found, err := t.Withdrawal(pos.ID)
+		if err != nil {
+			return err
+		}
+		switch {
+		case !found:
+			rep.flag("index", "wd/"+pos.ID.String(), "on the settled feed but not in the log")
+		case wd.Block != pos.Block:
+			rep.flag("index", "wd/"+pos.ID.String(), "on the settled feed under the wrong block")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// idx/wd_wallet: wallet ++ created ++ id.
+	if err := scanPrefix(t, iWdWallet, nil, func(k, _ []byte) error {
+		if len(k) != 8+8+16 {
+			rep.flag("index", "idx/wd_wallet/"+hex.EncodeToString(k), "malformed key")
+			return nil
+		}
+		var id uuid.UUID
+		copy(id[:], k[16:])
+		wd, found, err := t.Withdrawal(id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			rep.flag("index", "wd/"+id.String(), "in the per-wallet index but not in the log")
+			return nil
+		}
+		if string(join(wd.Wallet.Key(), be64(stampNanos(wd.CreatedAt)), id[:])) != string(k) {
+			rep.flag("index", "wd/"+id.String(), "in the per-wallet index under the wrong wallet or time")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// idx/wd_idem: the key a retry resolves through. It spans both keyspaces, so
+	// either half may answer — but exactly one must, and it must claim the key.
+	if err := scanPrefix(t, iWdIdem, nil, func(k, v []byte) error {
+		var id uuid.UUID
+		copy(id[:], v)
+		if p, ok, err := t.Pending(id); err != nil {
+			return err
+		} else if ok {
+			if p.IdempotencyKey != string(k) {
+				rep.flag("index", "wd/"+id.String(), "idempotency key "+string(k)+" resolves to a promise that does not claim it")
+			}
+			return nil
+		}
+		wd, found, err := t.Withdrawal(id)
+		if err != nil {
+			return err
+		}
+		switch {
+		case !found:
+			rep.flag("index", "idem/"+string(k), "points at no debit")
+		case wd.IdempotencyKey != string(k):
+			rep.flag("index", "wd/"+id.String(), "idempotency key "+string(k)+" resolves to a debit that does not claim it")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// data/addr and data/ref: the two wallet lookups. A stale entry here is the
+	// one that resolves an address or a handle to the wrong wallet entirely.
+	if err := scanPrefix(t, bAddr, nil, func(k, v []byte) error {
+		w, found, err := t.Wallet(walletIDFromKey(v))
+		if err != nil {
+			return err
+		}
+		if !found || w.Address != common.BytesToAddress(k) {
+			rep.flag("index", "addr/"+common.BytesToAddress(k).Hex(), "resolves to a wallet with a different address")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return scanPrefix(t, bRef, nil, func(k, v []byte) error {
+		w, found, err := t.Wallet(walletIDFromKey(v))
+		if err != nil {
+			return err
+		}
+		if !found || w.Ref != string(k) {
+			rep.flag("index", "ref/"+string(k), "resolves to a wallet with a different ref")
+		}
+		return nil
+	})
 }
 
 func isID(v []byte, want uuid.UUID) bool {
 	return len(v) == len(want) && string(v) == string(want[:])
+}
+
+func isWalletID(v []byte, want WalletID) bool {
+	return len(v) == 8 && string(v) == string(want.Key())
 }

@@ -27,15 +27,23 @@ type walletView struct {
 	Available string `json:"available"`
 }
 
+// drainsPage is the settled-debit feed, narrowed to what the forwarding tests
+// need from it.
+type drainsPage struct {
+	Withdrawals []struct {
+		Amount string `json:"amount"`
+		Reason string `json:"reason"`
+		TxHash string `json:"tx_hash"`
+		Wallet string `json:"wallet"`
+	} `json:"withdrawals"`
+}
+
 type depositsPage struct {
 	Deposits []struct {
-		ID      string `json:"id"`
-		Wallet  string `json:"wallet"`
-		Amount  string `json:"amount"`
-		Status  string `json:"status"`
-		TxHash  string `json:"tx_hash"`
-		SweptBy string `json:"swept_by"`
-		SweptTx string `json:"swept_tx"`
+		ID     string `json:"id"`
+		Wallet string `json:"wallet"`
+		Amount string `json:"amount"`
+		TxHash string `json:"tx_hash"`
 	} `json:"deposits"`
 	Cursor string `json:"cursor"`
 }
@@ -166,13 +174,19 @@ func TestLifecycle(t *testing.T) {
 		// prefix of the drain rather than a cost paid up front (§41). Gas
 		// estimation is the thing a simulator cannot check: if the estimate is
 		// short, the approve simply fails on a real chain.
+		// The credit is recorded on arrival and never touched again (§50), so
+		// what says the money moved is a drain DEBIT appearing — not a status on
+		// the deposit.
+		//
+		// This pump is also what drives the service through funding, approving
+		// and the transfer: awaitBalance below only watches the chain and steps
+		// nothing, so whatever this waits for has to be the thing that finishes
+		// the work.
 		h.pump("the deposit to be forwarded", func() bool {
-			h.call("GET", "/v1/wallets/"+user+"/deposits", nil, http.StatusOK, &page)
-			return len(page.Deposits) > 0 && page.Deposits[0].Status == "forwarded"
+			var debits drainsPage
+			h.call("GET", "/v1/withdrawals?reason=drain", nil, http.StatusOK, &debits)
+			return len(debits.Withdrawals) > 0
 		})
-		if page.Deposits[0].SweptBy == "" {
-			t.Fatal("a forwarded deposit was not linked to the debit that carried it")
-		}
 
 		h.awaitBalance("the treasury to hold the deposit",
 			func() *big.Int { return h.tokenBalance(treasuryAddr) }, h.deposit)
@@ -202,13 +216,10 @@ func TestLifecycle(t *testing.T) {
 		h.call("GET", "/v1/deposits", nil, http.StatusOK, &feed)
 
 		var forwarded, landed *struct {
-			ID      string `json:"id"`
-			Wallet  string `json:"wallet"`
-			Amount  string `json:"amount"`
-			Status  string `json:"status"`
-			TxHash  string `json:"tx_hash"`
-			SweptBy string `json:"swept_by"`
-			SweptTx string `json:"swept_tx"`
+			ID     string `json:"id"`
+			Wallet string `json:"wallet"`
+			Amount string `json:"amount"`
+			TxHash string `json:"tx_hash"`
 		}
 		for i := range feed.Deposits {
 			switch feed.Deposits[i].Wallet {
@@ -221,9 +232,18 @@ func TestLifecycle(t *testing.T) {
 		if forwarded == nil || landed == nil {
 			t.Fatalf("feed does not carry both ends: %+v", feed.Deposits)
 		}
-		if forwarded.SweptTx != landed.TxHash {
-			t.Fatalf("swept_tx %s does not match the landing tx %s",
-				forwarded.SweptTx, landed.TxHash)
+		// The two ends pair through the DEBIT, which is the record of the
+		// movement: the drain's tx_hash is the transfer that landed downstream.
+		var debits drainsPage
+		h.call("GET", "/v1/withdrawals?reason=drain", nil, http.StatusOK, &debits)
+		var paired bool
+		for _, wd := range debits.Withdrawals {
+			if wd.TxHash == landed.TxHash {
+				paired = true
+			}
+		}
+		if !paired {
+			t.Fatalf("no drain debit carries the landing tx %s: %+v", landed.TxHash, debits.Withdrawals)
 		}
 	})
 

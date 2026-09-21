@@ -158,8 +158,8 @@ The top row is what an operator actually watches, and
 - **Master wallet** — the one to alert on. A dry master stops every pipeline, and
   **nothing refills it**: the automatic top-up was removed along with the fee
   that funded it (§38). The same panel plots `bsc_master_usdt_wei` beside it,
-  because tokens parked there are what `bsc swap` can trade for gas. Native
-  below `gas.floor_wei` is a page, not a warning.
+  because fees accumulate there (§43) and are yours to move by hand — bsc does
+  not trade them (§53). Native below `gas.floor_wei` is a page, not a warning.
 - **Blocks behind** — sustained growth means the RPC cannot keep up, and
   withdrawals start being refused once it passes `chain.max_lag_blocks`.
 - **In-flight age** — signing is sequential, so this growing means one

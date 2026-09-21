@@ -45,7 +45,7 @@ func TestFlowRoundTripAndValidation(t *testing.T) {
 	}
 
 	if err := s.Update(func(tx *Tx) error {
-		return tx.PutFlow(Flow{Wallet: uuid.New()}) // no id
+		return tx.PutFlow(Flow{Wallet: nextID()}) // no id
 	}); err == nil {
 		t.Fatal("PutFlow accepted a flow with no id")
 	}

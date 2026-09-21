@@ -10,33 +10,51 @@ import (
 	"github.com/google/uuid"
 )
 
-func newWithdrawal(wallet uuid.UUID, amount int64, key string) Withdrawal {
-	return Withdrawal{
+func newPending(wallet WalletID, amount int64, key string) Pending {
+	return Pending{
 		ID: uuid.New(), Wallet: wallet, Reason: ReasonPayout, Destination: addr(0x99),
-		Amount: wei(amount), Status: WithdrawalPending, IdempotencyKey: key,
+		Amount: wei(amount), IdempotencyKey: key,
 		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 }
 
 // A retry after a timeout must replay the original rather than pay twice, which
 // over HTTP is the only thing standing between a dropped response and a double
-// spend.
-func TestWithdrawalIdempotencyLookup(t *testing.T) {
+// spend. The key has to resolve whichever keyspace the original is in (§51).
+func TestIdempotencyLookupFindsEitherHalf(t *testing.T) {
 	s := open(t)
 	w := seedWallet(t, s, "hot", 1000)
-	wd := newWithdrawal(w.ID, 250, "order-4417")
-	update(t, s, func(tx *Tx) error { return tx.PutWithdrawal(wd) })
+	p := newPending(w.ID, 250, "order-4417")
+	update(t, s, func(tx *Tx) error { return tx.PutPending(p) })
 
 	if err := s.View(func(tx *Tx) error {
-		got, ok, err := tx.WithdrawalByKey("order-4417")
-		if err != nil || !ok {
-			t.Fatalf("by key: ok=%v err=%v", ok, err)
+		got, done, err := tx.DebitByKey("order-4417")
+		if err != nil {
+			return err
 		}
-		if got.ID != wd.ID {
-			t.Fatalf("key resolved to %s, want %s", got.ID, wd.ID)
+		if got == nil || done != nil || got.ID != p.ID {
+			t.Fatalf("while pending: got %+v / %+v, want the promise", got, done)
 		}
-		if _, ok, err := tx.WithdrawalByKey("never-used"); err != nil || ok {
-			t.Fatalf("unknown key: ok=%v err=%v", ok, err)
+		if _, _, err := tx.DebitByKey("never-used"); err != nil {
+			t.Fatalf("unknown key: %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same key must still resolve once the promise has become a fact.
+	update(t, s, func(tx *Tx) error {
+		_, err := tx.Settle(p.ID, hash(0x42), 100, time.Now().UTC())
+		return err
+	})
+	if err := s.View(func(tx *Tx) error {
+		got, done, err := tx.DebitByKey("order-4417")
+		if err != nil {
+			return err
+		}
+		if done == nil || got != nil || done.ID != p.ID {
+			t.Fatalf("after settling: got %+v / %+v, want the fact", got, done)
 		}
 		return nil
 	}); err != nil {
@@ -45,29 +63,29 @@ func TestWithdrawalIdempotencyLookup(t *testing.T) {
 	mustBeClean(t, verify(t, s))
 }
 
-// The idempotency namespace is global now, not per app: one caller owns the
+// The idempotency namespace is global, not per wallet: one caller owns the
 // service and must keep its own keys unique (§37).
 func TestIdempotencyKeysAreGlobal(t *testing.T) {
 	s := open(t)
 	a := seedWalletAt(t, s, "a", addr(0x21), common.Address{}, 1000)
 	b := seedWalletAt(t, s, "b", addr(0x22), common.Address{}, 1000)
 
-	first := newWithdrawal(a.ID, 10, "shared")
-	second := newWithdrawal(b.ID, 20, "shared")
+	first := newPending(a.ID, 100, "shared")
+	second := newPending(b.ID, 200, "shared")
 	update(t, s, func(tx *Tx) error {
-		if err := tx.PutWithdrawal(first); err != nil {
+		if err := tx.PutPending(first); err != nil {
 			return err
 		}
-		return tx.PutWithdrawal(second)
+		return tx.PutPending(second)
 	})
 
 	if err := s.View(func(tx *Tx) error {
-		got, ok, err := tx.WithdrawalByKey("shared")
-		if err != nil || !ok {
+		got, _, err := tx.DebitByKey("shared")
+		if err != nil {
 			return err
 		}
-		if got.ID != second.ID {
-			t.Fatal("a key reused across wallets did not resolve to the later writer")
+		if got == nil || got.ID != second.ID {
+			t.Fatal("a key reused across wallets did not resolve to the later record")
 		}
 		return nil
 	}); err != nil {
@@ -75,71 +93,68 @@ func TestIdempotencyKeysAreGlobal(t *testing.T) {
 	}
 }
 
-func TestWithdrawalsWithoutAKeyAreStillStored(t *testing.T) {
+// Settling MOVES the record. The promise is gone from state/ and the fact is in
+// log/, in one transaction — which is what makes "which bucket it is in" a
+// status that cannot disagree with anything (§51).
+func TestSettlingMovesTheRecordBetweenKeyspaces(t *testing.T) {
 	s := open(t)
 	w := seedWallet(t, s, "hot", 1000)
-	wd := newWithdrawal(w.ID, 100, "")
-	update(t, s, func(tx *Tx) error { return tx.PutWithdrawal(wd) })
+	p := newPending(w.ID, 100, "k")
+	update(t, s, func(tx *Tx) error { return tx.PutPending(p) })
 
 	if err := s.View(func(tx *Tx) error {
-		got, ok, err := tx.Withdrawal(wd.ID)
-		if err != nil || !ok {
-			t.Fatalf("lookup: ok=%v err=%v", ok, err)
-		}
-		if got.Amount.Cmp(wei(100)) != 0 {
-			t.Fatalf("amount = %s", got.Amount)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	mustBeClean(t, verify(t, s))
-}
-
-// `confirmed` is the only terminal status, so the open set is exactly what is
-// still pending — which is both what the rules scan and what the caller polls.
-func TestOpenSetTracksTerminalStatus(t *testing.T) {
-	s := open(t)
-	w := seedWallet(t, s, "hot", 1000)
-	wd := newWithdrawal(w.ID, 100, "k")
-	update(t, s, func(tx *Tx) error { return tx.PutWithdrawal(wd) })
-
-	if err := s.View(func(tx *Tx) error {
-		open, err := tx.OpenWithdrawals()
+		open, err := tx.OpenPending()
 		if err != nil {
 			return err
 		}
 		if len(open) != 1 {
 			t.Fatalf("open = %d, want 1", len(open))
 		}
+		if _, ok, err := tx.Withdrawal(p.ID); err != nil || ok {
+			t.Fatalf("a promise is already in the log (ok=%v err=%v)", ok, err)
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 
+	settledAt := time.Now().UTC()
 	update(t, s, func(tx *Tx) error {
-		_, err := tx.MutateWithdrawal(wd.ID, func(x *Withdrawal) error {
-			x.Status = WithdrawalConfirmed
-			x.TxHash = hash(0x42)
-			return nil
-		})
-		return err
+		wd, err := tx.Settle(p.ID, hash(0x42), 4821, settledAt)
+		if err != nil {
+			return err
+		}
+		if wd.Amount.Cmp(p.Amount) != 0 || wd.Reason != p.Reason || wd.TxHash != hash(0x42) {
+			t.Fatalf("settled record = %+v, does not carry the promise", wd)
+		}
+		return nil
 	})
 
 	if err := s.View(func(tx *Tx) error {
-		open, err := tx.OpenWithdrawals()
+		open, err := tx.OpenPending()
 		if err != nil {
 			return err
 		}
 		if len(open) != 0 {
-			t.Fatalf("open = %d after confirmation, want 0", len(open))
+			t.Fatalf("open = %d after settling, want 0", len(open))
 		}
-		all, err := tx.Withdrawals(0)
+		if _, ok, err := tx.Pending(p.ID); err != nil || ok {
+			t.Fatalf("the promise outlived settlement (ok=%v err=%v)", ok, err)
+		}
+		wd, ok, err := tx.Withdrawal(p.ID)
+		if err != nil || !ok {
+			t.Fatalf("the fact is not in the log (ok=%v err=%v)", ok, err)
+		}
+		if wd.Block != 4821 || !wd.SettledAt.Equal(settledAt) {
+			t.Fatalf("settled record = %+v, want block and settled_at recorded", wd)
+		}
+		// And it is on the feed a caller polls.
+		feed, _, err := tx.SettledSince(Settled{}, 0)
 		if err != nil {
 			return err
 		}
-		if len(all) != 1 {
-			t.Fatalf("history = %d, want 1 — a confirmed withdrawal is kept forever", len(all))
+		if len(feed) != 1 || feed[0].ID != p.ID {
+			t.Fatalf("settled feed = %+v, want the one debit", feed)
 		}
 		return nil
 	}); err != nil {
@@ -148,26 +163,42 @@ func TestOpenSetTracksTerminalStatus(t *testing.T) {
 	mustBeClean(t, verify(t, s))
 }
 
+func TestSettlingSomethingThatIsNotPending(t *testing.T) {
+	s := open(t)
+	err := s.Update(func(tx *Tx) error {
+		_, err := tx.Settle(uuid.New(), hash(1), 1, time.Now())
+		return err
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
 // Committed is the overdraft guard's left-hand side: what this wallet has
-// promised and not yet paid (§39).
-func TestCommittedSumsOnlyPendingWithdrawalsForOneWallet(t *testing.T) {
+// promised and not yet paid (§39). Splitting the keyspaces made it a scan of
+// exactly the promises — a settled debit cannot leak into it, because it is not
+// in the bucket any more (§51).
+func TestCommittedSumsOnlyPromisesForOneWallet(t *testing.T) {
 	s := open(t)
 	a := seedWalletAt(t, s, "a", addr(0x21), common.Address{}, 5000)
 	b := seedWalletAt(t, s, "b", addr(0x22), common.Address{}, 5000)
 
+	done := newPending(a.ID, 4000, "")
 	update(t, s, func(tx *Tx) error {
-		if err := tx.PutWithdrawal(newWithdrawal(a.ID, 100, "")); err != nil {
+		if err := tx.PutPending(newPending(a.ID, 100, "")); err != nil {
 			return err
 		}
-		if err := tx.PutWithdrawal(newWithdrawal(a.ID, 250, "")); err != nil {
+		if err := tx.PutPending(newPending(a.ID, 250, "")); err != nil {
 			return err
 		}
-		if err := tx.PutWithdrawal(newWithdrawal(b.ID, 900, "")); err != nil {
+		if err := tx.PutPending(newPending(b.ID, 900, "")); err != nil {
 			return err
 		}
-		done := newWithdrawal(a.ID, 4000, "")
-		done.Status = WithdrawalConfirmed
-		return tx.PutWithdrawal(done)
+		if err := tx.PutPending(done); err != nil {
+			return err
+		}
+		_, err := tx.Settle(done.ID, hash(0x77), 10, time.Now().UTC())
+		return err
 	})
 
 	if err := s.View(func(tx *Tx) error {
@@ -176,7 +207,7 @@ func TestCommittedSumsOnlyPendingWithdrawalsForOneWallet(t *testing.T) {
 			return err
 		}
 		if got.Int64() != 350 {
-			t.Fatalf("committed(a) = %s, want 350", got)
+			t.Fatalf("committed(a) = %s, want 350 — the settled 4000 must not count", got)
 		}
 		got, err = tx.Committed(b.ID)
 		if err != nil {
@@ -191,45 +222,63 @@ func TestCommittedSumsOnlyPendingWithdrawalsForOneWallet(t *testing.T) {
 	}
 }
 
-func TestMutateWithdrawalRefusesImmutableFields(t *testing.T) {
+func TestMutatePendingRefusesImmutableFields(t *testing.T) {
 	s := open(t)
 	w := seedWallet(t, s, "hot", 1000)
-	wd := newWithdrawal(w.ID, 100, "k")
-	update(t, s, func(tx *Tx) error { return tx.PutWithdrawal(wd) })
+	p := newPending(w.ID, 100, "k")
+	update(t, s, func(tx *Tx) error { return tx.PutPending(p) })
 
-	cases := map[string]func(*Withdrawal){
-		"id":              func(x *Withdrawal) { x.ID = uuid.New() },
-		"wallet":          func(x *Withdrawal) { x.Wallet = uuid.New() },
-		"idempotency key": func(x *Withdrawal) { x.IdempotencyKey = "other" },
-		"created_at":      func(x *Withdrawal) { x.CreatedAt = time.Now().Add(time.Hour) },
+	cases := map[string]func(*Pending){
+		"id":              func(x *Pending) { x.ID = uuid.New() },
+		"wallet":          func(x *Pending) { x.Wallet = nextID() },
+		"destination":     func(x *Pending) { x.Destination = addr(0x11) },
+		"amount":          func(x *Pending) { x.Amount = wei(999) },
+		"idempotency key": func(x *Pending) { x.IdempotencyKey = "other" },
+		"created_at":      func(x *Pending) { x.CreatedAt = time.Now().Add(time.Hour) },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
 			err := s.Update(func(tx *Tx) error {
-				_, err := tx.MutateWithdrawal(wd.ID, func(x *Withdrawal) error {
+				_, err := tx.MutatePending(p.ID, func(x *Pending) error {
 					mutate(x)
 					return nil
 				})
 				return err
 			})
 			if !errors.Is(err, ErrImmutable) {
-				t.Fatalf("err = %v, want ErrImmutable", err)
+				t.Fatalf("got %v, want ErrImmutable", err)
 			}
 		})
 	}
+
+	// What may change is how the attempt is going.
+	update(t, s, func(tx *Tx) error {
+		_, err := tx.MutatePending(p.ID, func(x *Pending) error {
+			x.Attempts++
+			x.Error = "reverted"
+			return nil
+		})
+		return err
+	})
 }
 
-func TestWithdrawalsAreListedMostRecentFirst(t *testing.T) {
+func TestWalletSettledIsListedMostRecentFirst(t *testing.T) {
 	s := open(t)
 	w := seedWallet(t, s, "hot", 10_000)
 	for i := range 3 {
-		wd := newWithdrawal(w.ID, int64(i+1), "")
-		wd.CreatedAt = time.Now().UTC().Add(time.Duration(i) * time.Second)
-		update(t, s, func(tx *Tx) error { return tx.PutWithdrawal(wd) })
+		p := newPending(w.ID, int64(i+1), "")
+		p.CreatedAt = time.Now().UTC().Add(time.Duration(i) * time.Second)
+		update(t, s, func(tx *Tx) error {
+			if err := tx.PutPending(p); err != nil {
+				return err
+			}
+			_, err := tx.Settle(p.ID, hash(byte(i+1)), uint64(i+1), time.Now().UTC())
+			return err
+		})
 	}
 
 	if err := s.View(func(tx *Tx) error {
-		list, err := tx.WalletWithdrawals(w.ID, 0)
+		list, err := tx.WalletSettled(w.ID, 0)
 		if err != nil {
 			return err
 		}
@@ -247,10 +296,10 @@ func TestWithdrawalsAreListedMostRecentFirst(t *testing.T) {
 	}
 }
 
-func TestMutateMissingWithdrawal(t *testing.T) {
+func TestMutateMissingPending(t *testing.T) {
 	s := open(t)
 	err := s.Update(func(tx *Tx) error {
-		_, err := tx.MutateWithdrawal(uuid.New(), func(*Withdrawal) error { return nil })
+		_, err := tx.MutatePending(uuid.New(), func(*Pending) error { return nil })
 		return err
 	})
 	if !errors.Is(err, ErrNotFound) {
@@ -260,23 +309,45 @@ func TestMutateMissingWithdrawal(t *testing.T) {
 
 // Go's zero value is a valid uint8, so a construction site that forgets the
 // reason compiles silently and writes a debit that explains nothing. The store
-// is the only place that can catch it (§42).
-func TestWithdrawalMustNameAReason(t *testing.T) {
+// is the only place that can catch it, and it catches it in both keyspaces (§42).
+func TestDebitsMustNameAReason(t *testing.T) {
 	s := open(t)
 	w := seedWallet(t, s, "hot", 1000)
 
 	err := s.Update(func(tx *Tx) error {
-		return tx.PutWithdrawal(Withdrawal{
+		return tx.PutPending(Pending{
 			ID: uuid.New(), Wallet: w.ID, // Reason omitted
-			Destination: addr(0x99), Amount: wei(10),
-			Status: WithdrawalPending, CreatedAt: time.Now().UTC(),
+			Destination: addr(0x99), Amount: wei(10), CreatedAt: time.Now().UTC(),
 		})
 	})
-	if err == nil {
-		t.Fatal("a debit with no reason was accepted")
+	if err == nil || !strings.Contains(err.Error(), "no reason") {
+		t.Fatalf("pending: err = %v, want it to name the missing reason", err)
 	}
-	if !strings.Contains(err.Error(), "no reason") {
-		t.Fatalf("err = %v, want it to name the missing reason", err)
+
+	err = s.Update(func(tx *Tx) error {
+		return tx.PutWithdrawal(Withdrawal{
+			ID: uuid.New(), Wallet: w.ID, // Reason omitted
+			Destination: addr(0x99), Amount: wei(10), TxHash: hash(1),
+			CreatedAt: time.Now().UTC(),
+		})
+	})
+	if err == nil || !strings.Contains(err.Error(), "no reason") {
+		t.Fatalf("settled: err = %v, want it to name the missing reason", err)
+	}
+}
+
+// Being in the log means it happened, so it has to say what happened.
+func TestASettledDebitMustNameItsTransaction(t *testing.T) {
+	s := open(t)
+	w := seedWallet(t, s, "hot", 1000)
+	err := s.Update(func(tx *Tx) error {
+		return tx.PutWithdrawal(Withdrawal{
+			ID: uuid.New(), Wallet: w.ID, Reason: ReasonDrain,
+			Destination: addr(0x99), Amount: wei(10), CreatedAt: time.Now().UTC(),
+		})
+	})
+	if err == nil || !strings.Contains(err.Error(), "no transaction") {
+		t.Fatalf("err = %v, want it to refuse a settled debit with no tx", err)
 	}
 }
 
@@ -290,17 +361,37 @@ func TestAuditFlagsAnUnrecognisedReason(t *testing.T) {
 	update(t, s, func(tx *Tx) error {
 		wd := Withdrawal{
 			ID: uuid.New(), Wallet: w.ID, Reason: DebitReason(99),
-			Destination: addr(0x99), Amount: wei(10),
-			Status: WithdrawalPending, CreatedAt: time.Now().UTC(),
+			Destination: addr(0x99), Amount: wei(10), TxHash: hash(3),
+			CreatedAt: time.Now().UTC(),
 		}
 		return put(tx, bWithdrawal, wd.ID[:], wd.encode)
 	})
 
 	found := findingsOfKind(verify(t, s), "ownership")
 	if len(found) != 1 {
-		t.Fatalf("ownership findings = %d, want 1", len(found))
+		t.Fatalf("ownership findings = %d, want 1 (%v)", len(found), verify(t, s).Findings)
 	}
 	if !strings.Contains(found[0].Detail, "reason 99") {
 		t.Fatalf("detail = %q, want it to name the value", found[0].Detail)
+	}
+}
+
+// A drain is recorded once it has already happened, so one waiting as a promise
+// is something nobody will ever keep (§42).
+func TestAuditFlagsAPendingDrain(t *testing.T) {
+	s := open(t)
+	hot := seedWallet(t, s, "hot", 0)
+	p := seedProxy(t, s, "cust-1", hot.Address, 500)
+
+	update(t, s, func(tx *Tx) error {
+		return tx.PutPending(Pending{
+			ID: uuid.New(), Wallet: p.ID, Reason: ReasonDrain,
+			Destination: hot.Address, Amount: wei(500), CreatedAt: time.Now().UTC(),
+		})
+	})
+
+	found := findingsOfKind(verify(t, s), "ownership")
+	if len(found) != 1 || !strings.Contains(found[0].Detail, "drain is pending") {
+		t.Fatalf("findings = %v, want one naming the pending drain", verify(t, s).Findings)
 	}
 }

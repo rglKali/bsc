@@ -40,7 +40,7 @@ func database(t *testing.T) string {
 		t.Fatalf("Open: %v", err)
 	}
 	w := store.Wallet{
-		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged,
+		ID: 1, Ref: "hot",
 		Address: common.HexToAddress("0xabc"),
 		Balance: big.NewInt(100), CreatedAt: time.Now(),
 	}

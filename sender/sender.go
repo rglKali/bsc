@@ -36,7 +36,6 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/google/uuid"
 )
 
 // maxUint256 is the allowance every managed wallet grants the master.
@@ -515,25 +514,27 @@ func (s *Sender) advance(f store.Flow, ok bool, reason string) error {
 	})
 }
 
-// key resolves a wallet record to the key that signs for it. The master is the
-// master secret used directly; everything else is an HMAC derivation of its
-// record id. Getting this wrong would sign with a key that controls nothing.
+// key resolves a wallet record to the key that signs for it: always an HMAC
+// derivation of its id. There is no longer a case for the master — it is not a
+// wallet in this store, so no flow can name it (§49).
+//
+// The address check is the guard that matters. A record whose id does not
+// reproduce its own address would be signed for with a key that controls
+// nothing, and the transfer would revert after the gas was spent.
 func (s *Sender) key(w store.Wallet) (keys.Key, error) {
-	if w.Kind == store.KindMaster {
-		if w.Address != s.master.Address {
-			return keys.Key{}, fmt.Errorf(
-				"sender: wallet %s is marked master but is not the master address", w.Address.Hex())
-		}
-		return s.master, nil
-	}
-	k, err := s.ring.Derive(w.ID)
+	k, err := s.ring.Derive(uint64(w.ID))
 	if err != nil {
 		return keys.Key{}, fmt.Errorf("sender: derive %s: %w", w.ID, err)
+	}
+	if k.Address != w.Address {
+		return keys.Key{}, fmt.Errorf(
+			"sender: wallet %s records address %s but id %s derives %s",
+			w.Ref, w.Address.Hex(), w.ID, k.Address.Hex())
 	}
 	return k, nil
 }
 
-func (s *Sender) wallet(id uuid.UUID) (store.Wallet, bool, error) {
+func (s *Sender) wallet(id store.WalletID) (store.Wallet, bool, error) {
 	var (
 		w     store.Wallet
 		found bool

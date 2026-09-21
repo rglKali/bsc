@@ -52,18 +52,19 @@ func RetryDelay(attempts uint32) time.Duration {
 
 // ShouldDrain reports whether a wallet is owed a drain flow.
 //
-// The DrainTo check is what used to be a wallet-kind check. It is load-bearing
-// either way: a wallet with no destination has nowhere to drain to, and an
-// unscoped rule would try to move its balance to itself forever. Making it a
-// field rather than a kind is what lets any wallet be either thing (§32).
+// The DrainTo check is what used to be a wallet-kind check. It is load-bearing:
+// a wallet with no destination has nowhere to drain to, and an unscoped rule
+// would try to move its balance to itself forever. Making it a field rather
+// than a kind is what lets any wallet be either thing (§32).
+//
+// There is no longer a kind to check for. Every wallet in the store is a
+// derived, managed one — the master is not a row (§49).
 //
 // The threshold is pure gas economics — moving three cents costs more than
 // three cents. It decides only whether moving the money is worth paying for;
 // the deposit is recorded either way.
 func ShouldDrain(w store.Wallet, threshold *big.Int, now time.Time) bool {
 	switch {
-	case w.Kind != store.KindManaged:
-		return false
 	case !w.Proxies():
 		return false
 	case !w.Idle():
@@ -94,8 +95,6 @@ func ShouldDrain(w store.Wallet, threshold *big.Int, now time.Time) bool {
 func ShouldPay(w store.Wallet, hasPending bool, now time.Time) bool {
 	switch {
 	case !hasPending:
-		return false
-	case w.Kind != store.KindManaged:
 		return false
 	case w.Proxies():
 		return false

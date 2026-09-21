@@ -3,9 +3,8 @@
 //
 // There is one config for the whole service, replacing v1's three separate
 // matrices. Anything that can be derived is derived rather than configured: gas
-// amounts come from estimates, the token and the swap router follow whatever
-// chain the endpoint reports, and the starting block defaults to the current
-// finalized head.
+// amounts come from estimates, the token follows whatever chain the endpoint
+// reports, and the starting block defaults to the current finalized head.
 //
 // **The split between the file and the environment is a security boundary, not
 // a convenience.** `master_secret` is the one setting that can move every
@@ -16,7 +15,7 @@
 // secret, and with it the answer to "what changed last month" (§30).
 //
 // Keys are nested, and an environment variable is the key path in upper case
-// with BSC_ in front: swap.amount_wei is BSC_SWAP_AMOUNT_WEI. Precedence is
+// with BSC_ in front: gas.floor_wei is BSC_GAS_FLOOR_WEI. Precedence is
 // flag, then environment, then file, then default.
 package config
 
@@ -29,7 +28,6 @@ import (
 	"time"
 
 	"bsc/chain"
-	"bsc/swap"
 	"bsc/usdt"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -70,17 +68,9 @@ type Config struct {
 
 	// GasFloor is the native balance below which the master is reported as low,
 	// by /healthz, by `bsc check` and by the bsc_master_bnb_wei gauge. Nothing
-	// acts on it: refilling is an operator command now, and this is the number
-	// that says when to run it (§38).
+	// acts on it, and nothing can: refilling is a transfer the operator makes
+	// (§53), and this is the number that says when to make it.
 	GasFloor *big.Int // gas.floor_wei
-
-	// Swap settings for the `bsc swap` command. The running service never
-	// trades; these exist so the operator's command does not need four flags
-	// every time, and so the router can default from the chain (§38).
-	SwapRouter   string        // swap.router — a Uniswap-V2-style router; defaults per chain
-	SwapNative   string        // swap.wrapped_native — optional override; the router is asked otherwise
-	SwapSlippage uint32        // swap.slippage_bps
-	SwapDeadline time.Duration // swap.deadline
 
 	FundingMultiplier float64       // gas.funding_multiplier — the only gas knobs
 	GasMultiplier     float64       // gas.price_multiplier
@@ -100,7 +90,7 @@ var oneUSDT, _ = new(big.Int).SetString("1000000000000000000", 10)
 const DefaultPath = "/etc/bsc/config.yaml"
 
 // EnvPrefix is prepended to every key path to form an environment variable:
-// swap.amount_wei is BSC_SWAP_AMOUNT_WEI.
+// gas.floor_wei is BSC_GAS_FLOOR_WEI.
 const EnvPrefix = "BSC"
 
 // EnvVar renders the environment variable that sets a key, which is what error
@@ -132,14 +122,10 @@ func New() *viper.Viper {
 	v.SetDefault("gas.price_multiplier", 1.10)
 	v.SetDefault("gas.rebroadcast_after", 2*time.Minute)
 	v.SetDefault("gas.master_poll", 30*time.Second)
-	v.SetDefault("swap.router", "") // resolved from the chain the endpoint reports
-	v.SetDefault("swap.wrapped_native", "")
 	// A transfer costs well under a thousandth of a BNB, so this floor is a few
 	// hundred transactions of headroom — enough that a top-up has time to land
 	// before anything actually runs dry.
 	v.SetDefault("gas.floor_wei", "50000000000000000") // 0.05
-	v.SetDefault("swap.slippage_bps", 100)             // 1%
-	v.SetDefault("swap.deadline", 2*time.Minute)
 	v.SetDefault("snapshot.dir", "")
 	v.SetDefault("snapshot.interval", time.Hour)
 	v.SetDefault("snapshot.keep", 24)
@@ -197,10 +183,6 @@ func Parse(v *viper.Viper) (Config, error) {
 		GasMultiplier:     v.GetFloat64("gas.price_multiplier"),
 		RebroadcastAfter:  v.GetDuration("gas.rebroadcast_after"),
 		MasterPoll:        v.GetDuration("gas.master_poll"),
-		SwapRouter:        v.GetString("swap.router"),
-		SwapNative:        v.GetString("swap.wrapped_native"),
-		SwapSlippage:      uint32(v.GetUint64("swap.slippage_bps")),
-		SwapDeadline:      v.GetDuration("swap.deadline"),
 		SnapshotDir:       v.GetString("snapshot.dir"),
 		SnapshotInterval:  v.GetDuration("snapshot.interval"),
 		SnapshotKeep:      v.GetInt("snapshot.keep"),
@@ -234,23 +216,6 @@ func Parse(v *viper.Viper) (Config, error) {
 	if cfg.GasFloor, err = wei(v, "gas.floor_wei"); err != nil {
 		return Config{}, err
 	}
-	// A router the operator did not name is resolved from the chain in
-	// ResolveChain; only an explicit one can be checked this early.
-	if cfg.SwapRouter != "" && !common.IsHexAddress(cfg.SwapRouter) {
-		return Config{}, fmt.Errorf("swap.router (%s) %q is not a hex address", EnvVar("swap.router"), cfg.SwapRouter)
-	}
-	// Normally unset: the router reports its own wrapped token, which cannot
-	// then disagree with it. Only validated when overridden.
-	if cfg.SwapNative != "" && !common.IsHexAddress(cfg.SwapNative) {
-		return Config{}, fmt.Errorf("swap.wrapped_native (%s) %q is not a hex address", EnvVar("swap.wrapped_native"), cfg.SwapNative)
-	}
-	if cfg.SwapSlippage >= 10_000 {
-		return Config{}, fmt.Errorf("swap.slippage_bps %d would accept any price at all", cfg.SwapSlippage)
-	}
-	if cfg.SwapDeadline <= 0 {
-		return Config{}, errors.New("swap.deadline must be positive")
-	}
-
 	// The rate limit has to clear the block rate by a wide margin or the
 	// watcher can never catch up after an outage. Refusing a value that cannot
 	// keep up beats discovering it during an incident.
@@ -289,8 +254,8 @@ func wei(v *viper.Viper, key string) (*big.Int, error) {
 // mismatch leaves a service that reads blocks perfectly and cannot send
 // anything, with nothing in the logs to explain it.
 //
-// An explicit chain.token_address or swap.router still wins; this only supplies what
-// the operator left out.
+// An explicit chain.token_address still wins; this only supplies what the
+// operator left out.
 func (c *Config) ResolveChain(chainID uint64) error {
 	if chainID == 0 {
 		return errors.New("config: cannot resolve settings without a chain id")
@@ -313,18 +278,5 @@ func (c *Config) ResolveChain(chainID uint64) error {
 		}
 	}
 
-	// The router is only ever used by `bsc swap`, so an unknown chain is not an
-	// error here: the service runs perfectly well without one, and leaving it
-	// empty is what lets `bsc swap` be the thing that says a router is missing,
-	// at the moment somebody actually asks for a trade. Addresses verified
-	// against the explorer.
-	if c.SwapRouter == "" {
-		switch chainID {
-		case chain.MainnetChainID:
-			c.SwapRouter = swap.PancakeV2Mainnet.Hex()
-		case chain.TestnetChainID:
-			c.SwapRouter = swap.PancakeV2Testnet.Hex()
-		}
-	}
 	return nil
 }

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/google/uuid"
 )
 
 // master is a valid, fixed secret so derivations are reproducible in tests.
@@ -99,7 +99,7 @@ func TestParseHexErrorDoesNotEchoTheSecret(t *testing.T) {
 
 func TestDerivationIsDeterministicAndDistinct(t *testing.T) {
 	r := ring(t)
-	a, b := uuid.New(), uuid.New()
+	a, b := uint64(1), uint64(2)
 
 	first, err := r.Derive(a)
 	if err != nil {
@@ -122,33 +122,78 @@ func TestDerivationIsDeterministicAndDistinct(t *testing.T) {
 	}
 }
 
-func TestDerivationUsesRawIDBytes(t *testing.T) {
-	// Keying on the raw 16 bytes rather than a string removes any chance that
-	// two spellings of the same UUID derive two different wallets.
+func TestDerivationIsHMACOfTheFixedWidthIndex(t *testing.T) {
+	// The message is 8 bytes big-endian, and the width is the point: a
+	// variable-width encoding would let 1 and 256 share a message, which would
+	// hand two wallets the same private key.
 	r := ring(t)
-	id := uuid.MustParse("0f7c3e2a-1b4d-4c8e-9a6f-2d5b8c1e4f70")
-	upper := uuid.MustParse(strings.ToUpper(id.String()))
-	lower, err := r.Derive(id)
+	key, err := r.Derive(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	upperKey, err := r.Derive(upper)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lower.Address != upperKey.Address {
-		t.Fatal("case of the UUID's string form changed the derived key")
+	want := mac(master, []byte{0, 0, 0, 0, 0, 0, 0, 1})
+	if !bytes.Equal(crypto.FromECDSA(key.Priv), want) {
+		t.Fatal("derived key is not HMAC(master, be64(index))")
 	}
 
-	// And it really is HMAC(master, id[:]).
-	want := mac(master, id[:])
-	if !bytes.Equal(crypto.FromECDSA(lower.Priv), want) {
-		t.Fatal("derived key is not HMAC(master, raw id bytes)")
+	seen := map[common.Address]uint64{}
+	for _, i := range []uint64{1, 255, 256, 257, 65535, 65536, 1 << 32, 1<<64 - 1} {
+		k, err := r.Derive(i)
+		if err != nil {
+			t.Fatalf("Derive(%d): %v", i, err)
+		}
+		if prev, dup := seen[k.Address]; dup {
+			t.Fatalf("indices %d and %d derived the same address", prev, i)
+		}
+		seen[k.Address] = i
+	}
+}
+
+// The whole point of a counter: the database is no longer half the key. Walking
+// the sequence reproduces every address the service ever issued, from the
+// secret alone (§48).
+func TestTheSequenceIsRecoverableFromTheSecretAlone(t *testing.T) {
+	issued := map[uint64]common.Address{}
+	func() {
+		r := ring(t)
+		for i := uint64(1); i <= 64; i++ {
+			k, err := r.Derive(i)
+			if err != nil {
+				t.Fatal(err)
+			}
+			issued[i] = k.Address
+		}
+	}() // the ring, and any notion of what was issued, goes out of scope here
+
+	recovered := ring(t) // a fresh ring, from the same secret and nothing else
+	for i := uint64(1); i <= 64; i++ {
+		k, err := recovered.Derive(i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if k.Address != issued[i] {
+			t.Fatalf("index %d recovered %s, want %s", i, k.Address.Hex(), issued[i].Hex())
+		}
+	}
+}
+
+func TestIndexZeroIsNotAWallet(t *testing.T) {
+	r := ring(t)
+	if _, err := r.Derive(0); !errors.Is(err, ErrZeroIndex) {
+		t.Fatalf("Derive(0) = %v, want ErrZeroIndex", err)
+	}
+	// Allocate must never hand out 0, even when asked for it.
+	id, _, err := r.Allocate(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id < FirstIndex {
+		t.Fatalf("Allocate(0) handed out %d, want >= %d", id, FirstIndex)
 	}
 }
 
 func TestDerivationIsMasterSpecific(t *testing.T) {
-	id := uuid.New()
+	const id = 7
 	a, _ := New(bytes.Repeat([]byte{0x11}, 32))
 	b, _ := New(bytes.Repeat([]byte{0x22}, 32))
 	ka, err := a.Derive(id)
@@ -174,7 +219,7 @@ func TestMasterIsTheSecretItself(t *testing.T) {
 		t.Fatal("the master key is not the master secret used directly")
 	}
 	// The master must not collide with any derived wallet.
-	d, err := r.Derive(uuid.New())
+	d, err := r.Derive(1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,19 +228,19 @@ func TestMasterIsTheSecretItself(t *testing.T) {
 	}
 }
 
-func TestGenerateReturnsAUsableWallet(t *testing.T) {
+func TestAllocateWalksForwardAndAgreesWithDerive(t *testing.T) {
 	r := ring(t)
-	seen := make(map[uuid.UUID]bool)
-	for range 32 {
-		id, key, err := r.Generate()
+	seen := make(map[uint64]bool)
+	for want := uint64(1); want <= 32; want++ {
+		id, key, err := r.Allocate(want)
 		if err != nil {
-			t.Fatalf("Generate: %v", err)
+			t.Fatalf("Allocate(%d): %v", want, err)
 		}
-		if id == uuid.Nil {
-			t.Fatal("Generate returned the nil UUID")
+		if id < want {
+			t.Fatalf("Allocate(%d) went backwards to %d", want, id)
 		}
 		if seen[id] {
-			t.Fatalf("Generate repeated id %s", id)
+			t.Fatalf("Allocate repeated id %d", id)
 		}
 		seen[id] = true
 
@@ -203,10 +248,10 @@ func TestGenerateReturnsAUsableWallet(t *testing.T) {
 		// store would record an id that cannot reproduce its own address.
 		again, err := r.Derive(id)
 		if err != nil {
-			t.Fatalf("Derive(%s): %v", id, err)
+			t.Fatalf("Derive(%d): %v", id, err)
 		}
 		if again.Address != key.Address {
-			t.Fatalf("Generate/Derive disagree for %s", id)
+			t.Fatalf("Allocate/Derive disagree for %d", id)
 		}
 	}
 }

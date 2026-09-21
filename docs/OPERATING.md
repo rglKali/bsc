@@ -18,9 +18,17 @@ Three things are yours, not the service's:
    the fee that used to fund it.
 2. **The books.** bsc keeps no ledger and has no idea whose money is on a wallet.
    Whatever answers that question runs above it.
-3. **Backups.** Losing the database loses the wallet ids, and without them every
-   address ever derived is unrecoverable even though you still hold the master
-   secret.
+   The master is yours too: bsc stores nothing about it but its address, records
+   nothing it receives, and never moves it except to pay gas. Use it from a
+   script or a wallet app as you like (§49). Treat `BSC_MASTER_SECRET` as
+   permanent — every address in the database derives from it, and the service
+   refuses to open a database bound to a different one.
+3. **Backups.** Losing the database loses the refs, the topology and the whole
+   deposit history. It no longer loses the *money*: wallet ids are a sequence,
+   so the master secret plus a range re-derives every address (§48). That makes
+   a lost database terrible rather than fatal — and it makes restoring an old
+   one a hazard, because a rewound id sequence reissues indices. Read §48 before
+   restoring a snapshot into a live service.
 
 ## Day to day
 
@@ -69,12 +77,9 @@ tokens     0  (0 base units)
 gas floor  0.05
 gas price  1 gwei
 
-BELOW THE GAS FLOOR — nothing refills this automatically.
-Run `bsc swap --sell-usdt N` to trade tokens for gas.
-
-router     0x10ED…
-price      1 token -> 0.0016 native
-           1 native -> 612.4 tokens
+BELOW THE GAS FLOOR — nothing refills this. Send at least 0.0088 native to
+0x1A2b…. The tokens above are yours to move with any wallet
+that holds this key; bsc does not trade them (§53).
 ```
 
 It exits non-zero below the floor, so it works from cron or a check script. It
@@ -85,41 +90,25 @@ with a `fee` writes a second debit to it (§43). So a service that charges its
 users accumulates its own gas budget there without anybody arranging it. A
 service that charges nothing has to send tokens or native currency itself.
 
-**Refilling.** Either send native currency to the master directly, or trade the
-tokens sitting on it:
+**Refilling is a transfer you make.** Send native currency to the master
+address. That is the whole procedure.
 
-```sh
-bsc swap --buy-bnb 0.1        # exact output: "I need a tenth of a BNB"
-bsc swap --sell-usdt 25       # exact input: "put 25 USDT to work"
-bsc swap --buy-bnb 0.1 --dry-run   # quote only
-```
+bsc used to do this itself, then only when told to, and now not at all: the
+automatic top-up went in §38, and `bsc swap` in §53. The master is your own
+wallet — bsc stores nothing about it but its address (§49) — so trading the
+tokens sitting on it is something you do with any wallet, exchange or script you
+already trust, at a price you looked at, with no extra surface inside a service
+that holds everybody's keys.
 
-Both print the quote and the slippage bound and ask before signing. `--buy-bnb`
-is usually what you want: gas is the requirement, and the cost is the answer.
-`bsc check` prints the exact command, with the shortfall filled in.
-
-**If you want it automated, automate it in cron, not in the service:**
-
-```cron
-# hourly; does nothing unless the master is under gas.floor_wei
-17 * * * * /usr/local/bin/bsc swap --buy-bnb 0.1 --if-below --yes >> /var/log/bsc-swap.log 2>&1
-```
-
-`--if-below` exits after one balance read when the master is fine, so this is
-cheap to run often. The service still never trades on its own — see §44 for why
-that line is drawn here rather than inside the daemon, and what an automatic,
-predictably-timed, predictably-sized swap looks like to somebody watching the
-mempool.
+> **If you do trade from it, do it when the service is quiet.** It signs with
+> the same key, and nonces come from the chain rather than a counter (§7). If a
+> transfer is in flight, both can pick the same nonce and one is rejected. That
+> is harmless and loud — re-send — but avoid it during a busy window.
 
 **How much warning the floor gives.** It is a warning line, not empty. At 0.05
 native and ~65k gas per transfer, the master has roughly 770 transfers of runway
 below it at 1 gwei, and still ~150 at 5 gwei. Hitting it is a "this week"
 problem, which is why it is worth a page but not a 3am one.
-
-> **Run it when the service is quiet.** `bsc swap` signs with the same key the
-> service signs with, and nonces come from the chain rather than a counter (§7).
-> If a transfer is in flight, both can pick the same nonce and one is rejected.
-> That is harmless and loud — re-run it — but avoid it during a busy window.
 
 **Alert on this.** `bsc_master_bnb_wei` below `gas.floor_wei` is the one alert
 that must not be slept through, because a dry master stops every pipeline at
@@ -130,7 +119,7 @@ once and nothing self-corrects:
   expr: bsc_master_bnb_wei < 50000000000000000   # match gas.floor_wei
   for: 15m
   annotations:
-    summary: "bsc master is below the gas floor — run `bsc check` then `bsc swap`"
+    summary: "bsc master is below the gas floor — run `bsc check`, then send it native currency"
 ```
 
 ## What to watch
@@ -167,8 +156,10 @@ payout settle first, or the drain and the payout race for the same funds.
 
 ## Backups
 
-**Set `snapshot.dir`.** Empty disables backup entirely, which is the one
-configuration mistake that is unrecoverable.
+**Set `snapshot.dir`.** Empty disables backup entirely. That used to be the one
+unrecoverable mistake; since §48 the funds survive it, but everything that makes
+the service usable — which ref owns which address, what was deposited, what is
+still owed — does not.
 
 ```yaml
 snapshot:
@@ -179,8 +170,17 @@ snapshot:
 
 Snapshots are consistent copies of the whole file, written from inside a read
 transaction. They are **plaintext** — encrypt them at whatever ships them off the
-box. The master secret is not in them, but the wallet ids are, and those plus the
-secret are every private key.
+box. The master secret is not in them, and since §48 the ids in them are merely
+0, 1, 2 … — so a snapshot is no longer half of anybody's private key. The secret
+alone is now the whole of it, which raises the stakes on where that lives and
+lowers them on where these go.
+
+> **Restoring one is not routine.** The next wallet id is read from the highest
+> row, so restoring an older snapshot rewinds the sequence and re-issues indices
+> that newer wallets already hold — two refs, one address, balances merged. The
+> service refuses it while the address record survives, which after a restore it
+> may not. Before restoring into a live service, reconcile against the chain for
+> the ids created after the snapshot was taken (§48).
 
 Ship them off the machine. A backup on the same disk protects against nothing
 that actually happens.
@@ -207,7 +207,9 @@ bsc inspect --rpc /var/backups/bsc/latest.db     # also compare against the toke
   custody      not checked against the chain (re-run with --rpc)
 ```
 
-Offline it walks every index in both directions, checks that flows and wallets
+Offline it walks every index from both sides — record to entry and entry back
+to record, so a stale entry that resolves to the wrong row is caught as well as
+a missing one (§54) — checks that flows and wallets
 agree about who owns whom, checks that no drain chain loops, and checks that no
 wallet has promised more than it holds. `--rpc` adds the one comparison an
 offline pass cannot make: our record of custody against `balanceOf`.

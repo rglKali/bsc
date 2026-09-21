@@ -16,7 +16,7 @@
 # money on these numbers.
 #
 # Every setting is also addressable from the environment: the key path in upper
-# case with BSC_ in front, so swap.slippage_bps is BSC_SWAP_SLIPPAGE_BPS. The
+# case with BSC_ in front, so gas.floor_wei is BSC_GAS_FLOOR_WEI. The
 # environment beats this file, and a command-line flag beats both — which is how
 # you override one value during an incident without editing a reviewed file.
 #
@@ -44,8 +44,7 @@ ui_enabled: false
 
 chain:
   # THE ONE CHAIN INPUT. Everything else chain-shaped follows what this endpoint
-  # reports for eth_chainId: the token, the swap router, and the id every
-  # signature is bound to. Point it at a testnet node and the whole service
+  # reports for eth_chainId: the token and the id every signature is bound to. Point it at a testnet node and the whole service
   # follows. There is deliberately no chain_id setting — one that could disagree
   # with the endpoint eventually would, and the failure is a service that reads
   # blocks perfectly and cannot send anything.
@@ -106,31 +105,15 @@ gas:
   # Native balance below which the master is reported as low — by /healthz, by
   # `bsc check`, and by the bsc_master_bnb_wei gauge you alert on.
   #
-  # NOTHING REFILLS IT AUTOMATICALLY. The service used to sell tokens for gas on
-  # its own; it never trades now, so this is the number that tells a human to go
-  # and run `bsc swap`. Tokens do accumulate here — a withdrawal asked for with a
-  # `fee` writes a second debit to the master — but converting them is attended.
+  # NOTHING REFILLS IT AUTOMATICALLY, and nothing in bsc can: the service used to
+  # sell tokens for gas on its own, then only on command, and now not at all
+  # (§53). Send native currency to the master address.
+  #
+  # Tokens do accumulate there — a withdrawal asked for with a `fee` writes a
+  # second debit to the master — and they are yours to move with any wallet that
+  # holds BSC_MASTER_SECRET. bsc will not touch them.
   floor_wei: "50000000000000000" # 0.05
 
-swap:
-  # Settings for the `bsc swap` command only. The running service never trades.
-
-  # A Uniswap-V2-interface router. Defaults to the verified PancakeSwap V2
-  # deployment for whichever chain the endpoint reports; on an unknown chain
-  # `bsc swap` refuses until one is named here.
-  router: ""
-
-  # Override only, for a fork whose router names the accessor something other
-  # than WETH(). Normally unset: the router is asked, and cannot then disagree
-  # with itself.
-  wrapped_native: ""
-
-  # Bound on the price, computed against the router's own quote. 10000 would
-  # accept any price at all and is refused.
-  slippage_bps: 100 # 1%
-
-  # How long a swap transaction stays valid once signed.
-  deadline: 2m
 
 snapshot:
   # Periodic consistent copies of the whole database. EMPTY DISABLES BACKUP —

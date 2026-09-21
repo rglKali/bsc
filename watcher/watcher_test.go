@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"path/filepath"
 	"sync"
@@ -15,7 +16,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -28,13 +28,14 @@ type fakeChain struct {
 	head     uint64
 	blocks   map[uint64][]*types.Receipt
 	bnb      *big.Int
+	usdt     *big.Int
 	fetched  []uint64
 	headErr  error
 	blockErr error
 }
 
 func newFakeChain(head uint64) *fakeChain {
-	return &fakeChain{head: head, blocks: map[uint64][]*types.Receipt{}, bnb: big.NewInt(5)}
+	return &fakeChain{head: head, blocks: map[uint64][]*types.Receipt{}, bnb: big.NewInt(5), usdt: new(big.Int)}
 }
 
 func (f *fakeChain) Finalized(context.Context) (uint64, error) {
@@ -57,6 +58,12 @@ func (f *fakeChain) BalanceBNB(context.Context, common.Address) (*big.Int, error
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.bnb, nil
+}
+
+func (f *fakeChain) TokenBalance(context.Context, common.Address, common.Address) (*big.Int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return new(big.Int).Set(f.usdt), nil
 }
 
 func (f *fakeChain) put(block uint64, receipts ...*types.Receipt) {
@@ -125,11 +132,11 @@ func newHarness(t *testing.T, head uint64) *harness {
 
 	h := &harness{t: t, store: st, chain: newFakeChain(head), addrs: NewAddrSet()}
 	h.hot = store.Wallet{
-		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged, Address: addr(0x01),
+		ID: 1, Ref: "hot", Address: addr(0x01),
 		Active: true, Balance: new(big.Int), CreatedAt: time.Now(),
 	}
 	h.proxy = store.Wallet{
-		ID: uuid.New(), Ref: "cust-1", Kind: store.KindManaged, Address: addr(0x02),
+		ID: 2, Ref: "cust-1", Address: addr(0x02),
 		DrainTo: h.hot.Address, Balance: new(big.Int), CreatedAt: time.Now(),
 	}
 	h.update(func(tx *store.Tx) error {
@@ -147,7 +154,7 @@ func newHarness(t *testing.T, head uint64) *harness {
 }
 
 // walletOf reads a wallet back, for asserting on custody.
-func (h *harness) walletOf(id uuid.UUID) store.Wallet {
+func (h *harness) walletOf(id store.WalletID) store.Wallet {
 	h.t.Helper()
 	var out store.Wallet
 	h.view(func(tx *store.Tx) error {
@@ -192,20 +199,6 @@ func (h *harness) runOnce() {
 			return
 		}
 	}
-}
-
-func (h *harness) wallet(id uuid.UUID) store.Wallet {
-	h.t.Helper()
-	var out store.Wallet
-	h.view(func(tx *store.Tx) error {
-		w, ok, err := tx.Wallet(id)
-		if err != nil || !ok {
-			h.t.Fatalf("wallet %s: ok=%v err=%v", id, ok, err)
-		}
-		out = w
-		return nil
-	})
-	return out
 }
 
 func (h *harness) flows() []store.Flow {
@@ -325,9 +318,6 @@ func TestDepositsBelowTheDrainThresholdAreStillRecorded(t *testing.T) {
 	deps := h.deposits()
 	if len(deps) != 1 || deps[0].Amount.Cmp(wei(60)) != 0 {
 		t.Fatalf("deposits = %+v, want the 60 recorded", deps)
-	}
-	if deps[0].Status != store.DepositReceived {
-		t.Fatalf("status = %s, want received", deps[0].Status)
 	}
 	if got := h.flows(); len(got) != 0 {
 		t.Fatalf("spent gas draining less than the threshold: %+v", got)
@@ -550,28 +540,49 @@ func TestBehindTracksTheGapToTheHead(t *testing.T) {
 }
 
 // TestMasterGaugesReflectBothBalances: the operator's two numbers for the
-// master. Native is polled because it cannot be derived; the token balance
-// comes from the record the watcher already maintains, and is the same figure
-// the gas top-up rule decides on.
+// master. Both are asked of the chain, because the master is not a wallet in
+// this store — it is the operator's own key, spent from scripts and by hand, so
+// there is no record to read and no reason to watch transfers touching it (§49).
 func TestMasterGaugesReflectBothBalances(t *testing.T) {
 	h := newHarness(t, 1)
-	master := store.Wallet{
-		ID: uuid.New(), Kind: store.KindMaster, Address: addr(0x99),
-		Balance: wei(4242), CreatedAt: time.Now(),
-	}
-	h.update(func(tx *store.Tx) error { return tx.PutWallet(master) })
 
-	h.w.opts.Master = master.Address
-	h.w.opts.MasterWallet = master.ID
+	h.w.opts.Master = addr(0x99)
 	h.w.nextMasterAt = time.Time{} // due now
 	h.chain.bnb = wei(7)
+	h.chain.usdt = wei(4242)
 
 	h.w.pollMaster(context.Background())
 
 	if got := testutil.ToFloat64(metrics.MasterUSDT); got != 4242 {
-		t.Fatalf("bsc_master_usdt_wei = %v, want the recorded token balance 4242", got)
+		t.Fatalf("bsc_master_usdt_wei = %v, want the chain's 4242", got)
 	}
 	if got := testutil.ToFloat64(metrics.MasterBNB); got != 7 {
 		t.Fatalf("bsc_master_bnb_wei = %v, want the polled native balance 7", got)
+	}
+}
+
+// A watcher that has not resolved its cursor must not step. Zero means "block
+// 0", so stepping an unstarted watcher begins a backfill from genesis — on
+// mainnet a hundred million blocks — and the only symptom is a service that
+// looks busy and never catches up. This cost an e2e run a thirty-minute hang,
+// with "132260842 blocks behind" as the only clue (§52).
+func TestSteppingBeforeStartIsRefused(t *testing.T) {
+	h := newHarness(t, 100)
+
+	if _, err := h.w.Step(context.Background()); !errors.Is(err, ErrNotStarted) {
+		t.Fatalf("Step before Start = %v, want ErrNotStarted", err)
+	}
+	if got := h.w.Behind(); got != 0 {
+		t.Fatalf("an unstarted watcher reported %d blocks behind; it must claim nothing", got)
+	}
+	if len(h.chain.fetched) != 0 {
+		t.Fatalf("an unstarted watcher fetched blocks %v", h.chain.fetched)
+	}
+
+	if err := h.w.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := h.w.Step(context.Background()); err != nil {
+		t.Fatalf("Step after Start: %v", err)
 	}
 }

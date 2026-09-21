@@ -284,6 +284,18 @@ type Meta struct {
 	ChainID  uint64
 	Token    common.Address
 	Decimals uint8
+
+	// Master is the address the master secret controls. It is recorded here
+	// rather than as a wallet row because it is not one: it is the operator's
+	// own key, used from scripts and by hand, and nothing in this database is
+	// derived from its id — every managed wallet is derived from the secret
+	// itself (§49).
+	//
+	// Binding it has the same purpose as binding the chain and the token: every
+	// wallet in this file was derived from this secret, so opening it under a
+	// different one would leave every address unreachable while the service
+	// carried on as if nothing were wrong.
+	Master common.Address
 }
 
 // Meta reads the recorded token identity. ok is false on a store that has never
@@ -305,14 +317,26 @@ func (t *Tx) Meta() (Meta, bool, error) {
 	if len(id) != 8 {
 		return Meta{}, false, fmt.Errorf("store: chain id meta is %d bytes", len(id))
 	}
+	master := b.Get(keyMaster)
+	if len(master) != common.AddressLength {
+		return Meta{}, false, fmt.Errorf("store: master meta is %d bytes", len(master))
+	}
 	return Meta{
 		ChainID:  binary.BigEndian.Uint64(id),
 		Token:    common.BytesToAddress(raw),
 		Decimals: dec[0],
+		Master:   common.BytesToAddress(master),
 	}, true, nil
 }
 
-// SetMeta records the token identity, refusing to change one already stored.
+// ErrIdentityMismatch means the database was built for a different chain, token
+// or master than the service was started with. It is always fatal at startup:
+// every amount here is denominated by that token on that chain, and every
+// address was derived from that secret (§26, §49).
+var ErrIdentityMismatch = errors.New("store: database identity mismatch")
+
+// SetMeta records the database's identity, refusing to change one already
+// stored.
 // Every amount in the database is denominated by it, so a change is a migration
 // and not a configuration edit.
 func (t *Tx) SetMeta(m Meta) error {
@@ -321,9 +345,17 @@ func (t *Tx) SetMeta(m Meta) error {
 		return err
 	}
 	if ok {
+		if existing.Master != m.Master {
+			// Every wallet in this database derives from the master secret, so
+			// a different master means every address here is unreachable. That
+			// is unrecoverable and silent if it is allowed through, which is
+			// the whole reason this is checked (§49).
+			return fmt.Errorf("%w: this database was derived from master %s, but the service was started with %s — every wallet in it belongs to the first, so opening it under the second would strand them all",
+				ErrIdentityMismatch, existing.Master.Hex(), m.Master.Hex())
+		}
 		if existing != m {
-			return fmt.Errorf(
-				"store: this database belongs to chain %d, token %s with %d decimals — not chain %d, token %s with %d",
+			return fmt.Errorf("%w: this database belongs to chain %d, token %s with %d decimals, but the service was started for chain %d, token %s with %d — moving a database between them is a migration, not a configuration change",
+				ErrIdentityMismatch,
 				existing.ChainID, existing.Token.Hex(), existing.Decimals,
 				m.ChainID, m.Token.Hex(), m.Decimals)
 		}
@@ -338,6 +370,9 @@ func (t *Tx) SetMeta(m Meta) error {
 	}
 	if err := b.Put(keyChainID, binary.BigEndian.AppendUint64(nil, m.ChainID)); err != nil {
 		return fmt.Errorf("store: write chain id meta: %w", err)
+	}
+	if err := b.Put(keyMaster, m.Master.Bytes()); err != nil {
+		return fmt.Errorf("store: write master meta: %w", err)
 	}
 	return nil
 }

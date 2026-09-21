@@ -22,8 +22,7 @@ task run -- --help            # run the service
 task inspect -- snapshot.db   # audit a database file
 task abi                      # regenerate usdt/abi.go (needs solc + abigen; do not hand-edit)
 
-bsc check                     # master balances, gas floor, live price
-bsc swap --buy-bnb 0.1        # refill gas by hand (--sell-usdt for exact input)
+bsc check                     # master balances and the gas floor
 ```
 
 Single test / package:
@@ -71,12 +70,11 @@ where, read §33 — that is the decision being reopened.
 | Package | Role |
 | --- | --- |
 | `store/` | the only datastore: one bbolt file, packed-binary records, hand-rolled indexes |
-| `keys/` | HMAC key derivation from the master secret |
+| `keys/` | HMAC key derivation from the master secret, indexed by a wallet's sequential id |
 | `chain/` | the single RPC client (one rate-limit budget for everything) |
 | `flow/` | the pipeline. `flow.go`/`rules.go` are pure — state machines and work predicates, no I/O; `engine.go` is the transactional half that advances and settles them inside a store transaction |
 | `watcher/` | follows finalized blocks; one write transaction per block |
 | `sender/` | the only code that touches private keys: signs, journals, broadcasts |
-| `swap/` | router calldata, used only by the `bsc swap` command |
 | `usdt/` | generated token bindings (`task abi`) |
 | `api/` | the HTTP surface, wire amounts, and the embedded dashboard (off by default, §29) |
 | `metrics/` | the one `bsc_*` namespace, served from the same listener |
@@ -93,7 +91,7 @@ where, read §33 — that is the decision being reopened.
 - **Signing is strictly sequential.** One transaction in flight at a time, which
   is what keeps a pending-nonce read gapless without a nonce manager.
 - **Nonces come from the chain, never a local counter.** The operator signs by
-  hand via `bsc swap`; a stored counter would silently desync the moment they did.
+  hand from the master; a stored counter would silently desync the moment they did.
 - **One write transaction per block.** Confirmations, balances, deposits, newly
   started flows and the cursor commit together. This is what makes a block
   exactly-once with no dedup window.
@@ -119,19 +117,49 @@ where, read §33 — that is the decision being reopened.
   second unit and no scaling. Nothing is floored, so there is no dust — if you
   find yourself dividing an amount, stop and read §36.
 - **Custody is credited for every observed transfer**, with no threshold. Every
-  transfer to a managed wallet becomes a deposit record; only the master's are
-  skipped, because the master is bsc's own wallet.
-- **Every movement is a credit or a debit, and nothing else** (§42). A drain is a
-  debit with `reason: drain`, linked from the credits it carried via `SweptBy`.
-  Do not add a third kind of record — `sum(credits) − sum(debits) == balanceOf`
-  is the property that makes the store reconcilable, and it holds only while
-  that is true.
+  transfer to a wallet in the address set becomes a deposit record. The master
+  is not in that set (§49), so nothing it receives is recorded at all.
+- **Every movement is a credit or a debit, and nothing else** (§42). A drain is
+  a debit with `reason: drain`. Do not add a third kind of record —
+  `sum(credits) − sum(debits) == balanceOf` is the property that makes the store
+  reconcilable, and it holds only while that is true.
+- **A promise and a fact live in different keyspaces** (§51). A pending
+  withdrawal is a `store.Pending` in `state/withdrawal`; settling *moves* it to
+  `log/withdrawal` as a `store.Withdrawal`. **The bucket is the status** — there
+  is no stored field, and there must not be one. A promise carries no `TxHash`
+  and a fact carries no `Attempts`. Three lookups pay for this by trying both
+  buckets (by id, by idempotency key, a wallet's full history); everything else
+  got narrower. `Verify` flags a record found in both.
+- **A deposit is an observation, not a lifecycle** (§50). It has no status and
+  points at nothing: it is recorded after the fact and never touched again. Do
+  not link credits to the debit that swept them — a drain moves a *balance*,
+  resolved from `balanceOf` at signing, so any such link is a guess. The two
+  ends of a forward pair through the drain debit's `tx_hash`.
 - **A debit must always name a reason.** `PutWithdrawal` refuses a zero one
   rather than defaulting it: a record that does not say why money left is the
   bug, not the default.
 - **These are observations, never assertions of ownership.** The moment something
   computes a net position *per person* from credits and debits, the ledger is
   back and §33 is undone.
+- **A wallet's id is its derivation index, and the sequence only moves forward**
+  (§48). `priv = HMAC(master, be64(id))`. The next id is the highest row plus
+  one — there is deliberately **no stored counter**, so nothing can drift from
+  the table. Ids start at 1 and are not contiguous (`keys.Allocate` skips
+  invalid scalars); they are never a position in creation order. Zero is not a
+  wallet: `keys.Derive` and `PutWallet` both refuse it.
+- **The master is not a wallet** (§49). No row, no `kind`, not in the
+  `AddrSet` — its address lives in `meta` and nothing else about it is stored.
+  It is the operator's own key, spent from scripts and by hand, and bsc records
+  nothing it receives. Every row in `data/wallet` is derived and nameable; do
+  not reintroduce a wallet that is an exception to that.
+- **The master address is bound like the chain and the token** (§26, §49).
+  `SetMeta` refuses a different one, because every address in the file derives
+  from that secret and opening it under another strands all of them. Treat
+  `BSC_MASTER_SECRET` as permanent: rotating it rotates the whole keyset.
+- **Restoring an old snapshot rewinds the id sequence** (§48). That reissues
+  indices to different refs — one address, two callers, money merged silently.
+  `PutWallet` refuses it while the address record survives; after a restore it
+  may not. There is no gap scan. Do not treat a restore as routine.
 - **Creating a wallet must never spend gas** (§41). Deriving is HMAC plus a
   bbolt write; activation is the funding/approving prefix of the first flow that
   needs to move money. `prewarm: true` is the explicit opt-out and must stay
@@ -155,7 +183,8 @@ Both sides are records that already exist, so there is nothing to materialise an
 nothing that can drift. A reverted payout stays `pending`, so it stays committed —
 which is exactly right, and needs no special case.
 
-`bsc inspect` walks every index in both directions, checks flow/wallet ownership
+`bsc inspect` walks every index from both sides — record to entry and entry
+back to record (§54) — checks flow/wallet ownership
 both ways, checks that no drain chain loops, and checks that no wallet has
 promised more than it holds. `--rpc` additionally compares our record of custody
 against the token.
@@ -164,10 +193,11 @@ against the token.
 
 One bbolt file, three namespaces (`store/keys.go`):
 
-- `state/` — cursor, flows, the in-flight tx index, the send journal. Self-pruning.
+- `state/` — cursor, flows, the in-flight tx index, the send journal, and
+  **pending withdrawals**. Self-pruning.
 - `data/` — wallets, their indexes, plus the token identity this database is
   denominated in. Catastrophic to lose.
-- `log/` — deposits and withdrawals. Kept **forever**.
+- `log/` — deposits and **settled** withdrawals. Kept **forever**.
 
 Records are hand-packed binary with a leading version byte: add a field by
 appending and bumping the constant, read it under `if v >= N`, never reorder.
@@ -179,7 +209,7 @@ after there is data.
 Sorted keys do real work — the deposit cursor *is* `<block><logindex>`, the send
 journal is nonce-ordered, deposit dedup is a property of the key.
 
-**Every composite key is fixed-width** (16-byte wallet id, 12-byte cursor), so
+**Every composite key is fixed-width** (8-byte wallet id, 12-byte cursor), so
 they concatenate with no separator. The `<slug>\0<rest>` scoping is gone with the
 apps (§32) — do not reintroduce a variable-length key part without a separator.
 
@@ -208,9 +238,9 @@ or internal flow state. `api/contract_test.go` enforces this by walking the real
 surface and failing on the vocabulary — keep it passing rather than adding an
 exception.
 
-**Two statuses each, naming where the money physically is**: deposits are
-`received` → `forwarded`, withdrawals are `pending` → `confirmed`. Debits also
-carry a `reason` of `payout`, `fee` or `drain`. A withdrawal
+**Deposits have no status** (§50) — they are recorded once and never change.
+Withdrawals have two, `pending` → `confirmed`, because a withdrawal is accepted
+before it happens. Debits also carry a `reason` of `payout`, `fee` or `drain`. A withdrawal
 has **no failure state** (§28): what cannot be honoured is refused synchronously
 at creation and never becomes a record, and what breaks afterwards is ours to
 retry — the commitment stays held and `attempts`/`last_error` are diagnostics.
@@ -244,14 +274,12 @@ bsc spends native currency on every transfer. Fees land on the master (§43), so
 a service that charges its users accumulates a gas budget there — but **nothing
 converts it automatically**, and that is deliberate (§44).
 
-A swap is the only operation whose outcome is a price rather than a yes or no,
-and an automatic one is predictable in timing and size to anyone watching the
-mempool. The floor also gives days of runway, not minutes. So the loop is: alert
-on `bsc_master_bnb_wei`, run `bsc check`, run `bsc swap`.
-
-If you want it automated, it goes in cron — `bsc swap --buy-bnb N --if-below
---yes` no-ops above the floor. Do not move it back into the daemon without
-re-reading §44; §19 was there once.
+Nothing in bsc converts them, and since §53 nothing can: the automatic top-up
+went in §38 and the `bsc swap` command in §53. The master is the operator's own
+wallet (§49), so trading from it belongs in whatever they already use — at a
+price they looked at, with no extra surface inside a service that holds
+everybody's keys. The loop is: alert on `bsc_master_bnb_wei`, run `bsc check`,
+send native currency. Do not add trading back without re-reading §44 and §53.
 
 `/healthz` reports a master below `gas.floor_wei` as degraded. Under §19 it
 deliberately did not, because the automatic top-up made it self-healing; nothing
@@ -288,9 +316,10 @@ heals it now, so it is the finding.
   the caller surface.
 - **`money.drain_threshold_wei` is not a minimum deposit.** It decides only
   whether forwarding is worth the gas. Everything is recorded regardless (§36).
-- **`bsc swap` races the service for nonces** (§38). It signs with the same key
-  and reads the nonce from the chain, so running it mid-flight gets one of the
-  two rejected. Documented in `--help`; prefer a quiet moment.
+- **Anything signing from the master races the service for nonces** (§38). It
+  is the same key and nonces come from the chain, so a hand-sent transfer during
+  a busy window gets one of the two rejected. Harmless and loud; prefer a quiet
+  moment.
 - `chain.rpc_rate_limit` must clear the block rate by a wide margin. At ~0.45s
   blocks the watcher needs ~2.2 req/s just to keep up. Config refuses below 5.
 - **There is no `CHAIN_ID`.** `chain.rpc_url` is the one chain input; `eth_chainId`
@@ -299,6 +328,9 @@ heals it now, so it is the finding.
   `config.Parse` stays I/O-free; `Config.ResolveChain` is the step that needs the
   dial.
 - ``chain.start_block: 0`` means "the current finalized head", not genesis.
+  A watcher's *cursor* of 0, however, does mean block 0 — so `Step` refuses to
+  run before `Start` has resolved it (§52). Do not remove that guard: the
+  failure it prevents is silent, and looks like a service that is merely slow.
 - The watcher must never be starved: it is what observes finality, so anything
   that blocks it stops every in-flight transfer too. Shutdown is decided by
   `ctx.Err()`, never by inspecting an error for `context.DeadlineExceeded`.

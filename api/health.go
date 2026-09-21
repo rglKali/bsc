@@ -51,7 +51,7 @@ type healthView struct {
 // because the automatic top-up meant a low master normally fixed itself, and
 // reporting it would have cried wolf. With trading moved to an operator command
 // nothing fixes it automatically any more, so being low is exactly the finding:
-// it is the signal to go and run `bsc swap` (§38).
+// it is the signal to go and send the master more native currency (§53).
 //
 // **This is for monitoring, not for restarting.** A 503 here means "do not send
 // this traffic and look at me", never "bounce me": nothing it reports is fixed

@@ -14,7 +14,6 @@ import (
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/google/uuid"
 )
 
 func quietLog() *slog.Logger {
@@ -29,7 +28,7 @@ func storeWith(t *testing.T, balance int64) *store.Store {
 	}
 	t.Cleanup(func() { st.Close() })
 	w := store.Wallet{
-		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged, Address: common.HexToAddress("0xabc"),
+		ID: 1, Ref: "hot", Address: common.HexToAddress("0xabc"),
 		Balance: big.NewInt(balance), CreatedAt: time.Now(),
 	}
 	if err := st.Update(func(tx *store.Tx) error {

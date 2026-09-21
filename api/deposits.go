@@ -4,8 +4,6 @@ import (
 	"net/http"
 
 	"bsc/store"
-
-	"github.com/google/uuid"
 )
 
 // depositView is one recorded incoming transfer.
@@ -16,18 +14,11 @@ import (
 // `amount` is the chain's own figure. There is no second unit beside it and no
 // rounding applied to it, so it is exactly what a block explorer shows (§36).
 type depositView struct {
-	ID     string `json:"id"`
-	TxHash string `json:"tx_hash"`
-	Wallet string `json:"wallet"` // the ref the money landed on
-	From   string `json:"from"`
-	Amount string `json:"amount"`
-	Status string `json:"status"`
-
-	// SweptBy is the debit that carried this credit onward, present once it has
-	// been forwarded. Following it gives the transfer, the destination and the
-	// other credits that left in the same movement (§42).
-	SweptBy   string `json:"swept_by,omitempty"`
-	SweptTx   string `json:"swept_tx,omitempty"`
+	ID        string `json:"id"`
+	TxHash    string `json:"tx_hash"`
+	Wallet    string `json:"wallet"` // the ref the money landed on
+	From      string `json:"from"`
+	Amount    string `json:"amount"`
 	CreatedAt string `json:"created_at"`
 }
 
@@ -70,36 +61,15 @@ func (s *Server) listWalletDeposits(w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return err
 	}
-	status := r.URL.Query().Get("status")
-	if status != "" && status != "received" && status != "forwarded" {
-		return fail(http.StatusBadRequest, "bad_status", "status must be received, forwarded, or omitted")
-	}
-
 	out := []depositView{}
 	if err := s.store.View(func(tx *store.Tx) error {
 		wallet, err := s.wallet(tx, r)
 		if err != nil {
 			return err
 		}
-		var deposits []store.Deposit
-		if status == "received" && wallet.Proxies() {
-			// The open index is exactly this set on a forwarding wallet, so ask
-			// it rather than filtering the whole history.
-			deposits, err = tx.OpenDeposits(wallet.ID, limit)
-		} else {
-			deposits, err = tx.WalletDeposits(wallet.ID, limit)
-		}
+		deposits, err := tx.WalletDeposits(wallet.ID, limit)
 		if err != nil {
 			return err
-		}
-		if status != "" {
-			kept := deposits[:0]
-			for _, d := range deposits {
-				if d.Status.String() == status {
-					kept = append(kept, d)
-				}
-			}
-			deposits = kept
 		}
 		out, err = viewDeposits(tx, deposits)
 		return err
@@ -111,12 +81,10 @@ func (s *Server) listWalletDeposits(w http.ResponseWriter, r *http.Request) erro
 }
 
 // viewDeposits renders records, resolving each one's wallet to the ref its
-// caller knows it by and each debit link to that debit's transfer. Both are
-// cached per page, so a page of credits swept by one drain costs two lookups
-// rather than two per row.
+// caller knows it by. The ref is cached per page, so a page of credits on one
+// wallet costs one lookup rather than one per row.
 func viewDeposits(tx *store.Tx, deposits []store.Deposit) ([]depositView, error) {
-	refs := map[uuid.UUID]string{}
-	sweeps := map[uuid.UUID]string{}
+	refs := map[store.WalletID]string{}
 	out := make([]depositView, 0, len(deposits))
 	for _, d := range deposits {
 		ref, ok := refs[d.Wallet]
@@ -130,31 +98,14 @@ func viewDeposits(tx *store.Tx, deposits []store.Deposit) ([]depositView, error)
 			}
 			refs[d.Wallet] = ref
 		}
-		view := depositView{
+		out = append(out, depositView{
 			ID:        d.Cursor().String(),
 			TxHash:    d.TxHash.Hex(),
 			Wallet:    ref,
 			From:      d.From.Hex(),
 			Amount:    amountString(d.Amount),
-			Status:    d.Status.String(),
 			CreatedAt: stamp(d.CreatedAt),
-		}
-		if d.SweptBy != uuid.Nil {
-			view.SweptBy = d.SweptBy.String()
-			hash, ok := sweeps[d.SweptBy]
-			if !ok {
-				wd, found, err := tx.Withdrawal(d.SweptBy)
-				if err != nil {
-					return nil, err
-				}
-				if found {
-					hash = wd.TxHash.Hex()
-				}
-				sweeps[d.SweptBy] = hash
-			}
-			view.SweptTx = hash
-		}
-		out = append(out, view)
+		})
 	}
 	return out, nil
 }

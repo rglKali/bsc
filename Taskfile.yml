@@ -12,7 +12,7 @@ tasks:
       - task --list
 
   abi:
-    desc: Generate ABI bindings
+    desc: Regenerate the token bindings (needs solc + abigen)
     cmds:
       - mkdir -p usdt
       - curl -s https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/refs/heads/master/contracts/token/ERC20/IERC20.sol | solc --combined-json abi - | jq '.contracts."<stdin>:IERC20".abi' | abigen --out usdt/abi.go --pkg usdt --v2 --abi -

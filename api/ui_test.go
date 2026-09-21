@@ -12,7 +12,6 @@ import (
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/google/uuid"
 )
 
 // uiFixture is newFixture with the dashboard turned on, which is the only
@@ -31,7 +30,7 @@ func uiFixture(t *testing.T) *fixture {
 	}
 	f := &fixture{
 		t: t, st: st,
-		addrs: &fakeAddrs{m: map[common.Address]uuid.UUID{}},
+		addrs: &fakeAddrs{m: map[common.Address]store.WalletID{}},
 		sync:  &fakeSync{},
 	}
 	f.srv = New(st, ring, f.addrs, f.sync, Options{

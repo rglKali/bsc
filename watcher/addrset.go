@@ -6,7 +6,6 @@ import (
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/google/uuid"
 )
 
 // AddrSet is the watched-address set, held in memory because every log in
@@ -20,18 +19,18 @@ import (
 // wallet — no registration hop, no re-sync, and no second copy to drift.
 type AddrSet struct {
 	mu sync.RWMutex
-	m  map[common.Address]uuid.UUID
+	m  map[common.Address]store.WalletID
 }
 
 // NewAddrSet returns an empty set.
 func NewAddrSet() *AddrSet {
-	return &AddrSet{m: make(map[common.Address]uuid.UUID)}
+	return &AddrSet{m: make(map[common.Address]store.WalletID)}
 }
 
-// Load replaces the set from the store. Roughly 40 bytes per wallet, so a
-// million deposit addresses is tens of megabytes and needs no eviction policy.
+// Load replaces the set from the store. Measured at ~5.3 MB for 100k wallets
+// (see docs/ARCHITECTURE.md, "How big it gets"), so it needs no eviction policy.
 func (s *AddrSet) Load(tx *store.Tx) error {
-	m := make(map[common.Address]uuid.UUID)
+	m := make(map[common.Address]store.WalletID)
 	if err := tx.EachWallet(func(w store.Wallet) error {
 		m[w.Address] = w.ID
 		return nil
@@ -46,14 +45,14 @@ func (s *AddrSet) Load(tx *store.Tx) error {
 
 // Add registers one address. Callers must do this in the same place they create
 // the wallet, after the write commits.
-func (s *AddrSet) Add(addr common.Address, id uuid.UUID) {
+func (s *AddrSet) Add(addr common.Address, id store.WalletID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.m[addr] = id
 }
 
 // Lookup resolves an address to its wallet id.
-func (s *AddrSet) Lookup(addr common.Address) (uuid.UUID, bool) {
+func (s *AddrSet) Lookup(addr common.Address) (store.WalletID, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	id, ok := s.m[addr]

@@ -52,7 +52,7 @@ by value, nothing committed.
   plus concurrent in-flight transactions plus nonce-ordered gap recovery, all
   confined to `sender/`, since every flow is already a state machine that does
   not care how many others are running. The counter would have to resync whenever
-  `bsc swap` signs by hand.
+  the operator signs from the master by hand.
 
 ## Delivery
 
@@ -87,10 +87,11 @@ by value, nothing committed.
 
 - **A ledger, a fee, or a house sweep.** All three existed and all three were
   removed (§33). If one comes back, it belongs in the service above this one.
-- **Automatic trading.** `bsc swap` is attended on purpose (§38, §44): it is the
-  only operation whose outcome is a price rather than a yes or no, and an
-  automatic one is predictable in timing and size to anyone watching the
-  mempool.
+- **Trading, in any form.** It went out in three steps: the automatic top-up
+  (§38), then the attended `bsc swap` command (§53). It is the only operation
+  whose outcome is a price rather than a yes or no, and the master is the
+  operator's own wallet — so it belongs in whatever they already use to trade,
+  not inside a service that holds everybody's keys.
 - **Draining the master.** You hold `BSC_MASTER_SECRET` and can move funds out at
   any time; building it in adds risk for no gain.
 - **An admin API.** With ref addressing the caller API is already the operator's

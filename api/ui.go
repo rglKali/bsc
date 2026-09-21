@@ -7,8 +7,6 @@ import (
 
 	"bsc/buildinfo"
 	"bsc/store"
-
-	"github.com/ethereum/go-ethereum/common"
 )
 
 // The dashboard's read model.
@@ -184,13 +182,4 @@ func orZeroStr(v *big.Int) string {
 		return "0"
 	}
 	return v.String()
-}
-
-// addrStr renders an address, or empty for the zero value — which on the
-// dashboard means "not set" rather than "address zero".
-func addrStr(a common.Address) string {
-	if a == (common.Address{}) {
-		return ""
-	}
-	return a.Hex()
 }

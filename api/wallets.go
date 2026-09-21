@@ -101,16 +101,26 @@ func (s *Server) putWallet(w http.ResponseWriter, r *http.Request) error {
 			wallet = existing
 			return nil
 		}
-		id, key, err := s.ring.Generate()
+		// The next id is read from the store rather than kept as a counter:
+		// wallet keys are 8-byte big-endian, so bbolt's last key IS the highest
+		// id, and there is no separate number that can drift from the table.
+		// Allocate steps past any index whose HMAC is not a valid scalar, which
+		// is deterministic, so a recovery walking 0, 1, 2 … skips the same ones.
+		next, err := tx.NextWalletID()
 		if err != nil {
 			return err
 		}
+		id, key, err := s.ring.Allocate(uint64(next))
+		if err != nil {
+			return err
+		}
+		walletID := store.WalletID(id)
 		wallet = store.Wallet{
-			ID: id, Ref: ref, Kind: store.KindManaged, Address: key.Address,
+			ID: walletID, Ref: ref, Address: key.Address,
 			DrainTo: drainTo, Balance: new(big.Int),
 			CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 		}
-		if err := tx.CheckDrainChain(id, key.Address, drainTo); err != nil {
+		if err := tx.CheckDrainChain(walletID, key.Address, drainTo); err != nil {
 			return drainError(err)
 		}
 		if err := tx.PutWallet(wallet); err != nil {
@@ -125,7 +135,7 @@ func (s *Server) putWallet(w http.ResponseWriter, r *http.Request) error {
 		// this only decides when.
 		prewarmed = true
 		f, err := flow.Begin(flow.Params{
-			Kind: store.FlowPrewarm, Wallet: id, Active: false, Now: time.Now(),
+			Kind: store.FlowPrewarm, Wallet: walletID, Active: false, Now: time.Now(),
 		})
 		if err != nil {
 			return err
@@ -133,7 +143,7 @@ func (s *Server) putWallet(w http.ResponseWriter, r *http.Request) error {
 		if err := tx.PutFlow(f); err != nil {
 			return err
 		}
-		_, err = tx.ClaimWallet(id, f.ID)
+		_, err = tx.ClaimWallet(walletID, f.ID)
 		return err
 	}); err != nil {
 		return err

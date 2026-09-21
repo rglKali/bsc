@@ -20,7 +20,7 @@ import (
 // wallet id is fixed-width, so the composites below need no separator and no
 // slug validation to keep them unambiguous (§32).
 var (
-	bMeta = []byte("meta")  // "version", "token", "decimals", "chain_id"
+	bMeta = []byte("meta")  // "version", "token", "decimals", "chain_id", "master"
 	bStat = []byte("state") // "cursor"
 
 	bFlow = []byte("state/flow") // flow id          -> Flow
@@ -31,26 +31,28 @@ var (
 	bAddr   = []byte("data/addr")   // address   -> wallet id
 	bRef    = []byte("data/ref")    // ref       -> wallet id
 
+	// A promise lives in state/ and a fact lives in log/, and settling MOVES the
+	// record between them. The bucket is the status: there is no stored field
+	// that could disagree with where the record actually is (§51).
+	bPending = []byte("state/withdrawal") // withdrawal id -> Pending
+
 	bDeposit    = []byte("log/deposit")    // tx hash ++ log index -> Deposit
-	bWithdrawal = []byte("log/withdrawal") // withdrawal id        -> Withdrawal
+	bWithdrawal = []byte("log/withdrawal") // withdrawal id        -> Withdrawal (settled)
 
 	iDep       = []byte("idx/dep")        // block ++ logidx            -> deposit key (the cursor)
 	iDepWallet = []byte("idx/dep_wallet") // wallet ++ block ++ logidx  -> deposit key
-	iDepOpen   = []byte("idx/dep_open")   // wallet ++ depkey           -> deposit key (awaiting a drain)
-	iWd        = []byte("idx/wd")         // created ++ id              -> nil
-	iWdFeed    = []byte("idx/wd_feed")    // block ++ id                -> nil (settled only)
-	iWdWallet  = []byte("idx/wd_wallet")  // wallet ++ created ++ id    -> nil
-	iWdOpen    = []byte("idx/wd_open")    // id                         -> nil
-	iWdIdem    = []byte("idx/wd_idem")    // idempotency key            -> withdrawal id
+	iWdFeed    = []byte("idx/wd_feed")    // block ++ id             -> nil
+	iWdWallet  = []byte("idx/wd_wallet")  // wallet ++ created ++ id -> nil
+	iWdIdem    = []byte("idx/wd_idem")    // idempotency key         -> withdrawal id (either bucket)
 )
 
 // buckets is every bucket the store creates on open.
 var buckets = [][]byte{
 	bMeta, bStat,
-	bFlow, bTx, bSend,
+	bFlow, bTx, bSend, bPending,
 	bWallet, bAddr, bRef,
 	bDeposit, bWithdrawal,
-	iDep, iDepWallet, iDepOpen, iWd, iWdFeed, iWdWallet, iWdOpen, iWdIdem,
+	iDep, iDepWallet, iWdFeed, iWdWallet, iWdIdem,
 }
 
 var (
@@ -59,6 +61,7 @@ var (
 	keyToken    = []byte("token")    // the token this database is about
 	keyDecimals = []byte("decimals") // its decimals(), read from the chain once
 	keyChainID  = []byte("chain_id") // the chain it lives on, reported by the endpoint
+	keyMaster   = []byte("master")   // the address every wallet here was derived under
 )
 
 // ErrBadRef is returned for a wallet ref that cannot be used as a key or in a URL.
@@ -114,8 +117,20 @@ func join(parts ...[]byte) []byte {
 	return k
 }
 
+// walletIDFromKey reads a wallet id back out of a key or an index value. A
+// short or oversized slice is not a wallet id, and yields zero — which is the
+// master's reserved slot and so can never be mistaken for a managed wallet.
+func walletIDFromKey(b []byte) WalletID {
+	if len(b) != 8 {
+		return 0
+	}
+	return WalletID(binary.BigEndian.Uint64(b))
+}
+
 // walletPrefix is the range prefix for one wallet inside a wallet-scoped index.
-func walletPrefix(id uuid.UUID) []byte { return id[:] }
+// It is the wallet's own key, so a scoped scan is a prefix scan over the same
+// 8 bytes the wallet is stored under.
+func walletPrefix(id WalletID) []byte { return id.Key() }
 
 // depositKey is tx hash ++ log index: unique per on-chain transfer, so the key
 // itself is the dedup constraint — no uniqueness check to forget.

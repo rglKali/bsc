@@ -61,7 +61,7 @@ func TestDecoderIgnoresTrailingBytesFromANewerVersion(t *testing.T) {
 	// The version-byte contract: an older binary reading a record written by a
 	// newer one must read the fields it knows and ignore the rest.
 	w := Wallet{
-		ID: uuid.New(), Ref: "cust-1", Kind: KindManaged,
+		ID: nextID(), Ref: "cust-1",
 		Address: addr(9), Balance: wei(5), CreatedAt: time.Now().UTC(),
 	}
 	b, err := w.encode()
@@ -138,11 +138,11 @@ func TestZeroTimeRoundTripsAsZero(t *testing.T) {
 
 func TestEveryRecordRoundTrips(t *testing.T) {
 	now := time.Now().UTC()
-	id, wid := uuid.New(), uuid.New()
+	id, wid := uuid.New(), nextID()
 
 	t.Run("wallet", func(t *testing.T) {
 		in := Wallet{
-			ID: wid, Ref: "acme:cust-1", Kind: KindManaged, Address: addr(1),
+			ID: wid, Ref: "acme:cust-1", Address: addr(1),
 			DrainTo: addr(2), Active: true, Balance: wei(12_345), Paused: true,
 			Flow: id, FailedAttempts: 3, RetryAfter: now, CreatedAt: now, UpdatedAt: now,
 		}
@@ -154,7 +154,7 @@ func TestEveryRecordRoundTrips(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if out.Ref != in.Ref || out.Kind != in.Kind || out.Address != in.Address ||
+		if out.Ref != in.Ref || out.Address != in.Address ||
 			out.DrainTo != in.DrainTo || !out.Active || !out.Paused ||
 			out.Balance.Cmp(in.Balance) != 0 || out.Flow != in.Flow ||
 			out.FailedAttempts != in.FailedAttempts {
@@ -218,8 +218,7 @@ func TestEveryRecordRoundTrips(t *testing.T) {
 	t.Run("deposit", func(t *testing.T) {
 		in := Deposit{
 			Wallet: wid, Block: 48210577, LogIndex: 9, TxHash: hash(2),
-			From: addr(5), Amount: wei(1000), Status: DepositForwarded,
-			SweptBy: id, CreatedAt: now,
+			From: addr(5), Amount: wei(1000), CreatedAt: now,
 		}
 		b, err := in.encode()
 		if err != nil {
@@ -230,17 +229,17 @@ func TestEveryRecordRoundTrips(t *testing.T) {
 			t.Fatal(err)
 		}
 		if out.Cursor() != in.Cursor() || out.Amount.Cmp(in.Amount) != 0 ||
-			out.Status != in.Status || out.SweptBy != in.SweptBy || out.From != in.From {
+			out.Wallet != in.Wallet || out.TxHash != in.TxHash || out.From != in.From {
 			t.Fatalf("got %+v want %+v", out, in)
 		}
 	})
 
 	t.Run("withdrawal", func(t *testing.T) {
 		in := Withdrawal{
-			ID: id, Wallet: wid, Reason: ReasonFee, PartOf: wid,
+			ID: id, Wallet: wid, Reason: ReasonFee, PartOf: uuid.New(),
 			Destination: addr(6), Amount: wei(1000),
-			Status: WithdrawalConfirmed, TxHash: hash(8), Block: 4821,
-			Attempts: 4, IdempotencyKey: "k-1", CreatedAt: now, UpdatedAt: now,
+			TxHash: hash(8), Block: 4821,
+			IdempotencyKey: "k-1", CreatedAt: now, SettledAt: now,
 		}
 		b, err := in.encode()
 		if err != nil {
@@ -251,9 +250,33 @@ func TestEveryRecordRoundTrips(t *testing.T) {
 			t.Fatal(err)
 		}
 		if out.Wallet != in.Wallet || out.Amount.Cmp(in.Amount) != 0 ||
-			out.Status != in.Status || out.Attempts != in.Attempts ||
+			out.TxHash != in.TxHash || out.IdempotencyKey != in.IdempotencyKey ||
+			out.Reason != in.Reason || out.PartOf != in.PartOf || out.Block != in.Block ||
+			!out.SettledAt.Equal(in.SettledAt) {
+			t.Fatalf("got %+v want %+v", out, in)
+		}
+	})
+
+	t.Run("pending", func(t *testing.T) {
+		in := Pending{
+			ID: id, Wallet: wid, Reason: ReasonPayout, PartOf: uuid.New(),
+			Destination: addr(6), Amount: wei(1000),
+			Attempts: 4, Error: "reverted", RetryAfter: now,
+			IdempotencyKey: "k-1", CreatedAt: now, UpdatedAt: now,
+		}
+		b, err := in.encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := decodePending(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.Wallet != in.Wallet || out.Amount.Cmp(in.Amount) != 0 ||
+			out.Attempts != in.Attempts || out.Error != in.Error ||
 			out.IdempotencyKey != in.IdempotencyKey ||
-			out.Reason != in.Reason || out.PartOf != in.PartOf || out.Block != in.Block {
+			out.Reason != in.Reason || out.PartOf != in.PartOf ||
+			!out.RetryAfter.Equal(in.RetryAfter) {
 			t.Fatalf("got %+v want %+v", out, in)
 		}
 	})

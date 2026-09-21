@@ -114,7 +114,7 @@ func TestDrainCompletionCreditsEveryWaitingDeposit(t *testing.T) {
 			if _, err := tx.PutDeposit(store.Deposit{
 				Wallet: h.proxy.ID, Block: 1, LogIndex: uint32(10 + i),
 				TxHash: hash(byte(0x40 + i)), Amount: wei(amount),
-				Status: store.DepositReceived, CreatedAt: time.Now(),
+				CreatedAt: time.Now(),
 			}); err != nil {
 				return err
 			}
@@ -137,21 +137,16 @@ func TestDrainCompletionCreditsEveryWaitingDeposit(t *testing.T) {
 	if len(deps) != 3 {
 		t.Fatalf("deposits = %d, want 3", len(deps))
 	}
-	forwarded := 0
+	// The credits are recorded and left alone: a drain moves a balance, not a
+	// set of deposits, so nothing is stamped on them when it settles (§50).
+	onProxy := 0
 	for _, d := range deps {
-		if d.Wallet != h.proxy.ID {
-			continue
-		}
-		forwarded++
-		if d.Status != store.DepositForwarded {
-			t.Fatalf("deposit %d-%d status = %s, want forwarded", d.Block, d.LogIndex, d.Status)
-		}
-		if d.SweptBy == uuid.Nil {
-			t.Fatalf("deposit not linked to the debit that carried it: %+v", d)
+		if d.Wallet == h.proxy.ID {
+			onProxy++
 		}
 	}
-	if forwarded != 2 {
-		t.Fatalf("forwarded %d deposits, want 2", forwarded)
+	if onProxy != 2 {
+		t.Fatalf("credits on the proxy = %d, want 2", onProxy)
 	}
 	// The flow is gone and the wallet is idle again.
 	if got := h.flows(); len(got) != 0 {
@@ -195,15 +190,15 @@ func TestWithdrawalSettlementConfirmsAndReleasesTheCommitment(t *testing.T) {
 	h := newHarness(t, 1)
 	h.addrs.Add(h.hot.Address, h.hot.ID)
 
-	wd := store.Withdrawal{
+	wd := store.Pending{
 		ID: uuid.New(), Wallet: h.hot.ID, Reason: store.ReasonPayout, Destination: addr(0xDD),
-		Amount: wei(50), Status: store.WithdrawalPending, CreatedAt: time.Now(),
+		Amount: wei(50), CreatedAt: time.Now(),
 	}
 	h.update(func(tx *store.Tx) error {
 		if _, err := tx.Credit(h.hot.ID, wei(1000)); err != nil {
 			return err
 		}
-		return tx.PutWithdrawal(wd)
+		return tx.PutPending(wd)
 	})
 
 	txh := hash(0x61)
@@ -216,11 +211,15 @@ func TestWithdrawalSettlementConfirmsAndReleasesTheCommitment(t *testing.T) {
 	h.runOnce()
 
 	h.view(func(tx *store.Tx) error {
+		// Settling moved it into the log (§51).
+		if _, still, err := tx.Pending(wd.ID); err != nil || still {
+			t.Fatalf("the promise outlived settlement (still=%v err=%v)", still, err)
+		}
 		got, ok, err := tx.Withdrawal(wd.ID)
 		if err != nil || !ok {
 			t.Fatalf("withdrawal: ok=%v err=%v", ok, err)
 		}
-		if got.Status != store.WithdrawalConfirmed || got.TxHash != txh {
+		if got.TxHash != txh {
 			t.Fatalf("withdrawal = %+v", got)
 		}
 		committed, err := tx.Committed(h.hot.ID)
@@ -245,15 +244,15 @@ func TestRevertedWithdrawalStaysPendingAndKeepsItsCommitment(t *testing.T) {
 	h := newHarness(t, 1)
 	h.addrs.Add(h.hot.Address, h.hot.ID)
 
-	wd := store.Withdrawal{
+	wd := store.Pending{
 		ID: uuid.New(), Wallet: h.hot.ID, Reason: store.ReasonPayout, Destination: addr(0xDD),
-		Amount: wei(50), Status: store.WithdrawalPending, CreatedAt: time.Now(),
+		Amount: wei(50), CreatedAt: time.Now(),
 	}
 	h.update(func(tx *store.Tx) error {
 		if _, err := tx.Credit(h.hot.ID, wei(1000)); err != nil {
 			return err
 		}
-		return tx.PutWithdrawal(wd)
+		return tx.PutPending(wd)
 	})
 
 	txh := hash(0x62)
@@ -265,12 +264,12 @@ func TestRevertedWithdrawalStaysPendingAndKeepsItsCommitment(t *testing.T) {
 	h.runOnce()
 
 	h.view(func(tx *store.Tx) error {
-		got, _, err := tx.Withdrawal(wd.ID)
+		got, ok, err := tx.Pending(wd.ID)
 		if err != nil {
 			return err
 		}
-		if got.Status != store.WithdrawalPending {
-			t.Fatalf("status = %s, want it to stay pending", got.Status)
+		if !ok {
+			t.Fatal("a reverted payout left the pending keyspace")
 		}
 		if got.Attempts != 1 {
 			t.Fatalf("attempts = %d, want 1", got.Attempts)
@@ -360,9 +359,9 @@ func TestQueuedWithdrawalsWaitUntilCaughtUp(t *testing.T) {
 		if _, err := tx.Credit(h.hot.ID, wei(1000)); err != nil {
 			return err
 		}
-		return tx.PutWithdrawal(store.Withdrawal{
+		return tx.PutPending(store.Pending{
 			ID: uuid.New(), Wallet: h.hot.ID, Reason: store.ReasonPayout, Destination: addr(0xDD),
-			Amount: wei(50), Status: store.WithdrawalPending, CreatedAt: time.Now(),
+			Amount: wei(50), CreatedAt: time.Now(),
 		})
 	})
 	for b := uint64(1); b <= 25; b++ {

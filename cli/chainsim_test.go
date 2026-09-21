@@ -108,6 +108,12 @@ func (c *chainSim) BalanceBNB(_ context.Context, a common.Address) (*big.Int, er
 	return new(big.Int).Set(orZeroInt(c.bnb[a])), nil
 }
 
+func (c *chainSim) TokenBalance(_ context.Context, _, holder common.Address) (*big.Int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return new(big.Int).Set(orZeroInt(c.usdt[holder])), nil
+}
+
 // Call answers balanceOf and allowance, matched by selector.
 func (c *chainSim) Call(_ context.Context, _ common.Address, data []byte) ([]byte, error) {
 	c.mu.Lock()

@@ -12,6 +12,7 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -25,7 +26,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/google/uuid"
 )
 
 // Chain is the subset of the RPC client the watcher needs.
@@ -33,6 +33,10 @@ type Chain interface {
 	Finalized(ctx context.Context) (uint64, error)
 	BlockReceipts(ctx context.Context, block uint64) ([]*types.Receipt, error)
 	BalanceBNB(ctx context.Context, addr common.Address) (*big.Int, error)
+	// TokenBalance is only used for the master's gauge. Every managed wallet's
+	// custody comes from Transfer logs; the master is not one of ours, so its
+	// balance has to be asked for (§49).
+	TokenBalance(ctx context.Context, token, holder common.Address) (*big.Int, error)
 }
 
 // Options configure the watcher. Zero values take sensible defaults except
@@ -47,11 +51,13 @@ type Options struct {
 	BackfillBatch  int           // blocks per write transaction while catching up
 	DrainThreshold *big.Int      // don't spend gas moving less than this
 
-	// The master, so its balances can be gauged and its own transfers skipped.
-	MasterWallet uuid.UUID
-	Master       common.Address // for the BNB gauge
-	MasterPoll   time.Duration
-	Token        common.Address // the USDT contract; defaults to mainnet
+	// The master, so its two balances can be gauged. It is not a wallet in the
+	// store and not in the watched-address set — bsc records nothing it sends or
+	// receives (§49) — so the address is all there is to pass, and an unset one
+	// is what "no master" means.
+	Master     common.Address // both gauges are asked of the chain
+	MasterPoll time.Duration
+	Token      common.Address // the USDT contract; defaults to mainnet
 
 	// Notify is called after each successful commit so the sender can look for
 	// work without polling. Optional.
@@ -83,7 +89,15 @@ type Watcher struct {
 	// from logs — a manual gas top-up is a plain value transfer and emits
 	// nothing — so this poll is the only moment anything knows it.
 	masterGas atomic.Pointer[big.Int]
+
+	// started is set by Start, which is what resolves the cursor. Step refuses
+	// to run before it: a zero cursor means "block 0", so an unstarted watcher
+	// would quietly begin walking the chain from genesis (§52).
+	started bool
 }
+
+// ErrNotStarted means Step was called before Start resolved the cursor.
+var ErrNotStarted = errors.New("watcher: Step before Start; the cursor is unresolved")
 
 // Behind reports how many finalized blocks remain unprocessed.
 func (w *Watcher) Behind() uint64 { return w.behind.Load() }
@@ -202,6 +216,7 @@ func (w *Watcher) Start(ctx context.Context) error {
 		cursor = start
 	}
 	w.cursor = cursor
+	w.started = true
 
 	now := time.Now()
 	var started int
@@ -224,6 +239,12 @@ func (w *Watcher) Start(ctx context.Context) error {
 // the finalized head. Run is this in a loop; it is exported so a composition can
 // drive the chain deterministically rather than waiting on wall-clock timing.
 func (w *Watcher) Step(ctx context.Context) (caughtUp bool, err error) {
+	// Without this, an unstarted watcher reads cursor 0 and starts a backfill
+	// from genesis — on mainnet that is a hundred million blocks of history,
+	// and the only symptom is a service that looks busy and never catches up.
+	if !w.started {
+		return false, ErrNotStarted
+	}
 	head, err := w.chain.Finalized(ctx)
 	if err != nil {
 		return false, err
@@ -307,48 +328,23 @@ func (w *Watcher) pollMaster(ctx context.Context) {
 	metrics.MasterBNB.Set(f)
 	w.masterGas.Store(new(big.Int).Set(bal))
 
-	if w.opts.MasterWallet == uuid.Nil {
-		return
-	}
-
-	// The native balance cannot be derived from logs, so this poll is the only
-	// moment we know it — which makes it the natural place to ask whether the
-	// master needs topping up.
+	// Its token balance is asked of the chain, not accumulated. The master is
+	// not a wallet in this store — it is the operator's own key, spent from
+	// scripts and by hand — so there is no record to maintain and no reason for
+	// the watcher to care about transfers touching it (§49).
 	//
-	// Its *token* balance is a different matter: every transfer is a log, so the
-	// watcher already maintains it as the master's wallet record. The gauge
-	// therefore comes from the record rather than from another RPC call — and
-	// that is also the figure the top-up rule reads, so what the gauge shows is
-	// exactly what the decision will be made on.
-	if err := w.store.Update(func(tx *store.Tx) error {
-		master, ok, err := tx.Wallet(w.opts.MasterWallet)
-		if err != nil || !ok {
-			return err
-		}
-		// The master's token balance comes free from the Transfer logs the
-		// watcher already applies, so tracking it needs no extra call. The
-		// native balance is the one quantity in the service that cannot be
-		// derived from logs — a manual gas top-up is a plain value transfer
-		// that emits nothing — which is why it is polled at all (§14).
-		//
-		// Nothing acts on either number any more. Trading tokens back into gas
-		// used to start here; it is an operator command now, and these two
-		// gauges are what tells the operator to run it (§38).
-		held, _ := new(big.Float).SetInt(orZero(master.Balance)).Float64()
-		metrics.MasterUSDT.Set(held)
-		return nil
-	}); err != nil {
-		w.log.Error("master poll failed", "err", err)
+	// Nothing acts on either number. Trading tokens back into gas used to start
+	// here; it is an operator command now, and these two gauges are what tell
+	// the operator to run it (§38).
+	held, err := w.chain.TokenBalance(ctx, w.token, w.opts.Master)
+	if err != nil {
+		w.log.Warn("master token balance poll failed", "err", err)
 		return
 	}
-	w.opts.Notify()
-}
+	h, _ := new(big.Float).SetInt(held).Float64()
+	metrics.MasterUSDT.Set(h)
 
-func orZero(v *big.Int) *big.Int {
-	if v == nil {
-		return new(big.Int)
-	}
-	return v
+	w.opts.Notify()
 }
 
 // sleep waits for d, reporting false if the context ended first.

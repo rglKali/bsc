@@ -18,7 +18,7 @@ var now = time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 // proxy is a wallet that forwards what it receives: the drain candidate.
 func proxy(balance int64) store.Wallet {
 	return store.Wallet{
-		ID: uuid.New(), Ref: "cust-1", Kind: store.KindManaged,
+		ID: 1, Ref: "cust-1",
 		Address: addr(1), DrainTo: addr(2), Active: true,
 		Balance: big.NewInt(balance),
 	}
@@ -27,7 +27,7 @@ func proxy(balance int64) store.Wallet {
 // hot is a wallet that accumulates: the payout candidate.
 func hot(balance int64) store.Wallet {
 	return store.Wallet{
-		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged,
+		ID: 2, Ref: "hot",
 		Address: addr(2), Active: true, Balance: big.NewInt(balance),
 	}
 }
@@ -39,14 +39,6 @@ func TestShouldDrainNeverTouchesAnAccumulatingWallet(t *testing.T) {
 	w := hot(1_000)
 	if ShouldDrain(w, big.NewInt(1), now) {
 		t.Fatal("a wallet with no drain_to was told to drain")
-	}
-}
-
-func TestShouldDrainNeverTouchesTheMaster(t *testing.T) {
-	w := proxy(1_000)
-	w.Kind = store.KindMaster
-	if ShouldDrain(w, big.NewInt(1), now) {
-		t.Fatal("the master was told to drain")
 	}
 }
 
@@ -119,7 +111,6 @@ func TestShouldPay(t *testing.T) {
 		"paused":             {pausedHot(), true, false},
 		"busy":               {busyHot(), true, false},
 		"forwards elsewhere": {proxy(10_000), true, false},
-		"master":             {masterWallet(), true, false},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -139,12 +130,6 @@ func pausedHot() store.Wallet {
 func busyHot() store.Wallet {
 	w := hot(10_000)
 	w.Flow = uuid.New()
-	return w
-}
-
-func masterWallet() store.Wallet {
-	w := hot(10_000)
-	w.Kind = store.KindMaster
 	return w
 }
 

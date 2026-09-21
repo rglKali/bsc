@@ -3,10 +3,12 @@ package api
 import (
 	"math/big"
 	"net/http"
+	"sort"
 	"time"
 
 	"bsc/store"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/google/uuid"
 )
 
@@ -127,18 +129,35 @@ func (s *Server) createWithdrawal(w http.ResponseWriter, r *http.Request) error 
 		}
 
 		if body.IdempotencyKey != "" {
-			existing, ok, err := tx.WithdrawalByKey(body.IdempotencyKey)
+			// The original may still be a promise or may already have settled,
+			// so this looks in both keyspaces (§51).
+			prev, done, err := tx.DebitByKey(body.IdempotencyKey)
 			if err != nil {
 				return err
 			}
-			if ok {
+			var (
+				id     uuid.UUID
+				to     common.Address
+				amount *big.Int
+				w      store.WalletID
+				view   withdrawalView
+			)
+			switch {
+			case prev != nil:
+				id, to, amount, w = prev.ID, prev.Destination, prev.Amount, prev.Wallet
+				view = viewPending(*prev, wallet.Ref)
+			case done != nil:
+				id, to, amount, w = done.ID, done.Destination, done.Amount, done.Wallet
+				view = viewSettled(*done, wallet.Ref)
+			}
+			if id != uuid.Nil {
 				// A retry after a timeout replays the original. The same key
 				// with different parameters is a conflict, not a second payout.
-				if existing.Destination != dest || existing.Amount.Cmp(value) != 0 || existing.Wallet != wallet.ID {
+				if to != dest || amount.Cmp(value) != 0 || w != wallet.ID {
 					return fail(http.StatusConflict, "idempotency_conflict",
 						"idempotency_key %q was used with different parameters", body.IdempotencyKey)
 				}
-				out, err = replay(tx, existing, wallet.Ref)
+				out, err = replay(tx, id, view, wallet.ID, wallet.Ref)
 				return err
 			}
 		}
@@ -164,33 +183,32 @@ func (s *Server) createWithdrawal(w http.ResponseWriter, r *http.Request) error 
 		}
 
 		now := time.Now().UTC()
-		payout := store.Withdrawal{
+		payout := store.Pending{
 			ID: uuid.New(), Wallet: wallet.ID, Reason: store.ReasonPayout,
 			Destination: dest, Amount: value,
-			Status: store.WithdrawalPending, IdempotencyKey: body.IdempotencyKey,
-			CreatedAt: now, UpdatedAt: now,
+			IdempotencyKey: body.IdempotencyKey,
+			CreatedAt:      now, UpdatedAt: now,
 		}
-		if err := tx.PutWithdrawal(payout); err != nil {
+		if err := tx.PutPending(payout); err != nil {
 			return err
 		}
-		out = createdView{Payout: viewWithdrawal(payout, wallet.Ref)}
+		out = createdView{Payout: viewPending(payout, wallet.Ref)}
 
 		if fee == nil {
 			return nil
 		}
-		charge := store.Withdrawal{
+		charge := store.Pending{
 			ID: uuid.New(), Wallet: wallet.ID, Reason: store.ReasonFee,
 			PartOf: payout.ID, Destination: master.Address, Amount: fee,
 			// A moment later, so oldest-first runs the payout before its fee.
 			// Nothing depends on that order; it is simply the one that reads
 			// right if somebody is watching.
-			Status: store.WithdrawalPending, CreatedAt: now.Add(time.Millisecond),
-			UpdatedAt: now,
+			CreatedAt: now.Add(time.Millisecond), UpdatedAt: now,
 		}
-		if err := tx.PutWithdrawal(charge); err != nil {
+		if err := tx.PutPending(charge); err != nil {
 			return err
 		}
-		view := viewWithdrawal(charge, wallet.Ref)
+		view := viewPending(charge, wallet.Ref)
 		out.Fee = &view
 		return nil
 	}); err != nil {
@@ -203,17 +221,17 @@ func (s *Server) createWithdrawal(w http.ResponseWriter, r *http.Request) error 
 
 // replay rebuilds the response for an idempotent retry, finding the fee that
 // was created alongside the payout. The fee has no key of its own — one request
-// is one key — so it is found by the link back to its payout.
-func replay(tx *store.Tx, payout store.Withdrawal, ref string) (createdView, error) {
-	out := createdView{Payout: viewWithdrawal(payout, ref)}
-	siblings, err := tx.WalletWithdrawals(payout.Wallet, 0)
+// is one key — so it is found by the link back to its payout, which means
+// looking through the wallet's whole history across both keyspaces (§51).
+func replay(tx *store.Tx, payoutID uuid.UUID, payout withdrawalView, wallet store.WalletID, ref string) (createdView, error) {
+	out := createdView{Payout: payout}
+	siblings, err := walletDebits(tx, wallet, ref, 0)
 	if err != nil {
 		return out, err
 	}
-	for _, wd := range siblings {
-		if wd.PartOf == payout.ID {
-			view := viewWithdrawal(wd, ref)
-			out.Fee = &view
+	for i := range siblings {
+		if siblings[i].PartOf == payoutID.String() {
+			out.Fee = &siblings[i]
 			break
 		}
 	}
@@ -227,6 +245,18 @@ func (s *Server) getWithdrawal(w http.ResponseWriter, r *http.Request) error {
 	}
 	var out withdrawalView
 	if err := s.store.View(func(tx *store.Tx) error {
+		// A caller holds one id for the whole life of a withdrawal, so this
+		// looks in both keyspaces and renders whichever half it is in (§51).
+		if p, ok, err := tx.Pending(id); err != nil {
+			return err
+		} else if ok {
+			ref, err := refOf(tx, p.Wallet)
+			if err != nil {
+				return err
+			}
+			out = viewPending(p, ref)
+			return nil
+		}
 		wd, ok, err := tx.Withdrawal(id)
 		if err != nil {
 			return err
@@ -238,7 +268,7 @@ func (s *Server) getWithdrawal(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
-		out = viewWithdrawal(wd, ref)
+		out = viewSettled(wd, ref)
 		return nil
 	}); err != nil {
 		return err
@@ -282,8 +312,19 @@ func (s *Server) listWithdrawals(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		next = cursor
-		out, err = viewWithdrawals(tx, filterReason(records, reason), 0)
-		return err
+		refs := map[store.WalletID]string{}
+		for _, wd := range records {
+			ref, ok := refs[wd.Wallet]
+			if !ok {
+				if ref, err = refOf(tx, wd.Wallet); err != nil {
+					return err
+				}
+				refs[wd.Wallet] = ref
+			}
+			out = append(out, viewSettled(wd, ref))
+		}
+		out = filterViewReason(out, reason)
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -304,14 +345,14 @@ func reasonParam(r *http.Request) (string, error) {
 	}
 }
 
-func filterReason(records []store.Withdrawal, reason string) []store.Withdrawal {
+func filterViewReason(records []withdrawalView, reason string) []withdrawalView {
 	if reason == "all" {
 		return records
 	}
 	kept := records[:0]
-	for _, wd := range records {
-		if wd.Reason.String() == reason {
-			kept = append(kept, wd)
+	for _, v := range records {
+		if v.Reason == reason {
+			kept = append(kept, v)
 		}
 	}
 	return kept
@@ -336,17 +377,35 @@ func (s *Server) listWalletWithdrawals(w http.ResponseWriter, r *http.Request) e
 		if err != nil {
 			return err
 		}
-		var records []store.Withdrawal
-		if status == "pending" {
-			records, err = tx.WalletOpenWithdrawals(wallet.ID)
-		} else {
-			records, err = tx.WalletWithdrawals(wallet.ID, limit)
+		switch status {
+		case "pending":
+			// The keyspace IS the outstanding set, so this reads one bucket.
+			open, err := tx.WalletPending(wallet.ID)
+			if err != nil {
+				return err
+			}
+			for _, p := range open {
+				out = append(out, viewPending(p, wallet.Ref))
+			}
+		case "confirmed":
+			settled, err := tx.WalletSettled(wallet.ID, limit)
+			if err != nil {
+				return err
+			}
+			for _, wd := range settled {
+				out = append(out, viewSettled(wd, wallet.Ref))
+			}
+		default:
+			out, err = walletDebits(tx, wallet.ID, wallet.Ref, limit)
+			if err != nil {
+				return err
+			}
 		}
-		if err != nil {
-			return err
+		out = filterViewReason(out, reason)
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
 		}
-		out, err = viewWithdrawals(tx, filterReason(filterStatus(records, status), reason), limit)
-		return err
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -368,40 +427,7 @@ func statusParam(r *http.Request) (string, error) {
 	}
 }
 
-func filterStatus(records []store.Withdrawal, status string) []store.Withdrawal {
-	if status == "all" {
-		return records
-	}
-	kept := records[:0]
-	for _, wd := range records {
-		if wd.Status.String() == status {
-			kept = append(kept, wd)
-		}
-	}
-	return kept
-}
-
-func viewWithdrawals(tx *store.Tx, records []store.Withdrawal, limit int) ([]withdrawalView, error) {
-	refs := map[string]string{}
-	out := make([]withdrawalView, 0, len(records))
-	for _, wd := range records {
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-		ref, ok := refs[string(wd.Wallet[:])]
-		if !ok {
-			var err error
-			if ref, err = refOf(tx, wd.Wallet); err != nil {
-				return nil, err
-			}
-			refs[string(wd.Wallet[:])] = ref
-		}
-		out = append(out, viewWithdrawal(wd, ref))
-	}
-	return out, nil
-}
-
-func refOf(tx *store.Tx, id uuid.UUID) (string, error) {
+func refOf(tx *store.Tx, id store.WalletID) (string, error) {
 	w, ok, err := tx.Wallet(id)
 	if err != nil || !ok {
 		return "", err
@@ -409,19 +435,61 @@ func refOf(tx *store.Tx, id uuid.UUID) (string, error) {
 	return w.Ref, nil
 }
 
-func viewWithdrawal(wd store.Withdrawal, ref string) withdrawalView {
+// The wire keeps one shape with a `status`, because a caller holds one id
+// across a withdrawal's whole life and should not have to know that the record
+// moved keyspaces underneath it. The status is computed from which bucket the
+// record came out of — it is not stored anywhere (§51).
+
+func viewPending(p store.Pending, ref string) withdrawalView {
+	v := withdrawalView{
+		ID: p.ID.String(), Wallet: ref,
+		Reason: p.Reason.String(), Status: "pending",
+		To: p.Destination.Hex(), Amount: amountString(p.Amount),
+		Attempts: p.Attempts, LastError: p.Error,
+		CreatedAt: stamp(p.CreatedAt), UpdatedAt: stamp(p.UpdatedAt),
+	}
+	if p.PartOf != uuid.Nil {
+		v.PartOf = p.PartOf.String()
+	}
+	return v
+}
+
+func viewSettled(wd store.Withdrawal, ref string) withdrawalView {
 	v := withdrawalView{
 		ID: wd.ID.String(), Wallet: ref,
-		Reason: wd.Reason.String(), Status: wd.Status.String(),
+		Reason: wd.Reason.String(), Status: "confirmed",
 		To: wd.Destination.Hex(), Amount: amountString(wd.Amount),
-		TxHash: hashStr(wd.TxHash), Attempts: wd.Attempts, LastError: wd.Error,
-		CreatedAt: stamp(wd.CreatedAt), UpdatedAt: stamp(wd.UpdatedAt),
+		TxHash: hashStr(wd.TxHash), Cursor: wd.Settled().String(),
+		CreatedAt: stamp(wd.CreatedAt), UpdatedAt: stamp(wd.SettledAt),
 	}
 	if wd.PartOf != uuid.Nil {
 		v.PartOf = wd.PartOf.String()
 	}
-	if wd.Status.IsTerminal() {
-		v.Cursor = wd.Settled().String()
-	}
 	return v
+}
+
+// walletDebits is one wallet's whole history across both keyspaces, newest
+// first. This is the join the split costs, and it is the only one that reads
+// more than one bucket per row.
+func walletDebits(tx *store.Tx, wallet store.WalletID, ref string, limit int) ([]withdrawalView, error) {
+	pending, err := tx.WalletPending(wallet)
+	if err != nil {
+		return nil, err
+	}
+	settled, err := tx.WalletSettled(wallet, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]withdrawalView, 0, len(pending)+len(settled))
+	for _, p := range pending {
+		out = append(out, viewPending(p, ref))
+	}
+	for _, wd := range settled {
+		out = append(out, viewSettled(wd, ref))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }

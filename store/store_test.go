@@ -5,11 +5,11 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/google/uuid"
 )
 
 // open returns a store backed by a fresh file in the test's temp dir.
@@ -66,7 +66,7 @@ func seedProxy(t *testing.T, s *Store, ref string, drainTo common.Address, balan
 func seedWalletAt(t *testing.T, s *Store, ref string, at, drainTo common.Address, balance int64) Wallet {
 	t.Helper()
 	w := Wallet{
-		ID: uuid.New(), Ref: ref, Kind: KindManaged, Address: at, DrainTo: drainTo,
+		ID: nextID(), Ref: ref, Address: at, DrainTo: drainTo,
 		Active: true, Balance: wei(balance),
 		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
@@ -85,7 +85,7 @@ func seedWalletAt(t *testing.T, s *Store, ref string, at, drainTo common.Address
 			Wallet: w.ID, Block: 1, LogIndex: uint32(at[common.AddressLength-1]),
 			TxHash: hash(at[common.AddressLength-1]),
 			From:   addr(0xF0), Amount: wei(balance),
-			Status: DepositReceived, CreatedAt: time.Now().UTC(),
+			CreatedAt: time.Now().UTC(),
 		})
 		return err
 	})
@@ -251,16 +251,16 @@ func TestOpenReadOnlyReadsASnapshot(t *testing.T) {
 // blocks perfectly and can sign nothing.
 func TestMetaRefusesADifferentChain(t *testing.T) {
 	s := open(t)
-	mainnet := Meta{ChainID: 56, Token: addr(0x55), Decimals: 18}
+	mainnet := Meta{ChainID: 56, Token: addr(0x55), Decimals: 18, Master: addr(0x11)}
 	update(t, s, func(tx *Tx) error { return tx.SetMeta(mainnet) })
 
 	// Re-recording the same identity is how every normal restart goes.
 	update(t, s, func(tx *Tx) error { return tx.SetMeta(mainnet) })
 
 	for name, m := range map[string]Meta{
-		"another chain":    {ChainID: 97, Token: addr(0x55), Decimals: 18},
-		"another token":    {ChainID: 56, Token: addr(0x99), Decimals: 18},
-		"another decimals": {ChainID: 56, Token: addr(0x55), Decimals: 6},
+		"another chain":    {ChainID: 97, Token: addr(0x55), Decimals: 18, Master: addr(0x11)},
+		"another token":    {ChainID: 56, Token: addr(0x99), Decimals: 18, Master: addr(0x11)},
+		"another decimals": {ChainID: 56, Token: addr(0x55), Decimals: 6, Master: addr(0x11)},
 	} {
 		err := s.Update(func(tx *Tx) error { return tx.SetMeta(m) })
 		if err == nil {
@@ -270,6 +270,32 @@ func TestMetaRefusesADifferentChain(t *testing.T) {
 
 	got, ok, err := readMeta(t, s)
 	if err != nil || !ok || got != mainnet {
+		t.Fatalf("meta = %+v (ok=%v err=%v), want it unchanged", got, ok, err)
+	}
+}
+
+// The master is bound the same way the chain and the token are, and for a
+// sharper reason: every address in this database is derived from that secret,
+// so opening it under another would leave every wallet unreachable while the
+// service carried on as though nothing were wrong. It is the one wallet bsc
+// does not store — its address lives here and nowhere else (§49).
+func TestMetaRefusesADifferentMaster(t *testing.T) {
+	s := open(t)
+	bound := Meta{ChainID: 56, Token: addr(0x55), Decimals: 18, Master: addr(0x11)}
+	update(t, s, func(tx *Tx) error { return tx.SetMeta(bound) })
+
+	other := bound
+	other.Master = addr(0x22)
+	err := s.Update(func(tx *Tx) error { return tx.SetMeta(other) })
+	if err == nil {
+		t.Fatal("a different master was accepted")
+	}
+	if !strings.Contains(err.Error(), "strand") {
+		t.Fatalf("err = %v; it should say what is at stake", err)
+	}
+
+	got, ok, err := readMeta(t, s)
+	if err != nil || !ok || got != bound {
 		t.Fatalf("meta = %+v (ok=%v err=%v), want it unchanged", got, ok, err)
 	}
 }

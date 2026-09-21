@@ -13,7 +13,6 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind/v2"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/google/uuid"
 )
 
 // apply folds one finalized block into the store, inside the caller's write
@@ -35,7 +34,7 @@ import (
 // holds; the ledger is what an app is owed, and a deposit joins it only when its
 // drain lands (§22).
 func (w *Watcher) apply(tx *store.Tx, block uint64, receipts []*types.Receipt, now time.Time) error {
-	touched := make(map[uuid.UUID]struct{})
+	touched := make(map[store.WalletID]struct{})
 
 	for _, rc := range receipts {
 		if err := w.confirm(tx, rc, block, now, touched); err != nil {
@@ -53,7 +52,7 @@ func (w *Watcher) apply(tx *store.Tx, block uint64, receipts []*types.Receipt, n
 // confirm resolves a finalized transaction against the in-flight set and
 // advances the flow that was waiting on it. The watchlist and the router are the
 // same structure, so this is one lookup.
-func (w *Watcher) confirm(tx *store.Tx, rc *types.Receipt, block uint64, now time.Time, touched map[uuid.UUID]struct{}) error {
+func (w *Watcher) confirm(tx *store.Tx, rc *types.Receipt, block uint64, now time.Time, touched map[store.WalletID]struct{}) error {
 	ref, found, err := tx.TxRefByHash(rc.TxHash)
 	if err != nil {
 		return err
@@ -106,7 +105,7 @@ func (w *Watcher) forget(tx *store.Tx, hash common.Hash, ref store.TxRef) error 
 }
 
 // transfer applies one USDT Transfer log to the wallets it touches.
-func (w *Watcher) transfer(tx *store.Tx, rc *types.Receipt, lg *types.Log, block uint64, now time.Time, touched map[uuid.UUID]struct{}) error {
+func (w *Watcher) transfer(tx *store.Tx, rc *types.Receipt, lg *types.Log, block uint64, now time.Time, touched map[store.WalletID]struct{}) error {
 	// Every BEP-20 shares the Transfer topic, so the emitter decides whether a
 	// log is money we care about.
 	if lg.Address != w.token {
@@ -150,16 +149,10 @@ func (w *Watcher) transfer(tx *store.Tx, rc *types.Receipt, lg *types.Log, block
 // sub-cent credit was a ledger entry that changed nothing. With the chain's own
 // units on the wire there is no floor to apply and no dust to create: every
 // transfer is recordable exactly as it arrived (§36).
-func (w *Watcher) credit(tx *store.Tx, id uuid.UUID, ev *usdt.UsdtTransfer, rc *types.Receipt, lg *types.Log, block uint64, now time.Time) error {
+func (w *Watcher) credit(tx *store.Tx, id store.WalletID, ev *usdt.UsdtTransfer, rc *types.Receipt, lg *types.Log, block uint64, now time.Time) error {
 	wallet, err := tx.Credit(id, ev.Value)
 	if err != nil {
 		return err
-	}
-	// The master is the service's own wallet: its token balance is tracked like
-	// any other so `bsc check` can report it, but money arriving there is not a
-	// deposit anybody is waiting to hear about.
-	if wallet.Kind != store.KindManaged {
-		return nil
 	}
 	// A drain arriving at the wallet it was aimed at *is* recorded. It is a real
 	// transfer onto a wallet the caller owns, and with no ledger to double-count
@@ -169,7 +162,7 @@ func (w *Watcher) credit(tx *store.Tx, id uuid.UUID, ev *usdt.UsdtTransfer, rc *
 	created, err := tx.PutDeposit(store.Deposit{
 		Wallet: id, Block: block, LogIndex: uint32(lg.Index),
 		TxHash: rc.TxHash, From: ev.From, Amount: ev.Value,
-		Status: store.DepositReceived, CreatedAt: now.UTC(),
+		CreatedAt: now.UTC(),
 	})
 	if err != nil {
 		return err
@@ -186,7 +179,7 @@ func (w *Watcher) credit(tx *store.Tx, id uuid.UUID, ev *usdt.UsdtTransfer, rc *
 // evaluateTouched applies the drain rule to the wallets this block changed.
 // Scoping to touched wallets keeps the per-block cost proportional to activity
 // rather than to how many deposit addresses exist.
-func (w *Watcher) evaluateTouched(tx *store.Tx, touched map[uuid.UUID]struct{}, now time.Time) error {
+func (w *Watcher) evaluateTouched(tx *store.Tx, touched map[store.WalletID]struct{}, now time.Time) error {
 	for id := range touched {
 		wallet, found, err := tx.Wallet(id)
 		if err != nil {
@@ -217,11 +210,13 @@ func (w *Watcher) evaluateTouched(tx *store.Tx, touched map[uuid.UUID]struct{}, 
 // That replaces the pass over every app, which was proportional to the number
 // of apps whether or not any of them had work.
 func (w *Watcher) evaluatePending(tx *store.Tx, now time.Time) error {
-	open, err := tx.OpenWithdrawals()
+	// state/withdrawal holds exactly the promises, so this is one bucket scan
+	// proportional to what is in flight (§51).
+	open, err := tx.OpenPending()
 	if err != nil {
 		return err
 	}
-	seen := map[uuid.UUID]bool{}
+	seen := map[store.WalletID]bool{}
 	for _, wd := range open {
 		if seen[wd.Wallet] {
 			continue

@@ -12,6 +12,8 @@
 package chain
 
 import (
+	"bsc/usdt"
+
 	"context"
 	"errors"
 	"fmt"
@@ -137,7 +139,7 @@ func (c *Client) BlockReceipts(ctx context.Context, block uint64) ([]*types.Rece
 // Receipt returns one transaction's receipt, or nil when it is not yet mined.
 //
 // The watcher never needs this — it reads whole blocks — but an attended
-// operator command does: `bsc swap` has to know its approve landed before it
+// an operator does by hand: an approve has to land before the trade that
 // builds the trade that depends on it.
 func (c *Client) Receipt(ctx context.Context, hash common.Hash) (*types.Receipt, error) {
 	var rc *types.Receipt
@@ -198,6 +200,20 @@ func (c *Client) BalanceBNB(ctx context.Context, addr common.Address) (*big.Int,
 		return nil, err
 	}
 	return (*big.Int)(&out), nil
+}
+
+// TokenBalance reads balanceOf(holder) on a token contract.
+//
+// The service does not use this for managed wallets — their custody comes from
+// the Transfer logs the watcher already applies, with no extra call per wallet.
+// It exists for the master, which is not a wallet this service manages and so
+// has no record to read (§49).
+func (c *Client) TokenBalance(ctx context.Context, token, holder common.Address) (*big.Int, error) {
+	out, err := c.Call(ctx, token, usdt.NewUsdt().PackBalanceOf(holder))
+	if err != nil {
+		return nil, fmt.Errorf("chain: balanceOf(%s) on %s: %w", holder.Hex(), token.Hex(), err)
+	}
+	return usdt.NewUsdt().UnpackBalanceOf(out)
 }
 
 // SendRawTx broadcasts a signed, RLP-encoded transaction. The caller must have

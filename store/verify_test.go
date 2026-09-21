@@ -65,9 +65,9 @@ func TestVerifyCountsCommittedAcrossPendingWithdrawals(t *testing.T) {
 	w := seedWallet(t, s, "hot", 1000)
 	update(t, s, func(tx *Tx) error {
 		for _, amount := range []int64{100, 250} {
-			if err := tx.PutWithdrawal(Withdrawal{
+			if err := tx.PutPending(Pending{
 				ID: uuid.New(), Wallet: w.ID, Reason: ReasonPayout, Destination: addr(0x99),
-				Amount: wei(amount), Status: WithdrawalPending, CreatedAt: time.Now().UTC(),
+				Amount: wei(amount), CreatedAt: time.Now().UTC(),
 			}); err != nil {
 				return err
 			}
@@ -89,9 +89,9 @@ func TestVerifyFlagsAWalletOwingMoreThanItHolds(t *testing.T) {
 	s := open(t)
 	w := seedWallet(t, s, "hot", 100)
 	update(t, s, func(tx *Tx) error {
-		return tx.PutWithdrawal(Withdrawal{
+		return tx.PutPending(Pending{
 			ID: uuid.New(), Wallet: w.ID, Reason: ReasonPayout, Destination: addr(0x99),
-			Amount: wei(500), Status: WithdrawalPending, CreatedAt: time.Now().UTC(),
+			Amount: wei(500), CreatedAt: time.Now().UTC(),
 		})
 	})
 
@@ -105,16 +105,16 @@ func TestVerifyFlagsAWalletOwingMoreThanItHolds(t *testing.T) {
 	}
 }
 
-// A confirmed withdrawal is not a promise any more, so it must stop counting
-// against the wallet.
-func TestVerifyIgnoresConfirmedWithdrawals(t *testing.T) {
+// A settled debit is not a promise any more, so it must stop counting against
+// the wallet. Since §51 that is structural: it is in a different keyspace, and
+// Committed only ever scans the promises.
+func TestVerifyIgnoresSettledWithdrawals(t *testing.T) {
 	s := open(t)
 	w := seedWallet(t, s, "hot", 100)
 	update(t, s, func(tx *Tx) error {
 		return tx.PutWithdrawal(Withdrawal{
 			ID: uuid.New(), Wallet: w.ID, Reason: ReasonPayout, Destination: addr(0x99),
-			Amount: wei(500), Status: WithdrawalConfirmed, TxHash: hash(0x11),
-			CreatedAt: time.Now().UTC(),
+			Amount: wei(500), TxHash: hash(0x11), CreatedAt: time.Now().UTC(),
 		})
 	})
 	mustBeClean(t, verify(t, s))
@@ -127,8 +127,10 @@ func TestVerifyFlagsABrokenRefIndex(t *testing.T) {
 		return tx.tx.Bucket(bRef).Delete([]byte("hot"))
 	})
 
+	// A deleted entry is visible only from the record side: there is nothing
+	// left in the index to walk.
 	if found := findingsOfKind(verify(t, s), "index"); len(found) != 1 {
-		t.Fatalf("index findings = %d, want 1", len(found))
+		t.Fatalf("index findings = %d, want 1 (%v)", len(found), verify(t, s).Findings)
 	}
 }
 
@@ -183,29 +185,12 @@ func TestVerifyFlagsADrainCycleWrittenBehindItsBack(t *testing.T) {
 	// Close the loop by writing the record directly, bypassing MutateWallet.
 	update(t, s, func(tx *Tx) error {
 		b.DrainTo = a.Address
-		return put(tx, bWallet, b.ID[:], b.encode)
+		return put(tx, bWallet, b.ID.Key(), b.encode)
 	})
 
 	found := findingsOfKind(verify(t, s), "topology")
 	if len(found) == 0 {
 		t.Fatalf("no topology finding for a cycle (%v)", verify(t, s).Findings)
-	}
-}
-
-func TestVerifyFlagsADepositMissingFromTheOpenSet(t *testing.T) {
-	s := open(t)
-	hot := seedWallet(t, s, "hot", 0)
-	p := seedProxy(t, s, "cust-1", hot.Address, 500)
-
-	// Drop the open-index entry without changing the record's status.
-	update(t, s, func(tx *Tx) error {
-		return scanPrefix(tx, iDepOpen, walletPrefix(p.ID), func(k, _ []byte) error {
-			return tx.tx.Bucket(iDepOpen).Delete(append([]byte(nil), k...))
-		})
-	})
-
-	if found := findingsOfKind(verify(t, s), "index"); len(found) != 1 {
-		t.Fatalf("index findings = %d, want 1 (%v)", len(found), verify(t, s).Findings)
 	}
 }
 
@@ -226,9 +211,9 @@ func TestVerifyFlagsAnIdempotencyKeyPointingElsewhere(t *testing.T) {
 	s := open(t)
 	w := seedWallet(t, s, "hot", 1000)
 	update(t, s, func(tx *Tx) error {
-		if err := tx.PutWithdrawal(Withdrawal{
+		if err := tx.PutPending(Pending{
 			ID: uuid.New(), Wallet: w.ID, Reason: ReasonPayout, Destination: addr(0x99), Amount: wei(10),
-			Status: WithdrawalPending, IdempotencyKey: "order-1", CreatedAt: time.Now().UTC(),
+			IdempotencyKey: "order-1", CreatedAt: time.Now().UTC(),
 		}); err != nil {
 			return err
 		}
@@ -236,7 +221,58 @@ func TestVerifyFlagsAnIdempotencyKeyPointingElsewhere(t *testing.T) {
 		return tx.tx.Bucket(iWdIdem).Put([]byte("order-1"), other[:])
 	})
 
+	// Two findings for one corruption, and deliberately so: the record says it
+	// owns a key the index does not give back, and the index entry points at a
+	// debit that does not exist. Those are the two directions, and catching it
+	// from both is the point of walking the indexes as well as the records.
+	if found := findingsOfKind(verify(t, s), "index"); len(found) != 2 {
+		t.Fatalf("index findings = %d, want 2 (%v)", len(found), verify(t, s).Findings)
+	}
+}
+
+// The failure the record-side walk cannot see: an index entry pointing at a
+// wallet that is not the one it claims. A lookup through it succeeds and
+// returns somebody else's row, which is worse than a lookup that fails.
+func TestVerifyFlagsAnAddressIndexPointingAtTheWrongWallet(t *testing.T) {
+	s := open(t)
+	a := seedWalletAt(t, s, "a", addr(0x21), common.Address{}, 0)
+	seedWalletAt(t, s, "b", addr(0x22), common.Address{}, 0)
+
+	// b's address now resolves to a. Both wallets are intact, and every record
+	// still points at an index entry that exists — only the entry is wrong.
+	update(t, s, func(tx *Tx) error {
+		return tx.tx.Bucket(bAddr).Put(addr(0x22).Bytes(), a.ID.Key())
+	})
+
+	// Both directions see it, and they see different halves: b's record says the
+	// address index does not point back at it, and the entry itself resolves to
+	// a wallet with a different address. Only the second is a lookup that would
+	// have succeeded and returned the wrong row.
+	found := findingsOfKind(verify(t, s), "index")
+	if len(found) != 2 {
+		t.Fatalf("index findings = %d, want 2 (%v)", len(found), verify(t, s).Findings)
+	}
+	var sawMismatch bool
+	for _, f := range found {
+		if strings.Contains(f.Detail, "different address") {
+			sawMismatch = true
+		}
+	}
+	if !sawMismatch {
+		t.Fatalf("findings %v do not include the index-side mismatch", found)
+	}
+}
+
+// And the same for a dangling entry: one pointing at a wallet that was never
+// written at all.
+func TestVerifyFlagsADanglingRefIndex(t *testing.T) {
+	s := open(t)
+	seedWallet(t, s, "hot", 0)
+	update(t, s, func(tx *Tx) error {
+		return tx.tx.Bucket(bRef).Put([]byte("ghost"), WalletID(999).Key())
+	})
+
 	if found := findingsOfKind(verify(t, s), "index"); len(found) != 1 {
-		t.Fatalf("index findings = %d, want 1", len(found))
+		t.Fatalf("index findings = %d, want 1 (%v)", len(found), verify(t, s).Findings)
 	}
 }

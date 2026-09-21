@@ -13,7 +13,6 @@ import (
 	"bsc/flow"
 	"bsc/keys"
 	"bsc/store"
-	"bsc/swap"
 	"bsc/usdt"
 
 	"github.com/ethereum/go-ethereum"
@@ -41,8 +40,6 @@ type fakeChain struct {
 	allowance   map[common.Address]*big.Int // owner -> allowance granted to the master
 	allowanceTo map[allowanceKey]*big.Int   // explicit (owner, spender) pairs
 	balance     map[common.Address]*big.Int
-	swapRate    int64          // native units returned per token, for getAmountsOut
-	wrapped     common.Address // what the router reports for WETH()
 
 	sent      [][]byte
 	sendErr   error
@@ -91,7 +88,7 @@ func (f *fakeChain) BalanceBNB(_ context.Context, a common.Address) (*big.Int, e
 // allowanceKey identifies one (owner, spender) pair.
 type allowanceKey struct{ owner, spender common.Address }
 
-// Call answers the ERC-20 views and the router's price query, chosen by selector.
+// Call answers the ERC-20 views, chosen by selector.
 func (f *fakeChain) Call(_ context.Context, to common.Address, data []byte) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -102,25 +99,6 @@ func (f *fakeChain) Call(_ context.Context, to common.Address, data []byte) ([]b
 		return nil, nil
 	}
 	sel := common.Bytes2Hex(data[:4])
-
-	// The router reporting its own wrapped-native token.
-	if sel == common.Bytes2Hex(swap.PackWrappedNative()) {
-		var buf [32]byte
-		copy(buf[12:], f.wrapped.Bytes())
-		return buf[:], nil
-	}
-
-	// The router's price query: quote a fixed rate for the last hop.
-	if sel == common.Bytes2Hex(swap.PackGetAmountsOut(big.NewInt(0), nil)[:4]) {
-		in := new(big.Int).SetBytes(data[4:36])
-		out := new(big.Int).Mul(in, big.NewInt(f.swapRate))
-		var buf []byte
-		buf = appendWord(buf, big.NewInt(32)) // offset
-		buf = appendWord(buf, big.NewInt(2))  // length
-		buf = appendWord(buf, in)
-		buf = appendWord(buf, out)
-		return buf, nil
-	}
 
 	var out common.Hash
 	switch {
@@ -139,12 +117,6 @@ func (f *fakeChain) Call(_ context.Context, to common.Address, data []byte) ([]b
 		}
 	}
 	return out.Bytes(), nil
-}
-
-func appendWord(b []byte, v *big.Int) []byte {
-	var buf [32]byte
-	v.FillBytes(buf[:])
-	return append(b, buf[:]...)
 }
 
 func (f *fakeChain) SendRawTx(_ context.Context, raw []byte) (common.Hash, error) {
@@ -212,14 +184,14 @@ func newFixture(t *testing.T) *fixture {
 
 	f := &fixture{t: t, st: st, chain: ch, s: snd, ring: ring}
 
-	hotID, hotKey, _ := ring.Generate()
-	proxyID, proxyKey, _ := ring.Generate()
+	hotID, hotKey, _ := ring.Allocate(1)
+	proxyID, proxyKey, _ := ring.Allocate(hotID + 1)
 	f.hot = store.Wallet{
-		ID: hotID, Ref: "hot", Kind: store.KindManaged, Address: hotKey.Address,
+		ID: store.WalletID(hotID), Ref: "hot", Address: hotKey.Address,
 		Active: true, Balance: new(big.Int), CreatedAt: time.Now(),
 	}
 	f.proxy = store.Wallet{
-		ID: proxyID, Ref: "cust-1", Kind: store.KindManaged, Address: proxyKey.Address,
+		ID: store.WalletID(proxyID), Ref: "cust-1", Address: proxyKey.Address,
 		DrainTo: hotKey.Address, Balance: new(big.Int), CreatedAt: time.Now(),
 	}
 	f.update(func(tx *store.Tx) error {
@@ -285,7 +257,7 @@ func (f *fixture) flow(id uuid.UUID) (store.Flow, bool) {
 	return out, found
 }
 
-func (f *fixture) wallet(id uuid.UUID) store.Wallet {
+func (f *fixture) wallet(id store.WalletID) store.Wallet {
 	f.t.Helper()
 	var out store.Wallet
 	if err := f.st.View(func(tx *store.Tx) error {
@@ -455,15 +427,15 @@ func TestPayRefusesWhenTheChainHoldsLessThanOurRecords(t *testing.T) {
 	f := newFixture(t)
 	f.chain.balance[f.hot.Address] = wei(10)
 
-	wd := store.Withdrawal{
+	wd := store.Pending{
 		ID: uuid.New(), Wallet: f.hot.ID, Reason: store.ReasonPayout, Destination: addr(0xDD),
-		Amount: wei(250), Status: store.WithdrawalPending, CreatedAt: time.Now(),
+		Amount: wei(250), CreatedAt: time.Now(),
 	}
 	f.update(func(tx *store.Tx) error {
 		if _, err := tx.Credit(f.hot.ID, wei(1000)); err != nil { // our record is wrong
 			return err
 		}
-		return tx.PutWithdrawal(wd)
+		return tx.PutPending(wd)
 	})
 	fl := f.begin(store.FlowTransfer, f.hot, store.StateMoving, flow.Params{
 		Amount: wei(250), To: wd.Destination, Withdrawal: wd.ID,
@@ -478,15 +450,15 @@ func TestPayRefusesWhenTheChainHoldsLessThanOurRecords(t *testing.T) {
 		t.Fatal("flow should have failed and been removed")
 	}
 	if err := f.st.View(func(tx *store.Tx) error {
-		got, _, err := tx.Withdrawal(wd.ID)
+		// Refusing to broadcast is not the same as failing the request: the
+		// shortfall is ours, so the withdrawal stays a promise and is retried
+		// once custody agrees with the chain again (§28).
+		got, ok, err := tx.Pending(wd.ID)
 		if err != nil {
 			return err
 		}
-		// Refusing to broadcast is not the same as failing the request: the
-		// shortfall is ours, so the withdrawal stays pending and is retried
-		// once custody agrees with the chain again (§28).
-		if got.Status != store.WithdrawalPending {
-			t.Fatalf("withdrawal status = %s, want it still pending", got.Status)
+		if !ok {
+			t.Fatal("the withdrawal left the pending keyspace; it should still be owed")
 		}
 		if !strings.Contains(got.Error, "below") {
 			t.Fatalf("withdrawal error = %q, want the shortfall explained", got.Error)

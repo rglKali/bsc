@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"net/http"
 	"time"
 
@@ -27,7 +26,6 @@ import (
 	"bsc/watcher"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
 )
@@ -62,8 +60,7 @@ func runService(ctx context.Context, cfg config.Config) error {
 	defer rpc.Close()
 
 	// The endpoint says which chain this is, and everything chain-shaped follows
-	// from that: the token, the swap router, and the id every signature is bound
-	// to. Asking removes the one setting that could disagree with reality (§26).
+	// from that: the token, and the id every signature is bound to. Asking removes the one setting that could disagree with reality (§26).
 	chainID, err := rpc.ChainID(ctx)
 	if err != nil {
 		return err
@@ -80,21 +77,7 @@ func runService(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
-	// Recorded once and checked on every later start. Every amount in this
-	// database is denominated by this token on this chain, and every wallet in
-	// it was derived for it, so pointing the service at another is a migration
-	// rather than a configuration change — and now it cannot be done by accident.
-	if err := st.Update(func(tx *store.Tx) error {
-		return tx.SetMeta(store.Meta{ChainID: chainID, Token: cfg.Token, Decimals: decimals})
-	}); err != nil {
-		return err
-	}
-
-	// The master is recorded like any other wallet so its token balance is
-	// tracked from the same Transfer logs as everything else — which is what
-	// lets `bsc check` report it without an extra call.
-	masterWallet, err := ensureMasterWallet(st, master.Address)
-	if err != nil {
+	if err := bindIdentity(st, chainID, cfg.Token, decimals, master.Address); err != nil {
 		return err
 	}
 
@@ -117,7 +100,6 @@ func runService(ctx context.Context, cfg config.Config) error {
 		BackfillBatch: cfg.BackfillBatch,
 
 		DrainThreshold: cfg.DrainThreshold,
-		MasterWallet:   masterWallet.ID,
 		Master:         master.Address,
 		MasterPoll:     cfg.MasterPoll,
 		Token:          cfg.Token,
@@ -135,8 +117,6 @@ func runService(ctx context.Context, cfg config.Config) error {
 			Floor:     cfg.GasFloor,
 		},
 	})
-
-	addrs.Add(masterWallet.Address, masterWallet.ID)
 
 	mux := http.NewServeMux()
 	srv.Routes(mux)
@@ -178,38 +158,24 @@ func runService(ctx context.Context, cfg config.Config) error {
 	return nil
 }
 
-func addressOrZero(s string) common.Address {
-	if s == "" {
-		return common.Address{}
+// bindIdentity records what this database is — the chain, the token and its
+// decimals, and the master every wallet in it was derived under — and refuses
+// to start against a database built for anything else.
+//
+// It runs before the watcher, the sender or the listener exist, so a mismatch
+// stops the process rather than being discovered by a transfer that reverts or,
+// worse, by a wallet whose key nobody holds any more. The first start records;
+// every later one compares (§26, §49).
+func bindIdentity(st *store.Store, chainID uint64, token common.Address, decimals uint8, master common.Address) error {
+	if err := st.Update(func(tx *store.Tx) error {
+		return tx.SetMeta(store.Meta{
+			ChainID: chainID, Token: token, Decimals: decimals, Master: master,
+		})
+	}); err != nil {
+		if errors.Is(err, store.ErrIdentityMismatch) {
+			return fmt.Errorf("refusing to start: %w", err)
+		}
+		return err
 	}
-	return common.HexToAddress(s)
-}
-
-// ensureMasterWallet records the master as a wallet, idempotently. Its id is
-// derived from the address so a restart finds the same record rather than
-// creating a second one.
-func ensureMasterWallet(st *store.Store, addr common.Address) (store.Wallet, error) {
-	var out store.Wallet
-	err := st.Update(func(tx *store.Tx) error {
-		existing, ok, err := tx.WalletByAddress(addr)
-		if err != nil {
-			return err
-		}
-		if ok {
-			if existing.Kind != store.KindMaster {
-				return fmt.Errorf("app: %s is already recorded as a %s wallet", addr.Hex(), existing.Kind)
-			}
-			out = existing
-			return nil
-		}
-		out = store.Wallet{
-			ID:        uuid.NewSHA1(uuid.NameSpaceOID, addr.Bytes()),
-			Kind:      store.KindMaster,
-			Address:   addr,
-			Balance:   new(big.Int),
-			CreatedAt: time.Now().UTC(),
-		}
-		return tx.PutWallet(out)
-	})
-	return out, err
+	return nil
 }

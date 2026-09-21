@@ -61,8 +61,7 @@ task unit                            # offline: no chain, no network, no server
 task cover                           # coverage across the service packages
 task inspect -- snapshot.db          # audit a database file
 task sandbox                         # testnet + the dashboard at /ui/
-bsc check                            # the master's balances and the live price
-bsc swap --buy-bnb 0.1               # refill gas, by hand, at a price you saw
+bsc check                            # the master's balances and the gas floor
 ```
 
 Every test in `task unit` runs offline — the store is a temp file, the chain is a
@@ -104,18 +103,15 @@ nothing was ever written in two places.
 
 ```
 store/    the only datastore: bbolt, packed binary, hand-rolled indexes
-money/    one unit, and the parsing that guards it
 keys/     key derivation from the master secret
 chain/    the single RPC client, one shared rate-limit budget
-usdt/     generated token bindings (task abi) · swap/ the router calldata
-flow/     pure pipeline rules — state machines and work predicates, no I/O
-engine/   transactional glue: advance a flow, settle it, evaluate the rules
+usdt/     generated token bindings (task abi)
+flow/     the pipeline: pure rules beside the transactional glue that runs them
 watcher/  follows finalized blocks; one write transaction per block
 sender/   the only code that touches private keys
-api/      the HTTP surface · metrics/ the bsc_* namespace
-ui/       the optional dashboard, embedded; off unless ui_enabled
-buildinfo/ the version, stamped at link time
-app/      composition · cli/ the command tree · config/ one env config
+api/      the HTTP surface, wire amounts, and the embedded dashboard
+metrics/  the bsc_* namespace · buildinfo/ the version, stamped at link time
+cli/      the command tree and the wiring that runs it · config/ one config
 
 e2e/      the only tests that spend real funds — build-tagged, skip unless configured
 docs/     architecture, operating, consuming, roadmap

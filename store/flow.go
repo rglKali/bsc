@@ -18,7 +18,7 @@ func (t *Tx) PutFlow(f Flow) error {
 	if f.ID == uuid.Nil {
 		return errors.New("store: flow id must be set")
 	}
-	if f.Wallet == uuid.Nil {
+	if f.Wallet == 0 {
 		return errors.New("store: flow must name a wallet")
 	}
 	return put(t, bFlow, f.ID[:], f.encode)
@@ -65,7 +65,7 @@ func (t *Tx) DeleteFlow(f Flow) error {
 	if err := t.tx.Bucket(bFlow).Delete(f.ID[:]); err != nil {
 		return fmt.Errorf("store: delete flow: %w", err)
 	}
-	if f.Wallet != uuid.Nil {
+	if f.Wallet != 0 {
 		if _, err := t.MutateWallet(f.Wallet, func(w *Wallet) error {
 			if w.Flow == f.ID {
 				w.Flow = uuid.Nil

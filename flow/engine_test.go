@@ -48,11 +48,11 @@ func newFixture(t *testing.T) *fixture {
 
 	f := &fixture{t: t, st: st}
 	f.hot = store.Wallet{
-		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged, Address: addr(0x01),
+		ID: 1, Ref: "hot", Address: addr(0x01),
 		Active: true, Balance: new(big.Int), CreatedAt: now,
 	}
 	f.proxy = store.Wallet{
-		ID: uuid.New(), Ref: "cust-1", Kind: store.KindManaged, Address: addr(0x02),
+		ID: 2, Ref: "cust-1", Address: addr(0x02),
 		DrainTo: f.hot.Address, Active: true, Balance: new(big.Int), CreatedAt: now,
 	}
 	f.update(func(tx *store.Tx) error {
@@ -71,7 +71,7 @@ func (f *fixture) update(fn func(*store.Tx) error) {
 	}
 }
 
-func (f *fixture) wallet(id uuid.UUID) store.Wallet {
+func (f *fixture) wallet(id store.WalletID) store.Wallet {
 	f.t.Helper()
 	var w store.Wallet
 	if err := f.st.View(func(tx *store.Tx) error {
@@ -88,21 +88,40 @@ func (f *fixture) wallet(id uuid.UUID) store.Wallet {
 	return w
 }
 
-func (f *fixture) withdrawal(id uuid.UUID) store.Withdrawal {
+// pending reads a promise back. It fails if the record has settled, which is
+// the assertion most of these tests want: "is it still owed".
+func (f *fixture) pending(id uuid.UUID) store.Pending {
 	f.t.Helper()
-	var wd store.Withdrawal
+	var p store.Pending
 	if err := f.st.View(func(tx *store.Tx) error {
 		var ok bool
 		var err error
-		wd, ok, err = tx.Withdrawal(id)
+		p, ok, err = tx.Pending(id)
 		if err != nil || !ok {
-			f.t.Fatalf("withdrawal %s: ok=%v err=%v", id, ok, err)
+			f.t.Fatalf("pending %s: ok=%v err=%v", id, ok, err)
 		}
 		return nil
 	}); err != nil {
 		f.t.Fatal(err)
 	}
-	return wd
+	return p
+}
+
+// settled reads a fact back, and reports whether it is one yet.
+func (f *fixture) settled(id uuid.UUID) (store.Withdrawal, bool) {
+	f.t.Helper()
+	var (
+		wd store.Withdrawal
+		ok bool
+	)
+	if err := f.st.View(func(tx *store.Tx) error {
+		var err error
+		wd, ok, err = tx.Withdrawal(id)
+		return err
+	}); err != nil {
+		f.t.Fatal(err)
+	}
+	return wd, ok
 }
 
 // credit puts money on a wallet the way the watcher would, and records the
@@ -115,21 +134,21 @@ func (f *fixture) credit(w store.Wallet, block uint64, logIndex uint32, amount i
 		}
 		_, err := tx.PutDeposit(store.Deposit{
 			Wallet: w.ID, Block: block, LogIndex: logIndex, TxHash: hash(byte(logIndex + 1)),
-			From: addr(0xF0), Amount: wei(amount), Status: store.DepositReceived, CreatedAt: now,
+			From: addr(0xF0), Amount: wei(amount), CreatedAt: now,
 		})
 		return err
 	})
 }
 
-func (f *fixture) newWithdrawal(amount int64, createdAt time.Time) store.Withdrawal {
+func (f *fixture) newWithdrawal(amount int64, createdAt time.Time) store.Pending {
 	f.t.Helper()
-	wd := store.Withdrawal{
+	p := store.Pending{
 		ID: uuid.New(), Wallet: f.hot.ID, Reason: store.ReasonPayout,
 		Destination: addr(0x99), Amount: wei(amount),
-		Status: store.WithdrawalPending, CreatedAt: createdAt, UpdatedAt: createdAt,
+		CreatedAt: createdAt, UpdatedAt: createdAt,
 	}
-	f.update(func(tx *store.Tx) error { return tx.PutWithdrawal(wd) })
-	return wd
+	f.update(func(tx *store.Tx) error { return tx.PutPending(p) })
+	return p
 }
 
 // start begins a flow and claims its wallet, then drives it to the state given.
@@ -195,14 +214,6 @@ func TestDrainRecordsADebitAndLinksItsCredits(t *testing.T) {
 	f.advance(fl, true)
 
 	if err := f.st.View(func(tx *store.Tx) error {
-		open, err := tx.OpenDeposits(f.proxy.ID, 0)
-		if err != nil {
-			return err
-		}
-		if len(open) != 0 {
-			t.Fatalf("%d deposits still open after the drain", len(open))
-		}
-
 		// The drain produced a debit, born terminal and on the settled feed.
 		settled, _, err := tx.SettledSince(store.Settled{}, 0)
 		if err != nil {
@@ -212,22 +223,22 @@ func TestDrainRecordsADebitAndLinksItsCredits(t *testing.T) {
 			t.Fatalf("settled debits = %d, want the drain", len(settled))
 		}
 		debit := settled[0]
-		if debit.Reason != store.ReasonDrain || debit.Status != store.WithdrawalConfirmed {
-			t.Fatalf("debit = %+v, want a confirmed drain", debit)
+		if debit.Reason != store.ReasonDrain {
+			t.Fatalf("debit = %+v, want a drain", debit)
 		}
 		if debit.TxHash != drain || debit.Amount.Cmp(wei(800)) != 0 || debit.Block != 42 {
 			t.Fatalf("debit = %+v, want the sweep's hash, amount and block", debit)
 		}
 
-		// And every credit it carried points back at it.
+		// The credits are untouched. A drain moves a balance, not a set of
+		// deposits, so nothing is stamped on them (§50) — the debit's amount is
+		// the whole of what the movement says.
 		all, err := tx.WalletDeposits(f.proxy.ID, 0)
 		if err != nil {
 			return err
 		}
-		for _, d := range all {
-			if d.Status != store.DepositForwarded || d.SweptBy != debit.ID {
-				t.Fatalf("deposit not linked to the debit: %+v", d)
-			}
+		if len(all) == 0 {
+			t.Fatal("the credits that funded the drain are gone")
 		}
 		return nil
 	}); err != nil {
@@ -256,14 +267,15 @@ func TestFailedDrainBacksTheWalletOff(t *testing.T) {
 	if !got.Idle() {
 		t.Fatal("the wallet was not released")
 	}
-	// And the deposits stay open, so the next evaluation picks them up again.
+	// And no debit was recorded: nothing left the wallet, so there is nothing
+	// to observe. The balance is still there for the next evaluation to drain.
 	if err := f.st.View(func(tx *store.Tx) error {
-		open, err := tx.OpenDeposits(f.proxy.ID, 0)
+		settled, _, err := tx.SettledSince(store.Settled{}, 0)
 		if err != nil {
 			return err
 		}
-		if len(open) != 1 {
-			t.Fatalf("open deposits = %d, want 1", len(open))
+		if len(settled) != 0 {
+			t.Fatalf("settled debits = %d after a failed drain, want none", len(settled))
 		}
 		return nil
 	}); err != nil {
@@ -284,9 +296,10 @@ func TestConfirmedWithdrawalIsTerminalAndStopsBeingCommitted(t *testing.T) {
 	}, store.StateMoving)
 	f.advance(fl, true)
 
-	got := f.withdrawal(wd.ID)
-	if got.Status != store.WithdrawalConfirmed {
-		t.Fatalf("status = %s, want confirmed", got.Status)
+	// The promise became a fact: it left state/ and arrived in log/ (§51).
+	got, ok := f.settled(wd.ID)
+	if !ok {
+		t.Fatal("the payout did not settle into the log")
 	}
 	if got.TxHash != fl.Tx {
 		t.Fatalf("tx hash = %s, want %s", got.TxHash.Hex(), fl.Tx.Hex())
@@ -320,10 +333,12 @@ func TestRevertedPayoutStaysPendingAndKeepsItsCommitment(t *testing.T) {
 	fl.Error = "execution reverted"
 	f.advance(fl, false)
 
-	got := f.withdrawal(wd.ID)
-	if got.Status != store.WithdrawalPending {
-		t.Fatalf("status = %s, want it to stay pending", got.Status)
+	// It stays a promise: a reverted payout is not the caller's problem to
+	// compensate for, so the record stays where the rules will retry it (§28).
+	if _, settled := f.settled(wd.ID); settled {
+		t.Fatal("a reverted payout was recorded as a fact")
 	}
+	got := f.pending(wd.ID)
 	if got.Attempts != 1 || got.Error == "" {
 		t.Fatalf("diagnostics not recorded: attempts=%d err=%q", got.Attempts, got.Error)
 	}
@@ -357,8 +372,8 @@ func TestWithdrawalThatNeverPaidStaysPending(t *testing.T) {
 	}, store.StateApproving)
 	f.advance(fl, false)
 
-	if got := f.withdrawal(wd.ID); got.Status != store.WithdrawalPending {
-		t.Fatalf("status = %s, want pending", got.Status)
+	if _, settled := f.settled(wd.ID); settled {
+		t.Fatal("a payout that never reached the transfer was recorded as a fact")
 	}
 	if w := f.wallet(f.hot.ID); w.FailedAttempts != 1 {
 		t.Fatalf("wallet attempts = %d, want 1", w.FailedAttempts)
@@ -433,10 +448,10 @@ func TestEvaluateNeverPaysFromAProxyWallet(t *testing.T) {
 	f := newFixture(t)
 	f.credit(f.proxy, 10, 0, 50) // below the drain threshold, so no drain either
 	f.update(func(tx *store.Tx) error {
-		return tx.PutWithdrawal(store.Withdrawal{
+		return tx.PutPending(store.Pending{
 			ID: uuid.New(), Wallet: f.proxy.ID, Reason: store.ReasonPayout,
 			Destination: addr(0x99), Amount: wei(10),
-			Status: store.WithdrawalPending, CreatedAt: now,
+			CreatedAt: now,
 		})
 	})
 

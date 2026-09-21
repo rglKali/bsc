@@ -51,7 +51,7 @@ func TestHealthIsDegradedWhileTooFarBehind(t *testing.T) {
 // A master below the gas floor used to be self-healing: the automatic top-up
 // sold collected fees back into gas, so reporting it would have cried wolf.
 // Nothing refills it automatically any more, so being low *is* the finding —
-// it is the signal to go and run `bsc swap` (§38).
+// it is the signal to go and send the master more native currency (§53).
 func TestLowMasterIsDegraded(t *testing.T) {
 	f := newFixture(t)
 	f.srv.opts.Health = Health{

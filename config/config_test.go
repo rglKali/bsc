@@ -2,7 +2,6 @@ package config
 
 import (
 	"bsc/chain"
-	"bsc/swap"
 	"bsc/usdt"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -62,9 +61,6 @@ func TestDefaults(t *testing.T) {
 		t.Fatalf("Load resolved chain-dependent settings: chain %d token %s",
 			cfg.ChainID, cfg.Token.Hex())
 	}
-	if cfg.SwapRouter != "" {
-		t.Fatalf("router = %q, want empty so it resolves from the chain", cfg.SwapRouter)
-	}
 }
 
 func TestMasterSecretIsRequired(t *testing.T) {
@@ -98,8 +94,6 @@ func TestValidation(t *testing.T) {
 		"bad token":           {"BSC_CHAIN_TOKEN_ADDRESS", "not-an-address"},
 		"bad drain threshold": {"BSC_MONEY_DRAIN_THRESHOLD_WEI", "abc"},
 		"bad gas floor":       {"BSC_GAS_FLOOR_WEI", "abc"},
-		"bad router":          {"BSC_SWAP_ROUTER", "nope"},
-		"absurd slippage":     {"BSC_SWAP_SLIPPAGE_BPS", "10000"},
 		"zero batch":          {"BSC_CHAIN_BACKFILL_BATCH", "0"},
 		"low rate limit":      {"BSC_CHAIN_RPC_RATE_LIMIT", "1"},
 		"low funding mul":     {"BSC_GAS_FUNDING_MULTIPLIER", "0.9"},
@@ -156,41 +150,6 @@ func TestMasterSecretAcceptsAPrefixedForm(t *testing.T) {
 	}
 }
 
-func TestSwappingDefaultsToTheChainsRouter(t *testing.T) {
-	// On by default: a gateway that runs out of gas stops completely, so the
-	// safe default is the one that keeps it running.
-	withEnv(t)
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.SwapSlippage != 100 {
-		t.Fatalf("slippage = %d bps, want 100", cfg.SwapSlippage)
-	}
-	if false {
-		t.Fatal("swapping is off by default")
-	}
-
-	// Nothing chain-shaped is decided until the endpoint says which chain it is.
-	if cfg.SwapRouter != "" {
-		t.Fatalf("router = %q before resolution; it cannot be known yet", cfg.SwapRouter)
-	}
-	if err := cfg.ResolveChain(chain.MainnetChainID); err != nil {
-		t.Fatalf("ResolveChain: %v", err)
-	}
-	if cfg.SwapRouter != swap.PancakeV2Mainnet.Hex() {
-		t.Fatalf("router = %q, want the mainnet default", cfg.SwapRouter)
-	}
-
-	cfg, _ = Load()
-	if err := cfg.ResolveChain(chain.TestnetChainID); err != nil {
-		t.Fatalf("ResolveChain: %v", err)
-	}
-	if cfg.SwapRouter != swap.PancakeV2Testnet.Hex() {
-		t.Fatalf("testnet router = %q", cfg.SwapRouter)
-	}
-}
-
 func TestEnvironmentAlwaysBeatsTheChainDefaults(t *testing.T) {
 	// These are defaults, not policy.
 	withEnv(t,
@@ -214,44 +173,6 @@ func TestEnvironmentAlwaysBeatsTheChainDefaults(t *testing.T) {
 	}
 }
 
-func TestSwapSettingsAreValidated(t *testing.T) {
-	// These only drive the `bsc swap` command now, but a bad value still has to
-	// be refused before anything dials: an operator discovering it mid-trade is
-	// exactly the moment it costs something.
-	router := "0x10ED43C718714eb63d5aA57B78B54704E256024E"
-
-	tests := map[string][]string{
-		"bad wrapped native": {"BSC_SWAP_ROUTER", router, "BSC_SWAP_WRAPPED_NATIVE", "nonsense"},
-		"bad router":         {"BSC_SWAP_ROUTER", "nonsense"},
-		"absurd slippage":    {"BSC_SWAP_ROUTER", router, "BSC_SWAP_SLIPPAGE_BPS", "10000"},
-		"no deadline":        {"BSC_SWAP_ROUTER", router, "BSC_SWAP_DEADLINE", "0s"},
-	}
-	for name, env := range tests {
-		// A subtest per case: t.Setenv restores at the end of the *test*, so a
-		// shared loop would leak one case's values into the next.
-		t.Run(name, func(t *testing.T) {
-			withEnv(t, env...)
-			if _, err := Load(); err == nil {
-				t.Fatalf("%s: accepted", name)
-			}
-		})
-	}
-
-	var cfg Config
-	t.Run("complete", func(t *testing.T) {
-		// The wrapped token is deliberately absent: the router reports its own.
-		withEnv(t, "BSC_SWAP_ROUTER", router)
-		var err error
-		cfg, err = Load()
-		if err != nil {
-			t.Fatalf("complete configuration rejected: %v", err)
-		}
-	})
-	if cfg.SwapSlippage != 100 {
-		t.Fatalf("slippage = %d bps, want a 1%% default", cfg.SwapSlippage)
-	}
-}
-
 // TestNothingChainShapedIsKnownBeforeResolution: Load does no I/O, so it cannot
 // know which chain the endpoint speaks for. Leaving those fields empty is what
 // makes the mismatch impossible — there is no configured value to disagree.
@@ -261,9 +182,8 @@ func TestNothingChainShapedIsKnownBeforeResolution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.ChainID != 0 || cfg.Token != (common.Address{}) || cfg.SwapRouter != "" {
-		t.Fatalf("Load guessed at the chain: id %d token %s router %q",
-			cfg.ChainID, cfg.Token.Hex(), cfg.SwapRouter)
+	if cfg.ChainID != 0 || cfg.Token != (common.Address{}) {
+		t.Fatalf("Load guessed at the chain: id %d token %s", cfg.ChainID, cfg.Token.Hex())
 	}
 }
 
@@ -271,10 +191,9 @@ func TestResolveChainFollowsTheEndpoint(t *testing.T) {
 	for _, tc := range []struct {
 		chainID uint64
 		token   common.Address
-		router  string
 	}{
-		{chain.MainnetChainID, usdt.MainnetAddress, swap.PancakeV2Mainnet.Hex()},
-		{chain.TestnetChainID, usdt.TestnetAddress, swap.PancakeV2Testnet.Hex()},
+		{chain.MainnetChainID, usdt.MainnetAddress},
+		{chain.TestnetChainID, usdt.TestnetAddress},
 	} {
 		withEnv(t)
 		cfg, err := Load()
@@ -284,9 +203,8 @@ func TestResolveChainFollowsTheEndpoint(t *testing.T) {
 		if err := cfg.ResolveChain(tc.chainID); err != nil {
 			t.Fatalf("chain %d: ResolveChain: %v", tc.chainID, err)
 		}
-		if cfg.ChainID != tc.chainID || cfg.Token != tc.token || cfg.SwapRouter != tc.router {
-			t.Fatalf("chain %d resolved to token %s router %q",
-				tc.chainID, cfg.Token.Hex(), cfg.SwapRouter)
+		if cfg.ChainID != tc.chainID || cfg.Token != tc.token {
+			t.Fatalf("chain %d resolved to token %s", tc.chainID, cfg.Token.Hex())
 		}
 	}
 }
@@ -314,12 +232,6 @@ func TestUnknownChainMustNameItsToken(t *testing.T) {
 		t.Fatalf("an unknown chain with a named token was rejected: %v", err)
 	}
 
-	// The router is not: only `bsc swap` uses it, and refusing to start the
-	// service over a command it never runs would be the tail wagging the dog.
-	// Leaving it empty is what lets `bsc swap` be the one to say it is missing.
-	if cfg.SwapRouter != "" {
-		t.Fatalf("router = %q on an unknown chain, want it left empty", cfg.SwapRouter)
-	}
 }
 
 func TestResolveChainRefusesAChainIdOfZero(t *testing.T) {
@@ -350,6 +262,7 @@ money:
   house_sweep_min_cents: 500
 swap:
   enabled: false
+  slippage_bps: 100
 snapshot:
   dir: /srv/backups
   keep: 48
@@ -485,10 +398,8 @@ func TestShippedConfigMatchesTheDefaults(t *testing.T) {
 		shipped.MasterPoll != defaults.MasterPoll {
 		t.Errorf("gas group drifted: %+v", shipped)
 	}
-	if shipped.GasFloor.Cmp(defaults.GasFloor) != 0 ||
-		shipped.SwapSlippage != defaults.SwapSlippage ||
-		shipped.SwapDeadline != defaults.SwapDeadline {
-		t.Errorf("swap group drifted: %+v", shipped)
+	if shipped.GasFloor.Cmp(defaults.GasFloor) != 0 {
+		t.Errorf("gas floor drifted: %s", shipped.GasFloor)
 	}
 	if shipped.SnapshotInterval != defaults.SnapshotInterval || shipped.SnapshotKeep != defaults.SnapshotKeep {
 		t.Errorf("snapshot group drifted: %v %d", shipped.SnapshotInterval, shipped.SnapshotKeep)

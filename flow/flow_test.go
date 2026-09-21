@@ -34,7 +34,7 @@ func drive(t *testing.T, f store.Flow, results ...bool) (actions []ActionKind, f
 // payout is a transfer of an exact amount on behalf of a withdrawal.
 func payout(active bool) Params {
 	return Params{
-		Kind: store.FlowTransfer, Wallet: uuid.New(), To: addr(0xD0),
+		Kind: store.FlowTransfer, Wallet: 1, To: addr(0xD0),
 		Amount: big.NewInt(10), Withdrawal: uuid.New(),
 		Active: active, Now: time.Now(),
 	}
@@ -43,14 +43,14 @@ func payout(active bool) Params {
 // drain is a transfer of whatever the wallet holds, resolved at signing.
 func drain(active bool) Params {
 	return Params{
-		Kind: store.FlowTransfer, Wallet: uuid.New(), To: addr(0xD0),
+		Kind: store.FlowTransfer, Wallet: 1, To: addr(0xD0),
 		Active: active, Now: time.Now(),
 	}
 }
 
 func prewarm(active bool) Params {
 	return Params{
-		Kind: store.FlowPrewarm, Wallet: uuid.New(), Active: active, Now: time.Now(),
+		Kind: store.FlowPrewarm, Wallet: 1, Active: active, Now: time.Now(),
 	}
 }
 
@@ -263,13 +263,13 @@ func TestAdvancingATerminalFlowIsAnError(t *testing.T) {
 func TestBeginValidatesPerKind(t *testing.T) {
 	tests := map[string]Params{
 		"no wallet":            {Kind: store.FlowTransfer, To: addr(1)},
-		"unknown kind":         {Kind: store.FlowKind(99), Wallet: uuid.New()},
-		"drain without dest":   {Kind: store.FlowTransfer, Wallet: uuid.New()},
-		"withdrawal no dest":   {Kind: store.FlowTransfer, Wallet: uuid.New(), Amount: big.NewInt(1), Withdrawal: uuid.New()},
-		"withdrawal no amount": {Kind: store.FlowTransfer, Wallet: uuid.New(), To: addr(1), Withdrawal: uuid.New()},
-		"withdrawal zero":      {Kind: store.FlowTransfer, Wallet: uuid.New(), To: addr(1), Amount: big.NewInt(0), Withdrawal: uuid.New()},
-		"withdrawal no id":     {Kind: store.FlowTransfer, Wallet: uuid.New(), To: addr(1), Amount: big.NewInt(1)},
-		"prewarm with amount":  {Kind: store.FlowPrewarm, Wallet: uuid.New(), Amount: big.NewInt(1)},
+		"unknown kind":         {Kind: store.FlowKind(99), Wallet: 1},
+		"drain without dest":   {Kind: store.FlowTransfer, Wallet: 1},
+		"withdrawal no dest":   {Kind: store.FlowTransfer, Wallet: 1, Amount: big.NewInt(1), Withdrawal: uuid.New()},
+		"withdrawal no amount": {Kind: store.FlowTransfer, Wallet: 1, To: addr(1), Withdrawal: uuid.New()},
+		"withdrawal zero":      {Kind: store.FlowTransfer, Wallet: 1, To: addr(1), Amount: big.NewInt(0), Withdrawal: uuid.New()},
+		"withdrawal no id":     {Kind: store.FlowTransfer, Wallet: 1, To: addr(1), Amount: big.NewInt(1)},
+		"prewarm with amount":  {Kind: store.FlowPrewarm, Wallet: 1, Amount: big.NewInt(1)},
 	}
 	for name, p := range tests {
 		if _, err := Begin(p); err == nil {
@@ -282,7 +282,7 @@ func TestBeginStampsAndCarriesContext(t *testing.T) {
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	wd := uuid.New()
 	f, err := Begin(Params{
-		Kind: store.FlowTransfer, Wallet: uuid.New(), To: addr(0xEE),
+		Kind: store.FlowTransfer, Wallet: 1, To: addr(0xEE),
 		Amount: big.NewInt(77), Withdrawal: wd, Active: true, Now: now,
 	})
 	if err != nil {

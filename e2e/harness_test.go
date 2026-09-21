@@ -31,7 +31,6 @@ import (
 	"bsc/keys"
 	"bsc/sender"
 	"bsc/store"
-	"bsc/swap"
 	"bsc/usdt"
 	"bsc/watcher"
 
@@ -50,10 +49,7 @@ const (
 	envDeposit = "E2E_DEPOSIT" // default 2 whole tokens
 	envTimeout = "E2E_TIMEOUT" // default 15m for the whole lifecycle
 
-	envDestination = "E2E_DESTINATION"   // payout target; defaults to the funder
-	envCollector   = "E2E_FEE_COLLECTOR" // fee target; defaults to the master
-	envRouter      = "E2E_SWAP_ROUTER"   // defaults to PancakeSwap V2 for the chain
-	envSwapAmount  = "E2E_SWAP_AMOUNT"   // tokens per gas top-up; default 1 whole token
+	envDestination = "E2E_DESTINATION" // payout target; defaults to the funder
 )
 
 // harness is the real service wired against a real chain: real store, real RPC,
@@ -67,7 +63,11 @@ type harness struct {
 	ring  *keys.Ring
 	snd   *sender.Sender
 	wat   *watcher.Watcher
-	mux   *http.ServeMux
+	// live is set once wat.Start has resolved the cursor. Before that the
+	// watcher exists but its cursor is 0, and stepping it would start a backfill
+	// from block 0 — a hundred million blocks of history nobody asked for.
+	live bool
+	mux  *http.ServeMux
 
 	decimals     uint8
 	rpcURL       string
@@ -75,15 +75,12 @@ type harness struct {
 	masterKey    keys.Key
 	funder       keys.Key
 	token        common.Address
-	collector    common.Address
 	destination  common.Address
 	chainID      uint64
 	deposit      *big.Int
 	funderGas    *big.Int
 	tokensNeeded *big.Int
 	startTokens  *big.Int
-	router       common.Address
-	swapAmount   *big.Int
 	deadline     time.Time
 }
 
@@ -91,7 +88,6 @@ type harness struct {
 // does not demand a deposit's worth of tokens in the master.
 type needs struct {
 	deposit bool
-	swap    bool
 }
 
 func setup(t *testing.T, n needs) *harness {
@@ -107,7 +103,7 @@ func setup(t *testing.T, n needs) *harness {
 	masterSecret := need(envMaster)
 
 	// The endpoint is the only chain input, exactly as the service treats it.
-	// Everything else — which chain this is, the token, the router, and the
+	// Everything else — which chain this is, the token, and the
 	// mainnet guard below — follows what the endpoint reports once dialled.
 	rpcURL := os.Getenv(envRPC)
 	if rpcURL == "" {
@@ -201,33 +197,6 @@ func setup(t *testing.T, n needs) *harness {
 	if v := os.Getenv(envDestination); v != "" && common.IsHexAddress(v) {
 		destination = common.HexToAddress(v)
 	}
-	// The fee collector defaults to the master, matching production: swept fees
-	// are meant to accumulate there. Keeping the test faithful to that is worth
-	// more than making runs marginally cheaper — and the tokens are not lost,
-	// they simply move to the other wallet you hold.
-	collector := master.Address
-	if v := os.Getenv(envCollector); v != "" && common.IsHexAddress(v) {
-		collector = common.HexToAddress(v)
-	}
-
-	// The router defaults to the verified PancakeSwap V2 deployment for the
-	// chain, the same resolution the service performs.
-	router := swap.PancakeV2Testnet
-	if chainID == chain.MainnetChainID {
-		router = swap.PancakeV2Mainnet
-	}
-	if v := os.Getenv(envRouter); v != "" && common.IsHexAddress(v) {
-		router = common.HexToAddress(v)
-	}
-	swapAmount := whole(1)
-	if v := os.Getenv(envSwapAmount); v != "" {
-		n, ok := new(big.Int).SetString(v, 10)
-		if !ok || n.Sign() <= 0 {
-			t.Fatalf("%s must be a positive integer in wei", envSwapAmount)
-		}
-		swapAmount = n
-	}
-
 	// The token's decimals are read from the contract, exactly as the service
 	// does at startup. Nothing scales by them any more (§36) — they are the
 	// database's identity and what lets a log line render an amount.
@@ -236,7 +205,10 @@ func setup(t *testing.T, n needs) *harness {
 		t.Fatalf("token decimals: %v", err)
 	}
 	if err := st.Update(func(tx *store.Tx) error {
-		return tx.SetMeta(store.Meta{ChainID: chainID, Token: token, Decimals: decimals})
+		return tx.SetMeta(store.Meta{
+			ChainID: chainID, Token: token, Decimals: decimals,
+			Master: master.Address,
+		})
 	}); err != nil {
 		t.Fatalf("meta: %v", err)
 	}
@@ -264,8 +236,7 @@ func setup(t *testing.T, n needs) *harness {
 	h := &harness{
 		t: t, ctx: ctx, store: st, chain: rpc, ring: ring, snd: snd, wat: wat, mux: mux,
 		decimals: decimals, rpcURL: rpcURL, master: master.Address, masterKey: master, funder: funder, token: token,
-		collector: collector, destination: destination,
-		router: router, swapAmount: swapAmount,
+		destination: destination,
 		// Enough for the funder's handful of transfers, returned at the end.
 		funderGas: big.NewInt(10_000_000_000_000_000), // 0.01
 		chainID:   chainID, deposit: deposit, deadline: time.Now().Add(timeout),
@@ -274,9 +245,6 @@ func setup(t *testing.T, n needs) *harness {
 	if n.deposit {
 		h.tokensNeeded.Add(h.tokensNeeded, h.deposit)
 	}
-	if n.swap {
-		h.tokensNeeded.Add(h.tokensNeeded, h.swapAmount)
-	}
 	h.preflight()
 	h.stockFunder()
 	t.Cleanup(h.recoverEverything)
@@ -284,6 +252,7 @@ func setup(t *testing.T, n needs) *harness {
 	if err := wat.Start(ctx); err != nil {
 		t.Fatalf("watcher start: %v", err)
 	}
+	h.live = true
 	t.Logf("chain %d · master %s · funder %s · token %s",
 		chainID, master.Address.Hex(), funder.Address.Hex(), token.Hex())
 	return h
@@ -293,6 +262,14 @@ func setup(t *testing.T, n needs) *harness {
 // twelve minutes later on a wallet that was never funded.
 func (h *harness) preflight() {
 	h.t.Helper()
+
+	// Sweep first, count second. A previous run that was killed mid-flight
+	// leaves tokens in wallets this secret derives again — the addresses are
+	// deterministic now (§48) — and those leftovers would otherwise be swept
+	// along with this run's deposit, making every amount assertion wrong and
+	// tripping a real balance underflow in the watcher. Recovering them also
+	// puts them back where the preflight expects to find them.
+	h.recoverDerived()
 
 	// Everything starts in the master: it stocks the generated funder and
 	// collects it back at the end, so it is the only balance to check.
@@ -343,24 +320,43 @@ func (h *harness) pump(what string, cond func() bool) {
 			h.dump()
 			h.t.Fatalf("timed out waiting for %s after %s", what, time.Since(started).Round(time.Second))
 		}
-		for {
-			worked, err := h.snd.Step(h.ctx)
-			if err != nil {
-				h.t.Fatalf("sender: %v", err)
-			}
-			if !worked {
-				break
-			}
-		}
-		if _, err := h.wat.Step(h.ctx); err != nil {
-			h.t.Fatalf("watcher: %v", err)
-		}
+		h.drive()
 		if time.Since(lastLog) > 20*time.Second {
 			lastLog = time.Now()
 			h.t.Logf("… waiting for %s (%s elapsed, %d blocks behind)",
 				what, time.Since(started).Round(time.Second), h.wat.Behind())
 		}
 		time.Sleep(time.Second)
+	}
+}
+
+// drive steps the sender until it runs out of work, then the watcher once. It
+// is what turns a wait into progress, and it no-ops before the service exists
+// so the funding waits at startup can use it too.
+//
+// Everything that waits calls this. An earlier version had `pump` drive and
+// `awaitBalance` merely poll, which coupled them: a pump whose condition was
+// already true did no work, and the awaitBalance after it then waited on a
+// balance nothing was moving — for the full 30-minute timeout.
+func (h *harness) drive() {
+	h.t.Helper()
+	// Not "is the watcher constructed" but "has it resolved its cursor": the
+	// funder is stocked before Start, and stepping an unstarted watcher would
+	// walk the chain from block 0.
+	if !h.live {
+		return
+	}
+	for {
+		worked, err := h.snd.Step(h.ctx)
+		if err != nil {
+			h.t.Fatalf("sender: %v", err)
+		}
+		if !worked {
+			break
+		}
+	}
+	if _, err := h.wat.Step(h.ctx); err != nil {
+		h.t.Fatalf("watcher: %v", err)
 	}
 }
 
@@ -476,8 +472,10 @@ func (h *harness) awaitBalance(what string, read func() *big.Int, want *big.Int)
 	started := time.Now()
 	for read().Cmp(want) < 0 {
 		if time.Now().After(h.deadline) || h.ctx.Err() != nil {
+			h.dump()
 			h.t.Fatalf("timed out waiting for %s to reach %s (have %s)", what, want, read())
 		}
+		h.drive()
 		time.Sleep(2 * time.Second)
 	}
 	h.t.Logf("✓ %s (%s)", what, time.Since(started).Round(time.Second))
@@ -495,6 +493,7 @@ func (h *harness) waitFor(what string, cond func() bool) bool {
 				what, time.Since(started).Round(time.Second))
 			return false
 		}
+		h.drive()
 		time.Sleep(2 * time.Second)
 	}
 	h.t.Logf("✓ %s (%s)", what, time.Since(started).Round(time.Second))
@@ -549,70 +548,111 @@ func (h *harness) recoverEverything() {
 		})
 	}
 	h.returnNative()
-	// Tokens a swap test traded away are not bought back. Trading is an
-	// operator action now (§38), and a teardown that quietly traded in the
-	// other direction would be the automation this design removed — at a price
-	// nobody looked at. The test logs what it sold; top the master up by hand.
 }
 
-// recoverDerived pulls tokens back out of the wallets the service derived
-// during the run.
+// derivedScan is how many wallet indices the recovery walks.
 //
-// A failed run strands funds in them — a deposit forwarded into a treasury but
-// never paid out, say — and without this the next run's preflight
-// fails for want of tokens that are sitting right there. It works because of the
-// design's own property: the master holds an unlimited allowance on every
-// derived wallet, so it can pull the balance back *and* pay the gas, with no
-// need to fund those wallets first.
+// Since §48 a wallet's address is HMAC(master, be64(index)) with indices from
+// 1, so EVERY RUN DERIVES THE SAME ADDRESSES. That is the point of the change —
+// the money is recoverable from the secret alone — but it means one run's
+// leftovers are the next run's starting balance, and a fresh database has no
+// record of them. So the recovery derives the sequence rather than reading the
+// store, which is also the gap scan §48 describes, at a scale where it is free.
+//
+// A run uses three wallets; 32 is slack for a suite that grows.
+const derivedScan = 32
+
+// recoverDerived pulls tokens back out of the wallets this secret derives.
+//
+// It runs BEFORE the suite as well as after. A run that is killed mid-flight —
+// or one whose teardown could not finish — strands funds in a derived wallet,
+// and the next run would then sweep a deposit *plus* those leftovers: the drain
+// moves more than was deposited, the watcher debits more custody than it
+// recorded (a genuine balance underflow, correctly reported), and every amount
+// assertion downstream is wrong by the leftover. That is exactly what happened
+// the first time this suite ran end to end.
+//
+// It works because of the design's own property: the master holds an unlimited
+// allowance on every wallet it has activated, so it can pull the balance back
+// *and* pay the gas, with no need to fund those wallets first. A wallet that
+// was never activated has no allowance — and, never having been drained, is
+// where its tokens are stuck until somebody funds it by hand.
 func (h *harness) recoverDerived() {
 	h.t.Helper()
 
-	var wallets []store.Wallet
-	if err := h.store.View(func(tx *store.Tx) error {
-		return tx.EachWallet(func(w store.Wallet) error {
-			if w.Kind != store.KindMaster {
-				wallets = append(wallets, w)
-			}
-			return nil
-		})
-	}); err != nil {
-		h.t.Logf("recovery: listing wallets: %v", err)
-		return
-	}
-
 	abi := usdt.NewUsdt()
 	before, pulled := h.tokenBalance(h.master), new(big.Int)
-	for _, w := range wallets {
-		held := h.tokenBalance(w.Address)
+	for i := uint64(1); i <= derivedScan; i++ {
+		key, err := h.ring.Derive(i)
+		if err != nil {
+			h.t.Logf("recovery: derive %d: %v", i, err)
+			continue
+		}
+		held := h.tokenBalance(key.Address)
 		if held.Sign() == 0 {
 			continue
 		}
 		// Without an allowance the transferFrom would simply revert and waste
 		// the gas, so check before spending it.
-		out, err := h.chain.Call(h.ctx, h.token, abi.PackAllowance(w.Address, h.master))
+		out, err := h.chain.Call(h.ctx, h.token, abi.PackAllowance(key.Address, h.master))
 		if err != nil {
-			h.t.Logf("recovery: allowance for %s: %v", w.Address.Hex(), err)
+			h.t.Logf("recovery: allowance for %s: %v", key.Address.Hex(), err)
 			continue
 		}
 		allowed, err := abi.UnpackAllowance(out)
-		if err != nil || allowed.Cmp(held) < 0 {
-			h.t.Logf("recovery: %s holds %s but the master may only move %v — leaving it",
-				w.Address.Hex(), fmtToken(held), allowed)
+		h.t.Logf("recovering %s tokens stranded in wallet %d (%s)", fmtToken(held), i, key.Address.Hex())
+		if err == nil && allowed.Cmp(held) >= 0 {
+			h.signAndSend(h.masterKey, h.token, new(big.Int),
+				abi.PackTransferFrom(key.Address, h.master, held))
+			pulled.Add(pulled, held)
 			continue
 		}
-		h.t.Logf("recovering %s tokens stranded in %s (%s)", fmtToken(held), w.Address.Hex(), w.Kind)
-		h.signAndSend(h.masterKey, h.token, new(big.Int),
-			abi.PackTransferFrom(w.Address, h.master, held))
+		// No allowance: the wallet holds tokens but was never activated, which
+		// is what a run killed between the deposit and the drain leaves behind.
+		// The master cannot pull from it — but the harness holds its key, so it
+		// can push. Gas first, since an unactivated wallet has none.
+		h.t.Logf("recovery: wallet %d was never activated (allowance %v); pushing instead", i, allowed)
+		if !h.fundGasFor(key.Address) {
+			continue
+		}
+		h.transferTokens(key, h.master, held)
 		pulled.Add(pulled, held)
 	}
 	if pulled.Sign() > 0 {
 		// The recovered tokens have to land before anything downstream reads the
-		// master's balance, or the buy-back would purchase them a second time.
+		// master's balance, or the preflight would count them twice.
 		want := new(big.Int).Add(before, pulled)
 		h.waitFor("stranded tokens recovered", func() bool {
 			return h.tokenBalance(h.master).Cmp(want) >= 0
 		})
 	}
+}
+
+// fundGasFor gives a derived wallet just enough native currency to send one
+// token transfer, for the recovery path where the master cannot pull.
+func (h *harness) fundGasFor(addr common.Address) bool {
+	h.t.Helper()
+	price, err := h.chain.GasPrice(h.ctx)
+	if err != nil {
+		h.t.Logf("recovery: gas price: %v", err)
+		return false
+	}
+	// An ERC-20 transfer is well under 100k gas; double it and the price, since
+	// stranding the recovery itself for want of a few gwei helps nobody.
+	need := new(big.Int).Mul(price, big.NewInt(200_000))
+	held, err := h.chain.BalanceBNB(h.ctx, addr)
+	if err != nil {
+		h.t.Logf("recovery: balance of %s: %v", addr.Hex(), err)
+		return false
+	}
+	if held.Cmp(need) >= 0 {
+		return true
+	}
+	h.signAndSend(h.masterKey, addr, new(big.Int).Sub(need, held), nil)
+	return h.waitFor("gas for "+addr.Hex(), func() bool {
+		got, err := h.chain.BalanceBNB(h.ctx, addr)
+		return err == nil && got.Cmp(need) >= 0
+	})
 }
 
 // returnNative sends back everything the funder holds bar the cost of the

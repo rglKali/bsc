@@ -31,7 +31,7 @@ var ErrTerminal = errors.New("flow: already terminal")
 // Params describes the flow to begin.
 type Params struct {
 	Kind       store.FlowKind
-	Wallet     uuid.UUID
+	Wallet     store.WalletID
 	To         common.Address // the drain destination, or the payout recipient
 	Amount     *big.Int       // exact amount; must be unset for a drain, which sweeps everything
 	Withdrawal uuid.UUID      // the withdrawal this transfer pays, when it pays one
@@ -44,7 +44,7 @@ type Params struct {
 // approving are simply the prefix of whichever flow needed an inactive wallet —
 // so an active wallet starts directly at the state that does the real work.
 func Begin(p Params) (store.Flow, error) {
-	if p.Wallet == uuid.Nil {
+	if p.Wallet == 0 {
 		return store.Flow{}, errors.New("flow: wallet must be set")
 	}
 	if err := validate(p); err != nil {
@@ -178,7 +178,7 @@ func (k ActionKind) String() string {
 // balance at signing time.
 type Action struct {
 	Kind   ActionKind
-	Wallet uuid.UUID      // the managed wallet the value moves from
+	Wallet store.WalletID // the managed wallet the value moves from
 	To     common.Address // destination, for Move
 	Amount *big.Int       // exact amount, or nil to move everything
 }

@@ -2,7 +2,6 @@ package store
 
 import (
 	"bytes"
-	"github.com/google/uuid"
 	"sort"
 	"strings"
 	"testing"
@@ -126,17 +125,17 @@ func TestValidRef(t *testing.T) {
 // Every composite key is built from fixed-width parts now, so concatenation is
 // unambiguous without the separator the slug scoping needed (§32).
 func TestWalletScopedKeysAreFixedWidth(t *testing.T) {
-	a, b := uuid.New(), uuid.New()
-	ka := join(a[:], Cursor{Block: 1, LogIndex: 2}.Key())
-	kb := join(b[:], Cursor{Block: 1, LogIndex: 2}.Key())
+	a, b := nextID(), nextID()
+	ka := join(a.Key(), Cursor{Block: 1, LogIndex: 2}.Key())
+	kb := join(b.Key(), Cursor{Block: 1, LogIndex: 2}.Key())
 	if bytes.Equal(ka, kb) {
 		t.Fatal("two wallets produced the same index key")
 	}
 	if !bytes.HasPrefix(ka, walletPrefix(a)) || bytes.HasPrefix(ka, walletPrefix(b)) {
 		t.Fatal("wallet prefixes leak between wallets")
 	}
-	if len(ka) != 16+12 {
-		t.Fatalf("key width = %d, want 28", len(ka))
+	if len(ka) != 8+12 {
+		t.Fatalf("key width = %d, want 20", len(ka))
 	}
 }
 

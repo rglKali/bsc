@@ -186,14 +186,21 @@ func ether(n int64) *big.Int {
 	return new(big.Int).Mul(big.NewInt(n), new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
 }
 
+type withdrawalsPage struct {
+	Withdrawals []struct {
+		Amount string `json:"amount"`
+		Reason string `json:"reason"`
+		TxHash string `json:"tx_hash"`
+		Wallet string `json:"wallet"`
+	} `json:"withdrawals"`
+	Cursor string `json:"cursor"`
+}
+
 type depositsPage struct {
 	Deposits []struct {
-		Amount  string `json:"amount"`
-		Status  string `json:"status"`
-		Wallet  string `json:"wallet"`
-		TxHash  string `json:"tx_hash"`
-		SweptBy string `json:"swept_by"`
-		SweptTx string `json:"swept_tx"`
+		Amount string `json:"amount"`
+		Wallet string `json:"wallet"`
+		TxHash string `json:"tx_hash"`
 	} `json:"deposits"`
 	Cursor string `json:"cursor"`
 }
@@ -231,16 +238,28 @@ func TestFullMoneyLifecycle(t *testing.T) {
 			landed = i
 		}
 	}
-	if d := feed.Deposits[arrival]; d.Status != "forwarded" || d.Amount != ether(50).String() || d.SweptBy == "" {
-		t.Fatalf("arrival = %+v, want it forwarded and linked to its debit", d)
+	if d := feed.Deposits[arrival]; d.Amount != ether(50).String() {
+		t.Fatalf("arrival = %+v, want 50 USDT on cust-1", d)
 	}
-	if d := feed.Deposits[landed]; d.Status != "received" || d.Amount != ether(50).String() {
-		t.Fatalf("landing = %+v, want it received on the hot wallet", d)
+	if d := feed.Deposits[landed]; d.Amount != ether(50).String() {
+		t.Fatalf("landing = %+v, want 50 USDT on the hot wallet", d)
 	}
-	// The two ends of one movement are pairable by the debit's transfer.
-	if feed.Deposits[arrival].SweptTx != feed.Deposits[landed].TxHash {
-		t.Fatalf("swept_tx %s does not match the landing tx %s",
-			feed.Deposits[arrival].SweptTx, feed.Deposits[landed].TxHash)
+
+	// The two ends of one movement are still pairable — by the DEBIT, which is
+	// the record of the movement, rather than by a link stamped on the credits.
+	// The drain's tx_hash is the transfer that landed downstream (§50).
+	var debits withdrawalsPage
+	s.call("GET", "/v1/withdrawals?reason=drain", nil, http.StatusOK, &debits)
+	if len(debits.Withdrawals) != 1 {
+		t.Fatalf("drains = %+v, want the one that forwarded the money", debits.Withdrawals)
+	}
+	drain := debits.Withdrawals[0]
+	if drain.Amount != ether(50).String() {
+		t.Fatalf("drain moved %s, want the full 50", drain.Amount)
+	}
+	if drain.TxHash != feed.Deposits[landed].TxHash {
+		t.Fatalf("the drain's tx %s is not the one that landed downstream (%s)",
+			drain.TxHash, feed.Deposits[landed].TxHash)
 	}
 
 	if got := s.sim.usdtOf(hot); got.Cmp(ether(50)) != 0 {
@@ -349,8 +368,8 @@ func TestSmallDepositsWaitThenForwardTogether(t *testing.T) {
 	}
 	var feed depositsPage
 	s.call("GET", "/v1/wallets/cust-1/deposits", nil, http.StatusOK, &feed)
-	if len(feed.Deposits) != 1 || feed.Deposits[0].Status != "received" {
-		t.Fatalf("deposits = %+v, want one recorded and waiting", feed.Deposits)
+	if len(feed.Deposits) != 1 || feed.Deposits[0].Amount != half.String() {
+		t.Fatalf("deposits = %+v, want the one sub-threshold arrival recorded", feed.Deposits)
 	}
 
 	// A second half tips it over, and both leave together.
@@ -364,10 +383,10 @@ func TestSmallDepositsWaitThenForwardTogether(t *testing.T) {
 	if len(feed.Deposits) != 2 {
 		t.Fatalf("deposits = %d, want both", len(feed.Deposits))
 	}
-	for _, d := range feed.Deposits {
-		if d.Status != "forwarded" {
-			t.Fatalf("deposit %+v was not forwarded", d)
-		}
+	// Both credits are still recorded exactly as they arrived; what moved them
+	// is the drain debit, and that is where the movement is recorded (§50).
+	if got := s.sim.usdtOf(user); got.Sign() != 0 {
+		t.Fatalf("the wallet still holds %s after the drain", got)
 	}
 	s.audit()
 }

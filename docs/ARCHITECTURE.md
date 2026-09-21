@@ -104,7 +104,7 @@ line: 100k sits in a 131,072-slot table, ~115k tips it to the next and roughly
 10 MB, where it stays until ~230k. A million addresses measures 84 MB.
 
 What actually grows without bound is `log/`, which is kept forever: a deposit is
-138 bytes plus about as much index again.
+113 bytes plus about as much index again.
 
 ## Pipelines: sequential execution, persisted waiting
 
@@ -275,7 +275,7 @@ Add an entry rather than silently changing a documented decision.
 17. **Deposit addresses are permanent per ref.** No reuse, no rotation, no expiry.
 18. **Retention.** `state/` self-prunes as flows terminate; deposits and
     withdrawals are kept forever; there is no third log to age out.
-19. *(Withdrawn by §38: trading is an operator command now.)* **Gas top-ups swap collected fees back into native currency**, reversing v1's
+19. *(Withdrawn by §38, then finished by §53: bsc does not trade at all.)* **Gas top-ups swap collected fees back into native currency**, reversing v1's
     decision that gas replenishment stays manual. That decision reasoned the
     operator holds the key and can swap by hand — true, but it weighed an
     attended service. The top-up is a flow like any other, so it inherits the
@@ -284,7 +284,7 @@ Add an entry rather than silently changing a documented decision.
     without lifting the balance above the floor would otherwise trade away every
     fee. It is the only operation whose outcome is a price rather than a yes or
     no, so it is also the only one with a slippage bound and a deadline.
-20. *(Still true, but of `bsc swap` rather than of a flow — see §38.)* **The swap uses the Uniswap-V2 router interface**, not a Universal Router,
+20. *(Moot since §53: the router client is gone. Kept because the reasoning — a simple interface over a better-routed one, in the one code path whose outcome is a price — is why trading was easy to remove.)* **The swap uses the Uniswap-V2 router interface**, not a Universal Router,
     despite newer venues existing on this chain (PancakeSwap V3 SmartRouter and
     Infinity, Uniswap v4). The trade is ~10 USDT at most once an hour, where V2's
     0.25% fee costs a couple of cents more than V3's best tier — well inside the
@@ -697,7 +697,7 @@ problem. Removing it is §32 through §40.
     namespaces its own refs (`acme:cust-1`), which is a line in its code rather
     than a concept in this service.
 
-38. **Trading is an operator command, not a flow.** §19 made the gas top-up
+38. *(Finished by §53: the command went too, so bsc does not trade at all. The reasoning below is why it was easy to remove.)* **Trading is an operator command, not a flow.** §19 made the gas top-up
     automatic, reasoning that an unattended service must be able to refill
     itself. §20 chose the router for it. Both are withdrawn.
 
@@ -837,7 +837,7 @@ problem. Removing it is §32 through §40.
     same manual repair.
 
 
-44. **Fees came back; the automatic swap did not.** §38 removed the gas top-up
+44. *(Superseded by §53: no swap of any kind now. The arithmetic below still governs the alert, and is why a dry master is a "this week" problem rather than a 3am one.)* **Fees came back; the automatic swap did not.** §38 removed the gas top-up
     for two reasons, and §43 voided the first of them — there are fees again,
     and they land on the master. The second reason stands on its own, and is why
     trading is still a command.
@@ -966,6 +966,283 @@ problem. Removing it is §32 through §40.
     `keys` was raised too and stays, for the opposite reason: it has four
     importers and `sender` has one, so folding it in would make `api` and `cli`
     depend on the signing package and dilute the one claim that directory makes.
+
+48. **Wallet ids are a sequence, not random.** A wallet's private key was
+    `HMAC-SHA256(master, uuid)`; it is now `HMAC-SHA256(master, be64(index))`,
+    with the index also serving as the wallet's storage key.
+
+    **This is not weaker.** HMAC's security as a PRF does not depend on the
+    message being unpredictable — the definition gives the adversary
+    chosen-message access — so `HMAC(master, 1)`, `HMAC(master, 2)` … are
+    indistinguishable from independent random strings to anyone without the
+    master. It is what BIP-32 hardened derivation does for the same reason. The
+    122 random bits in the UUID were doing no cryptographic work, and on-chain
+    nothing changes: the addresses are HMAC outputs, so an observer still cannot
+    tell that two of them share a master.
+
+    **What it buys is recovery.** The UUID was half the key material, so losing
+    the database lost every address ever derived *even while holding the master
+    secret* — 122 random bits are not searchable. That sentence is now gone.
+    Master secret plus "there were about N of them" is a complete recovery of
+    the money: derive 1..N+gap, ask the chain what each holds, sweep. The refs,
+    the topology and the history are still lost — the service is gone — but the
+    funds are not. That was the worst failure in the system and it is now
+    merely terrible.
+
+    **The counter is not stored.** Wallet keys are 8-byte big-endian, so bbolt's
+    key order is numeric order and the next id is read as "the last key, plus
+    one" inside the same write transaction. There is no second number beside the
+    table that can drift from it, which removes the monotonicity problem a
+    stored counter would have had. `keys.Allocate` steps past any index whose
+    HMAC is not a valid scalar (~2⁻¹²⁸ each), deterministically, so a recovery
+    walking the sequence skips exactly the same indices. Ids are therefore not
+    contiguous and nothing may treat an id as a position in creation order.
+
+    **Index 0 is the master**, which is the one wallet whose key is the secret
+    used directly rather than a derivation. `keys.Derive` refuses it, `PutWallet`
+    refuses any other wallet taking it and refuses the master taking anything
+    else, and `sender.key` already branched on kind. It also means zero is a
+    real id and can no longer mean "no wallet" — `watcher.Options.MasterWallet`
+    was exactly that sentinel and is gone, replaced by `store.MasterWalletID`
+    with the master's presence gated on its address instead.
+
+    **The cost, stated plainly.** `NextWalletID` reads the table, so restoring
+    an older snapshot rewinds the sequence: wallets created after that snapshot
+    would have their indices reissued to different refs — two handles, one
+    address, money merged silently. UUIDs could not do this; they could only
+    lose things. `PutWallet` refuses the collision while the address record is
+    still there, but a restore takes that away too. The real fix is a
+    gap-limit scan against the chain before issuing, which is what HD wallets
+    do — and it puts an RPC call on the creation path, which §41 spent effort
+    removing. Not built. **Restoring a snapshot into a live service is now a
+    procedure with a hazard, not a routine operation.**
+
+    **And the addresses are now the same in every environment that shares a
+    secret.** Under UUIDs, two databases built from one secret derived different
+    addresses and could never collide; now index 1 is index 1 everywhere. That
+    is the recovery property stated from the other side, and it showed up
+    immediately in the e2e suite: a run killed mid-flight left tokens in wallet
+    2, the next run deposited into the same address, and the drain swept both —
+    more than was deposited, tripping a real balance underflow and making every
+    amount assertion wrong. The suite now sweeps the derived sequence before it
+    starts as well as after (`e2e/harness_test.go`, `recoverDerived`), which is
+    the gap scan this entry describes, at a scale where it is free. Anything
+    else sharing a secret across environments needs the same discipline.
+
+    Deriving from the caller's ref instead would dissolve that hazard entirely —
+    re-creating `acme:cust-1` after a restore derives the same address, turning
+    the collision into the correct answer — at the price of making the ref key
+    material, so that ref normalization becomes a key-rotation concern. Worth
+    reopening if snapshot restores become common.
+
+49. **The master is not a wallet.** It had a row, a `kind` byte marking it, and
+    an entry in the watched-address set. All three are gone; its address lives
+    in `meta` beside the chain id and the token, and nothing else about it is
+    stored.
+
+    It was never really one of ours. Every wallet in this database is derived —
+    `HMAC(master, be64(id))` — and the master is the thing they are derived
+    *from*: the operator's own key, used from scripts, for swaps, and by hand.
+    Modelling it as a row meant a `WalletKind` enum whose only job was to mark
+    that one row as exceptional, and then five places checking the mark.
+
+    What the row did, and what replaced it:
+
+    - **Accumulated the master's token balance** for `bsc_master_usdt_wei`. That
+      is now one `balanceOf` per master poll, in the same function that already
+      makes an RPC call for the native balance. The comment justifying the
+      accumulated figure — "what the gauge shows is exactly what the decision
+      will be made on" — had outlived the decision: §38/§44 removed the thing
+      that acted on it.
+    - **Put the master in the `AddrSet`**, so the watcher matched transfers to
+      it. It no longer does, which is the point: bsc has no business recording
+      what the operator's own wallet receives.
+    - **Suppressed a deposit record** for money arriving there. Unreachable now
+      — an address that is not watched produces nothing to suppress.
+    - **Kept the master out of `ShouldDrain`/`ShouldPay`.** Both already
+      required a `drain_to` or a pending withdrawal, neither of which the master
+      could have, so the kind check was belt-and-braces over a rule that already
+      held.
+
+    `WalletKind` goes with it, and with it the branches in `PutWallet`,
+    `MutateWallet`, `Verify`, `sender.key` and the watcher's credit path. A
+    wallet record is 8 bytes smaller and every wallet in the store is now the
+    same kind of thing — which is the real win, because "every row here is
+    derived and nameable" is an invariant you can state in one line.
+
+    **`sender.key` got stricter in the process.** It used to branch on kind and
+    return the master's key for the master's row; now it always derives, and
+    checks that the derived address matches the one recorded. A wallet whose id
+    does not reproduce its own address is refused rather than signed for with a
+    key that controls nothing.
+
+    **The master's address is now bound like the chain and the token** (§26).
+    `SetMeta` records it on first run and refuses a different one afterwards,
+    with an error that says what is at stake: every address in the file comes
+    from that secret, so opening it under another strands all of them. Before
+    this, rotating `BSC_MASTER_SECRET` under a populated database silently
+    replaced the master row, left the old address resolving to a record claiming
+    a different one, and passed `bsc inspect` clean. The secret is treated as
+    permanent — rotating it means rotating the whole keyset — and this is what
+    makes that assumption enforced rather than assumed.
+
+    Ids now start at 1 and zero is not a wallet: `keys.Derive(0)` returns
+    `ErrZeroIndex` and `PutWallet` refuses it. Zero is mathematically a fine
+    index; reserving it means an unset field fails loudly instead of deriving a
+    key for an address nothing watches.
+
+    The master still appears in the log, as it should: a fee debit names it as a
+    destination, and a drain to a wallet the operator controls names it too.
+    Those are records of where money went, which is exactly what `log/` is for.
+
+50. **A deposit has no lifecycle.** `Status` and `SweptBy` are gone, and with
+    them the `idx/dep_open` bucket, `OpenDeposits`, `ForwardDeposits`, the
+    `?status=` filter and the `swept_by`/`swept_tx` fields on the wire.
+
+    The asymmetry with withdrawals is the whole argument. A **withdrawal is
+    accepted before it happens** — `pending` is a real commitment and the
+    overdraft guard depends on it. A **deposit is only ever recorded after it
+    happened.** It is one immutable sentence: this much landed here, at this
+    block. Giving it a status meant inventing a lifecycle for a fact.
+
+    `Status` was also a stored copy of `SweptBy != nil`: both were assigned in
+    the same two lines of `ForwardDeposits` and nowhere else, and `Verify`
+    carried two branches whose only job was asserting they agreed. An audit
+    check that exists to police a redundancy is the redundancy announcing
+    itself.
+
+    **And the link was wrong in a reachable case.** `PutDeposit` added a credit
+    to the open set on arrival with no check on whether the wallet was busy, and
+    `ForwardDeposits` stamped everything open at settlement. A deposit landing
+    between a sweep being signed — where the amount is resolved from `balanceOf`
+    — and that sweep confirming was therefore stamped by a debit that did not
+    carry it, and left the open set while its money was still on the wallet. The
+    next drain moved it and recorded a debit with no credits linked.
+
+    That is not a bug to fix, because **a drain moves a balance, not a set of
+    deposits.** Attributing individual credits to it is lot tracking over a
+    pool, which is a ledger concept and exactly what §33 removed. Any answer bsc
+    invented there was a guess dressed as a record.
+
+    Nothing is lost that mattered. The pairing a caller needs — the upstream
+    credit and the downstream credit being two ends of one movement — is still
+    there, through the **debit**, which is the record of the movement: the
+    drain's `tx_hash` is the transfer that landed downstream. Sourcing it from
+    the thing that moved the money rather than from a stamp on the money is also
+    simply more honest.
+
+    Deposit records are 130 → 113 bytes, the store is down to 17 buckets, and
+    `viewDeposits` lost an N+1 lookup into the withdrawal table.
+
+51. **A promise and a fact are two keyspaces.** `log/withdrawal` held both
+    pending and settled debits; now `state/withdrawal` holds the promises and
+    `log/withdrawal` holds only what happened. **Settling moves the record.**
+
+    The namespaces meant something and this record contradicted them. `log/` is
+    "a record of what happened, kept forever" — and a pending withdrawal has not
+    happened. It was also the only record that arrived in `log/` before being
+    true, which is precisely the thing §42 spent its argument on when it said a
+    pending payout has no place on the settled feed.
+
+    **The status field is gone, and could not come back.** Which bucket a record
+    is in *is* its status. There is nothing stored to disagree with `Block`, and
+    the §47 audit branch that checked `status` against feed membership has
+    nothing left to check. This is the third status removed on the same
+    argument, after §50's deposits: a field that restates where a record already
+    is, is not information.
+
+    **Two partial indexes stopped existing.** `idx/wd_open` was "the pending
+    ones" and `idx/wd_feed` was "the settled ones" — both hand-maintained
+    partitions of one bucket. The bucket boundary does that now for free, which
+    matters because hand-maintained indexes are where a bug in this store would
+    live. `idx/wd` went too: it served only `Tx.Withdrawals`, which had no
+    callers outside its own test. Five withdrawal indexes became two, and the
+    store is down to **16 buckets** from 18.
+
+    **Neither record carries dead fields any more.** A promise has no `TxHash`
+    and no `Block`, because neither exists yet. A fact has no `Attempts` and no
+    `Error`, because how many tries it took is a story about keeping the promise,
+    not about the movement — and it gained `SettledAt`, which it could not have
+    before without a second timestamp nobody could name.
+
+    The work rules and the overdraft guard got **narrower**: `OpenPending` and
+    `Committed` scan exactly the promises and nothing else, where before they
+    filtered an index over all of history. A drain is simpler too — born
+    terminal, it goes straight to `log/` and never touches the promise
+    keyspace, so `PutWithdrawal` lost the branch that used to handle it.
+
+    **The cost, paid in three places.** `GET /v1/withdrawals/{id}`, idempotency
+    lookup, and a wallet's full history have to try both buckets. That is a real
+    join and it is where a future bug will be, which is why the exclusivity is
+    an audit check: `Verify` flags a record that is somehow in both.
+
+    The wire is unchanged. A caller still holds one id for a withdrawal's whole
+    life and still sees `status: pending` then `confirmed` — computed from which
+    bucket answered, never read from a field.
+
+52. **Stepping an unstarted watcher is refused.** `Start` is what resolves the
+    cursor — from the store, or from the finalized head on a fresh database. Its
+    zero value means *block 0*, so a `Step` before `Start` does not fail: it
+    quietly begins a backfill from genesis, which on mainnet is a hundred
+    million blocks. The only symptom is a service that looks busy, fetches
+    constantly, and never catches up.
+
+    This is not hypothetical — it cost a thirty-minute e2e hang, reported as
+    "132260842 blocks behind", which is the chain's height rather than any real
+    lag. The cause was a test harness stepping the watcher while stocking a
+    funding wallet, before the service was up.
+
+    `Step` now returns `ErrNotStarted`. A zero cursor is the one case where the
+    safe-looking default is the catastrophic one, and the cost of the guard is a
+    bool.
+
+53. **`bsc swap` is gone, and with it the `swap` package.** Trading left this
+    service in three steps, each narrowing who could start one: §19 had the
+    daemon top itself up automatically; §38 and §44 cut that back to an attended
+    operator command; this removes the command.
+
+    §49 is what makes it obviously right. The master is **not a wallet bsc
+    manages** — it is the operator's own key, and bsc stores nothing about it but
+    its address. Trading from your own wallet is something you do with any
+    wallet, exchange or script you already trust. Keeping a router client inside
+    a service that holds everybody else's keys bought a convenience that was
+    never bsc's to offer, and cost a package, four config settings, a build-time
+    ABI, and the only code path whose outcome was a price rather than a yes or
+    no.
+
+    What goes: `swap/`, `bsc swap`, `swap.router`, `swap.wrapped_native`,
+    `swap.slippage_bps`, `swap.deadline`, the router resolution in
+    `ResolveChain`, and `e2e/swap_test.go`. Thirteen packages, down from
+    fourteen.
+
+    What stays: `bsc check` — still the answer to "how is the master doing" —
+    minus its price lines, and both master gauges. Tokens still accumulate on
+    the master from fees (§43); the difference is that bsc now only *reports*
+    them. The runbook's refill procedure is one sentence: send native currency
+    to the master address.
+
+    The `abi` package went at the same time, unrelated to trading: it was a
+    second, parallel set of generated bindings, and `usdt` is enough (§45 —
+    nothing is deployed, so there is no reason to keep two).
+
+54. **The audit walks the indexes too.** `Verify` started from every record and
+    asked whether the indexes knew about it. That catches a *missing* entry —
+    but an entry pointing at a record that was never written, or at the wrong
+    one, was invisible, and two documents claimed it "walks every index in both
+    directions" when it walked none of them from that side.
+
+    The missing direction is the one that matters more. A missing entry makes a
+    lookup fail, which is loud. A wrong entry makes a lookup *succeed* and hand
+    back somebody else's row — an address resolving to a wallet that is not the
+    one it names, an idempotency key replaying a debit that never claimed it.
+    Verified by removing the new pass: a `data/ref` entry pointing at a wallet
+    that does not exist produced **zero** findings.
+
+    All seven index buckets are now scanned: `idx/dep`, `idx/dep_wallet`,
+    `idx/wd_feed`, `idx/wd_wallet`, `idx/wd_idem`, `data/addr` and `data/ref`.
+    One corruption now usually reports twice, once from each side, and the two
+    findings say different things — which is the point, because only one of them
+    describes a lookup that would have silently worked.
 
 ## Verification
 

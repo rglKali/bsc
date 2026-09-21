@@ -41,7 +41,7 @@ func seed(t *testing.T, balance int64) (*store.Store, store.Wallet) {
 	t.Cleanup(func() { st.Close() })
 
 	top := store.Wallet{
-		ID: uuid.New(), Ref: "hot", Kind: store.KindManaged,
+		ID: 1, Ref: "hot",
 		Address: common.HexToAddress("0xabc"), Active: true,
 		Balance: big.NewInt(balance), CreatedAt: time.Now(),
 	}
@@ -76,11 +76,11 @@ func TestVerifyReportsInconsistency(t *testing.T) {
 	// A wallet promising more than it holds. With no ledger this is the
 	// solvency question, asked of the thing that actually holds the money (§40).
 	if err := st.Update(func(tx *store.Tx) error {
-		return tx.PutWithdrawal(store.Withdrawal{
+		return tx.PutPending(store.Pending{
 			ID: uuid.New(), Wallet: top.ID, Reason: store.ReasonPayout,
 			Destination: common.HexToAddress("0xdd"),
-			Amount:      big.NewInt(500), Status: store.WithdrawalPending,
-			CreatedAt: time.Now(),
+			Amount:      big.NewInt(500),
+			CreatedAt:   time.Now(),
 		})
 	}); err != nil {
 		t.Fatalf("seed withdrawal: %v", err)

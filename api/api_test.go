@@ -16,16 +16,15 @@ import (
 	"bsc/store"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/google/uuid"
 )
 
 // fakeAddrs records what the API registered for watching.
 type fakeAddrs struct {
 	mu sync.Mutex
-	m  map[common.Address]uuid.UUID
+	m  map[common.Address]store.WalletID
 }
 
-func (f *fakeAddrs) Add(a common.Address, id uuid.UUID) {
+func (f *fakeAddrs) Add(a common.Address, id store.WalletID) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.m[a] = id
@@ -42,6 +41,9 @@ func (f *fakeAddrs) has(a common.Address) bool {
 type fakeSync struct{ behind uint64 }
 
 func (f *fakeSync) Behind() uint64 { return f.behind }
+
+// testSecret is a fixed master so derivations are reproducible across tests.
+var testSecret = bytes.Repeat([]byte{0x11}, 32)
 
 type fixture struct {
 	t      *testing.T
@@ -61,14 +63,13 @@ func newFixture(t *testing.T) *fixture {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	master := bytes.Repeat([]byte{0x11}, 32)
-	ring, err := keys.New(master)
+	ring, err := keys.New(testSecret)
 	if err != nil {
 		t.Fatalf("keys.New: %v", err)
 	}
 	f := &fixture{
 		t: t, st: st,
-		addrs: &fakeAddrs{m: map[common.Address]uuid.UUID{}},
+		addrs: &fakeAddrs{m: map[common.Address]store.WalletID{}},
 		sync:  &fakeSync{},
 	}
 	f.srv = New(st, ring, f.addrs, f.sync, Options{

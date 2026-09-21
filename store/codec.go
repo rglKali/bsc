@@ -41,11 +41,6 @@ func (e *enc) u8(v uint8)   { e.b = append(e.b, v) }
 func (e *enc) u32(v uint32) { e.b = binary.BigEndian.AppendUint32(e.b, v) }
 func (e *enc) u64(v uint64) { e.b = binary.BigEndian.AppendUint64(e.b, v) }
 
-// i64 carries a Cents amount. Ledger figures are machine integers rather than
-// big-endian big.Ints because they are exact by construction and never need to
-// be sorted as keys.
-func (e *enc) i64(v int64) { e.u64(uint64(v)) }
-
 func (e *enc) boolean(v bool) {
 	if v {
 		e.u8(1)
@@ -60,6 +55,10 @@ func (e *enc) raw(p []byte) { e.b = append(e.b, p...) }
 func (e *enc) addr(a common.Address) { e.raw(a.Bytes()) }
 func (e *enc) hash(h common.Hash)    { e.raw(h.Bytes()) }
 func (e *enc) id(u uuid.UUID)        { e.raw(u[:]) }
+
+// walletID writes a wallet's sequential number. Same width and byte order as
+// its storage key, so a record and the key that finds it agree by construction.
+func (e *enc) walletID(id WalletID) { e.u64(uint64(id)) }
 
 // str appends a uint16-length-prefixed string. 64KiB is far above any slug,
 // ref, idempotency key or error message we store.
@@ -153,8 +152,6 @@ func (d *dec) u64() uint64 {
 	return binary.BigEndian.Uint64(p)
 }
 
-func (d *dec) i64() int64 { return int64(d.u64()) }
-
 func (d *dec) boolean() bool { return d.u8() == 1 }
 
 func (d *dec) addr() common.Address { return common.BytesToAddress(d.take(common.AddressLength)) }
@@ -165,6 +162,8 @@ func (d *dec) id() uuid.UUID {
 	copy(u[:], d.take(len(u)))
 	return u
 }
+
+func (d *dec) walletID() WalletID { return WalletID(d.u64()) }
 
 func (d *dec) str() string {
 	p := d.take(2)

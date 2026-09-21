@@ -122,17 +122,16 @@ func settleDrain(tx *store.Tx, f store.Flow, confirmed common.Hash, block uint64
 		// Resolved when the sweep was signed, from the balance the chain
 		// reported then — a drain never carries an amount before that.
 		Amount: f.Amount,
-		Status: store.WithdrawalConfirmed, TxHash: confirmed, Block: block,
-		CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
+		TxHash: confirmed, Block: block,
+		CreatedAt: now.UTC(), SettledAt: now.UTC(),
 	}
 	if err := tx.PutWithdrawal(debit); err != nil {
 		return fmt.Errorf("engine: record drain: %w", err)
 	}
-	// One sweep moves the whole balance, so it consumes every credit waiting on
-	// this wallet at once.
-	if _, err := tx.ForwardDeposits(f.Wallet, debit.ID); err != nil {
-		return fmt.Errorf("engine: forward deposits: %w", err)
-	}
+	// Nothing is stamped on the credits. A drain moves a *balance*, not a set
+	// of deposits — the amount is read from balanceOf at signing — so linking
+	// individual credits to it was always an approximation, and a wrong one for
+	// any deposit that arrived while the sweep was in flight (§50).
 	if _, err := tx.ClearBackoff(f.Wallet); err != nil {
 		return fmt.Errorf("engine: clear backoff: %w", err)
 	}
@@ -151,7 +150,7 @@ func settleWithdrawal(tx *store.Tx, f store.Flow, from store.FlowState, confirme
 		return backOff(tx, f.Wallet, now)
 	}
 
-	wd, found, err := tx.Withdrawal(f.Withdrawal)
+	wd, found, err := tx.Pending(f.Withdrawal)
 	if err != nil {
 		return err
 	}
@@ -165,11 +164,11 @@ func settleWithdrawal(tx *store.Tx, f store.Flow, from store.FlowState, confirme
 	// nothing moved — and while it is pending it still counts against the
 	// wallet's committed total, so the overdraft guard keeps holding.
 	if !ok {
-		_, err := tx.MutateWithdrawal(wd.ID, func(w *store.Withdrawal) error {
-			// Kept for the operator, not as a verdict: the request is still
+		_, err := tx.MutatePending(wd.ID, func(p *store.Pending) error {
+			// Kept for the operator, not as a verdict: the promise is still
 			// live and the next attempt overwrites this.
-			w.Error = f.Error
-			w.Attempts++
+			p.Error = f.Error
+			p.Attempts++
 			return nil
 		})
 		if err != nil {
@@ -184,20 +183,19 @@ func settleWithdrawal(tx *store.Tx, f store.Flow, from store.FlowState, confirme
 	// The wallet's balance is not adjusted here. The watcher observes the
 	// outgoing Transfer in the same block and debits custody from the log,
 	// which keeps one source of truth for what a wallet holds.
-	_, err = tx.MutateWithdrawal(wd.ID, func(w *store.Withdrawal) error {
-		w.Status = store.WithdrawalConfirmed
-		w.TxHash = confirmed
-		w.Block = block
-		w.Error = ""
-		return nil
-	})
+	//
+	// Settling MOVES the record: it leaves state/ and arrives in log/ as a
+	// fact, in this same transaction. The diagnostics go with the promise —
+	// how many attempts it took is a story about keeping it, not about the
+	// movement (§51).
+	_, err = tx.Settle(wd.ID, confirmed, block, now)
 	return err
 }
 
 // backOff stamps the wallet with an exponentially growing retry deadline. This
 // is what stops a declarative work rule plus a failing flow from becoming a
 // retry loop that burns gas as fast as blocks arrive.
-func backOff(tx *store.Tx, wallet uuid.UUID, now time.Time) error {
+func backOff(tx *store.Tx, wallet store.WalletID, now time.Time) error {
 	w, found, err := tx.Wallet(wallet)
 	if err != nil {
 		return err
@@ -276,22 +274,15 @@ func EvaluateAll(tx *store.Tx, cfg Config, now time.Time) (int, error) {
 // the ones behind it forever: it is retried rather than failed (§28), so
 // without an ordering it could hold the wallet on every evaluation. Its wallet
 // backoff lets the queue behind it move in the meantime.
-func oldestPending(tx *store.Tx, wallet uuid.UUID) (*store.Withdrawal, error) {
-	open, err := tx.WalletOpenWithdrawals(wallet)
-	if err != nil {
+func oldestPending(tx *store.Tx, wallet store.WalletID) (*store.Pending, error) {
+	// Everything in this keyspace is pending, so there is nothing to filter:
+	// the bucket is the outstanding set (§51).
+	open, err := tx.WalletPending(wallet)
+	if err != nil || len(open) == 0 {
 		return nil, err
 	}
-	var pending []store.Withdrawal
-	for _, wd := range open {
-		if wd.Status == store.WithdrawalPending {
-			pending = append(pending, wd)
-		}
-	}
-	if len(pending) == 0 {
-		return nil, nil
-	}
-	sort.Slice(pending, func(i, j int) bool { return pending[i].CreatedAt.Before(pending[j].CreatedAt) })
-	return &pending[0], nil
+	sort.Slice(open, func(i, j int) bool { return open[i].CreatedAt.Before(open[j].CreatedAt) })
+	return &open[0], nil
 }
 
 // startFlow creates a flow and claims its wallet, the two halves of "this wallet is

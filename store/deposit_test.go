@@ -5,14 +5,13 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/google/uuid"
 )
 
 func putDeposit(t *testing.T, s *Store, w Wallet, block uint64, logIndex uint32, txb byte, amount int64) Deposit {
 	t.Helper()
 	d := Deposit{
 		Wallet: w.ID, Block: block, LogIndex: logIndex, TxHash: hash(txb),
-		From: addr(0xF0), Amount: wei(amount), Status: DepositReceived,
+		From: addr(0xF0), Amount: wei(amount),
 		CreatedAt: time.Now().UTC(),
 	}
 	update(t, s, func(tx *Tx) error {
@@ -140,100 +139,6 @@ func TestDepositCursorIsStableWhenNothingIsNew(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-}
-
-// One drain moves the whole balance, so it forwards every deposit waiting on
-// the wallet at once — which is why forwarding is a status on the record rather
-// than an entry in the feed.
-func TestOneDrainForwardsEveryOpenDepositOnTheWallet(t *testing.T) {
-	s := open(t)
-	hot := seedWallet(t, s, "hot", 0)
-	p := seedProxy(t, s, "cust-1", hot.Address, 0)
-	putDeposit(t, s, p, 10, 0, 0xA1, 300)
-	putDeposit(t, s, p, 11, 0, 0xA2, 400)
-
-	debit := uuid.New()
-	update(t, s, func(tx *Tx) error {
-		// The debit has to exist: a credit naming one that does not is exactly
-		// what the audit looks for (§42).
-		if err := tx.PutWithdrawal(Withdrawal{
-			ID: debit, Wallet: p.ID, Reason: ReasonDrain, Destination: hot.Address,
-			Amount: wei(700), Status: WithdrawalConfirmed, TxHash: hash(0xDD),
-			Block: 12, CreatedAt: time.Now().UTC(),
-		}); err != nil {
-			return err
-		}
-		n, err := tx.ForwardDeposits(p.ID, debit)
-		if err != nil {
-			return err
-		}
-		if n != 2 {
-			t.Fatalf("forwarded %d, want 2", n)
-		}
-		return nil
-	})
-
-	if err := s.View(func(tx *Tx) error {
-		open, err := tx.OpenDeposits(p.ID, 0)
-		if err != nil {
-			return err
-		}
-		if len(open) != 0 {
-			t.Fatalf("%d deposits still open after the drain", len(open))
-		}
-		all, err := tx.WalletDeposits(p.ID, 0)
-		if err != nil {
-			return err
-		}
-		for _, d := range all {
-			if d.Status != DepositForwarded || d.SweptBy != debit {
-				t.Fatalf("deposit %v not linked to the debit that carried it: %+v", d.Cursor(), d)
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	mustBeClean(t, verify(t, s))
-}
-
-// A deposit on a wallet that accumulates has nowhere to go, so it must never
-// join the open set: nothing would ever take it back out (§34).
-func TestDepositsOnAnAccumulatingWalletAreNeverOpen(t *testing.T) {
-	s := open(t)
-	w := seedWallet(t, s, "hot", 0)
-	putDeposit(t, s, w, 10, 0, 0xAA, 500)
-
-	if err := s.View(func(tx *Tx) error {
-		open, err := tx.OpenDeposits(w.ID, 0)
-		if err != nil {
-			return err
-		}
-		if len(open) != 0 {
-			t.Fatalf("%d open deposits on an accumulating wallet", len(open))
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	mustBeClean(t, verify(t, s))
-}
-
-func TestForwardDepositsIsANoOpWhenNothingIsOpen(t *testing.T) {
-	s := open(t)
-	hot := seedWallet(t, s, "hot", 0)
-	p := seedProxy(t, s, "cust-1", hot.Address, 0)
-
-	update(t, s, func(tx *Tx) error {
-		n, err := tx.ForwardDeposits(p.ID, uuid.New())
-		if err != nil {
-			return err
-		}
-		if n != 0 {
-			t.Fatalf("forwarded %d with nothing open", n)
-		}
-		return nil
-	})
 }
 
 func blocks(ds []Deposit) []uint64 {
